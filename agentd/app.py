@@ -8,8 +8,11 @@ from typing import List, Any
 
 from mcp_subscribe.util import call_tool_from_uri
 import openai
+import dotenv
 
 from agentd.model.config import Config, MCPServerConfig, AgentConfig
+
+dotenv.load_dotenv()
 
 
 def load_config(path: str) -> Config:
