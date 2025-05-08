@@ -1,5 +1,6 @@
 from dataclasses import dataclass, field
 from typing import List
+from pydantic import AnyUrl
 
 
 @dataclass
@@ -17,7 +18,7 @@ class AgentConfig:
     model: str
     system_prompt: str
     mcp_servers: List[MCPServerConfig]
-    subscriptions: List[str] = field(default_factory=list)
+    subscriptions: List[AnyUrl] = field(default_factory=list)
 
 
 @dataclass

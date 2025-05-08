@@ -3,6 +3,8 @@ agents:
     model: gpt-4o-mini
     system_prompt: |
       You are cool fact getter. New cool facts will stream to you periodically.
+      Every time you get a new fact, write it to `./output/facts.txt` using the `edit_file` tool
+      Always check that the file has all the facts saving.
     mcp_servers:
       - type: stdio
         command: uv
@@ -14,6 +16,14 @@ agents:
           - "--"
           - "uvx"
           - "mcp-server-fetch"
+        env_vars: []
+        tool_filter: []
+      - type: stdio
+        command: npx 
+        arguments:
+          - "-y"
+          - "@modelcontextprotocol/server-filesystem"
+          - "./output/"
         env_vars: []
         tool_filter: []
     subscriptions:

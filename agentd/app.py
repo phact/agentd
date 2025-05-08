@@ -1,4 +1,9 @@
+import logging
+
 import asyncio
+
+from pydantic import AnyUrl
+
 from agents.mcp.server import MCPServerStdio
 
 import yaml
@@ -11,8 +16,18 @@ import openai
 import dotenv
 
 from agentd.model.config import Config, MCPServerConfig, AgentConfig
+from agentd.patch import patch_openai_with_mcp
 
 dotenv.load_dotenv()
+
+# Setup logging configuration early in the file
+logging.basicConfig(
+    level=logging.INFO,
+    format='%(asctime)s - %(name)s - %(levelname)s - %(message)s',
+    datefmt='%H:%M:%S'
+)
+# Get logger for this module
+logger = logging.getLogger(__name__)
 
 
 def load_config(path: str) -> Config:
@@ -21,12 +36,13 @@ def load_config(path: str) -> Config:
     agents = []
     for ag in data.get('agents', []):
         servers = [MCPServerConfig(**server) for server in ag.get('mcp_servers', [])]
+        urls = [AnyUrl(url) for url in ag.get('subscriptions', [])]
         agents.append(AgentConfig(
             name=ag['name'],
             model=ag['model'],
             system_prompt=ag['system_prompt'],
             mcp_servers=servers,
-            subscriptions=ag.get('subscriptions', [])
+            subscriptions=urls
         ))
     return Config(agents=agents)
 
@@ -36,16 +52,18 @@ class Agent:
         self.config = config
         self.messages: List[Any] = []
         self.history = [{"role": "system", "content": config.system_prompt}]
-        #self.session: ClientSession | None = None
-        self.session = None
-        self.client = openai.AsyncClient()
+        self.sessions_by_tool : dict[str, Any] = {}
+        self.servers = []
+        self.client = patch_openai_with_mcp(openai.AsyncClient())
 
     async def handle_notification(self, message: Any):
         self.messages.append(message)
 
     async def subscribe_resources(self):
         for uri in self.config.subscriptions:
-            await self.session.subscribe_resource(uri)
+            tool_name = uri.host
+            session = self.sessions_by_tool[tool_name]
+            await session.subscribe_resource(uri)
             print(f"[{self.config.name}] Subscribed to {uri}")
 
     async def process_notifications(self):
@@ -55,11 +73,18 @@ class Agent:
                 try:
                     uri = msg.root.params.uri
                     print(f"[{self.config.name}] Handling notification: {uri}")
-                    output = await call_tool_from_uri(uri, self.session)
+                    tool_name = uri.host
+                    session = self.sessions_by_tool[tool_name]
+                    try:
+                        output = await call_tool_from_uri(uri, session)
+                    except Exception as e:
+                        print(f"Error calling tool {uri}: {e}")
+                        continue
                     self.history.append({"role": "user", "content": f"Tool {uri} returned: {output}"})
                     resp = await self.client.chat.completions.create(
                         model=self.config.model,
-                        messages=self.history
+                        messages=self.history,
+                        mcp_servers=self.servers
                     )
                     content = resp.choices[0].message.content
                     print(f"Assistant: {content}")
@@ -78,7 +103,8 @@ class Agent:
             try:
                 resp = await self.client.chat.completions.create(
                     model=self.config.model,
-                    messages=self.history
+                    messages=self.history,
+                    mcp_servers=self.servers
                 )
                 content = resp.choices[0].message.content
                 print(f"Assistant: {content}")
@@ -87,20 +113,27 @@ class Agent:
                 traceback.print_exc()
 
     async def run(self):
-        tool = self.config.mcp_servers[0]
+        servers = self.config.mcp_servers
 
-        server = MCPServerStdio(
-            params={
-                "command": tool.command,
-                "args": tool.arguments,
-                "env": {kv.split('=',1)[0]: kv.split('=',1)[1] for kv in tool.env_vars}
-            },
-            cache_tools_list=True
-        )
+        for server_conf in servers:
+            server = MCPServerStdio(
+                params={
+                    "command": server_conf.command,
+                    "args": server_conf.arguments,
+                    "env": {kv.split('=',1)[0]: kv.split('=',1)[1] for kv in server_conf.env_vars}
+                },
+                cache_tools_list=True,
+                client_session_timeout_seconds=300
+            )
 
-        await server.connect()
-        self.session = server.session
-        server.session._message_handler = self.handle_notification
+            await server.connect()
+            server.session._message_handler = self.handle_notification
+
+            tools = (await server.session.list_tools()).tools
+            for tool in tools:
+                self.sessions_by_tool[tool.name] = server.session
+            self.servers.append(server)
+
         await self.subscribe_resources()
         print(f"Agent {self.config.name} ready. Type 'quit' to exit.")
 

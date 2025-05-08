@@ -2,6 +2,7 @@
 
 import asyncio
 import json
+import logging
 from functools import wraps
 from openai.resources.chat.completions import Completions, AsyncCompletions
 from agents.mcp.util import MCPUtil
@@ -10,6 +11,8 @@ import litellm
 
 # Global server cache
 _SERVER_CACHE = {}
+
+logger = logging.getLogger(__name__)
 
 async def _ensure_connected(server):
     """Return the same connected server every time (stdio or sse)."""
@@ -64,7 +67,7 @@ def patch_openai_with_mcp(client):
 
 
     # constants
-    MAX_TOOL_LOOPS = 5          # safety valve
+    MAX_TOOL_LOOPS = 20          # safety valve
 
     async def _handle_completion(
             self, args, model, messages,
@@ -90,8 +93,6 @@ def patch_openai_with_mcp(client):
         loop_count = 0
         while True:
             loop_count += 1
-            if loop_count > MAX_TOOL_LOOPS:
-                raise RuntimeError("Tool-call loop exceeded MAX_TOOL_LOOPS")
 
             # ----- make the chat completion call -----
             if provider == "openai":
@@ -117,7 +118,9 @@ def patch_openai_with_mcp(client):
                 resp["choices"][0]["message"], "tool_calls", []
             ) if provider != "openai" else resp.choices[0].message.tool_calls
 
-            if not tcalls:
+            if not tcalls or loop_count >= MAX_TOOL_LOOPS:
+                if loop_count >= MAX_TOOL_LOOPS:
+                    logger.warning(f"Reached max tool loops ({MAX_TOOL_LOOPS})")
                 # no more tool calls → done
                 return resp
 
@@ -135,6 +138,7 @@ def patch_openai_with_mcp(client):
                     raise KeyError(f"Tool '{tname}' not found in server lookup")
 
                 # run the tool via MCP
+                logger.info(f"Calling tool {tname} with args {targ_json}")
                 result_obj = await server.call_tool(tname, targ_json)
 
                 # append the assistant call + tool response
