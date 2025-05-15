@@ -34,3 +34,10 @@ response = client.chat.completions.create(
 )
 
 print(response.choices[0].message.content)
+
+response = client.embeddings.create(
+    model="gemini/text-embedding-004",
+    input="Hello world",
+)
+
+print(response.data[0].embedding)
