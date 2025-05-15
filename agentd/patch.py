@@ -5,6 +5,7 @@ import json
 import logging
 from functools import wraps
 from openai.resources.chat.completions import Completions, AsyncCompletions
+from openai.resources.embeddings import Embeddings, AsyncEmbeddings
 from agents.mcp.util import MCPUtil
 import litellm.utils as llm_utils
 import litellm
@@ -42,8 +43,12 @@ def patch_openai_with_mcp(client):
     is_async = client.__class__.__name__ == 'AsyncOpenAI'
 
     # Store original methods before patching
-    orig_sync = Completions.create
-    orig_async = AsyncCompletions.create
+    orig_completions_sync = Completions.create
+    orig_completions_async = AsyncCompletions.create
+
+    orig_embeddings_sync = Embeddings.create
+    orig_embeddings_async = AsyncEmbeddings.create
+
 
     async def _prepare(servers, strict):
         """Ensure servers are connected and get their tools."""
@@ -97,10 +102,10 @@ def patch_openai_with_mcp(client):
             # ----- make the chat completion call -----
             if provider == "openai":
                 resp = (
-                    await orig_async(self, *args, model=model, messages=messages,
+                    await orig_completions_async(self, *args, model=model, messages=messages,
                                      tools=tools, **clean_kwargs)
                     if async_mode else
-                    orig_sync(self, *args, model=model, messages=messages,
+                    orig_completions_sync(self, *args, model=model, messages=messages,
                               tools=tools, **clean_kwargs)
                 )
             else:
@@ -155,21 +160,46 @@ def patch_openai_with_mcp(client):
             #tools = None   # subsequent turns shouldn't resend schemas
 
     @wraps(Completions.create)
-    def patched_sync(self, *args, model=None, messages=None,
+    def patched_completions_sync(self, *args, model=None, messages=None,
                      mcp_servers=None, mcp_strict=False, tools=None, **kwargs):
         return _run_async(_handle_completion(self, args, model, messages,
                                           mcp_servers, mcp_strict, tools, kwargs, False))
 
     @wraps(AsyncCompletions.create)
-    async def patched_async(self, *args, model=None, messages=None,
+    async def patched_completions_async(self, *args, model=None, messages=None,
                            mcp_servers=None, mcp_strict=False, tools=None, **kwargs):
         return await _handle_completion(self, args, model, messages,
                                      mcp_servers, mcp_strict, tools, kwargs, True)
 
+
+    @wraps(orig_embeddings_sync)
+    def patched_embeddings_sync(self, *args, model=None, input=None, **kwargs):
+        # determine provider and api key
+        _, provider, api_key, _ = llm_utils.get_llm_provider(model)
+        if provider == "openai":
+            # call OpenAI SDK
+            return orig_embeddings_sync(self, *args, model=model, input=input, **kwargs)
+        else:
+            # call LiteLLM SDK
+            logger.debug(f"Routing embedding request for model={model} to liteLLM")
+            return litellm.embedding(model=model, input=input, api_key=api_key, **kwargs)
+
+    @wraps(orig_embeddings_async)
+    async def patched_embeddings_async(self, *args, model=None, input=None, **kwargs):
+        _, provider, api_key, _ = llm_utils.get_llm_provider(model)
+        if provider == "openai":
+            return await orig_embeddings_async(self, *args, model=model, input=input, **kwargs)
+        else:
+            logger.debug(f"Routing async embedding request for model={model} to liteLLM")
+            return await litellm.aembedding(model=model, input=input, api_key=api_key, **kwargs)
+
+
     # Patch only the appropriate method based on client type
     if is_async:
-        AsyncCompletions.create = patched_async
+        AsyncCompletions.create = patched_completions_async
+        AsyncEmbeddings.create = patched_embeddings_async
     else:
-        Completions.create = patched_sync
+        Completions.create = patched_completions_sync
+        Embeddings.create = patched_embeddings_sync
 
     return client
