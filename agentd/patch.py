@@ -194,7 +194,8 @@ def patch_openai_with_mcp(client):
                     logger.warning(f"Reached max tool loops ({MAX_TOOL_LOOPS})")
                 return response
 
-            #  Otherwise, handle each tool_call
+            # Process all tool calls concurrently
+            tool_call_tasks = []
             for call in tool_calls:
                 # Extract name and arguments robustly (OpenAI vs LiteLLM differences)
                 if provider == "openai":
@@ -207,51 +208,60 @@ def patch_openai_with_mcp(client):
                 if not isinstance(fn_args, dict):
                     fn_args = json.loads(fn_args)
 
-
                 # If this name is in explicit_tool_names—and *not* in MCP or decorator—
                 # then we bail out and return the response directly to the caller.
                 if fn_name in explicit_tool_names and fn_name not in server_lookup and fn_name not in SCHEMA_REGISTRY:
-                    # Don’t execute it locally. Instead, hand back the raw GPT response
+                    # Don't execute it locally. Instead, hand back the raw GPT response
                     # (which still contains call.function.arguments) so the caller can run it.
                     return response
 
-                # Route to MCP or local @tool
-                if fn_name in server_lookup:
-                    # → MCP‐backed tool
-                    server = server_lookup[fn_name]
-                    logger.info(f"Invoking MCP tool '{fn_name}' with args {fn_args}")
-                    result_obj = await server.call_tool(fn_name, fn_args)
-                    tool_output = result_obj.dict().get("content")
-                else:
-                    # → local decorator‐registered function
-                    logger.info(f"Invoking local @tool function '{fn_name}' with args {fn_args}")
-                    fn = FUNCTION_REGISTRY.get(fn_name)
-                    if fn is None:
-                        raise KeyError(f"Tool '{fn_name}' not registered")
-                    tool_output = fn(**fn_args)
+                # Create a task for each tool call
+                tool_call_tasks.append(self._process_tool_call(call, fn_name, fn_args, server_lookup, provider))
 
-                # Append the tool_call record and the tool’s output to the conversation
-                #     in the format OpenAI expects
-                if provider == "openai":
-                    current_messages = current_messages + [
-                        {"role": "assistant", "tool_calls": [call]},
-                        {"role": "tool", "name": fn_name,
-                         "content": str(tool_output),
-                         "tool_call_id": call.id}
-                    ]
-                else:
-                    call_id = call.get("id", None)
-                    current_messages = current_messages + [
-                        {"role": "assistant", "tool_calls": [call]},
-                        {"role": "tool", "name": fn_name,
-                         "content": str(tool_output),
-                         "tool_call_id": call_id}
-                    ]
+            # Wait for all tool calls to complete
+            tool_results = await asyncio.gather(*tool_call_tasks)
+            
+            # Update messages with all tool call results
+            for result in tool_results:
+                current_messages.extend(result)
 
-                # Clear out `tools` and `tool_choice` for any subsequent loops
-                clean_kwargs.pop("tools", None)
-                clean_kwargs.pop("tool_choice", None)
-                final_tools = None  # don’t resend schemas again
+            # Clear out `tools` and `tool_choice` for any subsequent loops
+            clean_kwargs.pop("tools", None)
+            clean_kwargs.pop("tool_choice", None)
+            final_tools = None  # don't resend schemas again
+
+    async def _process_tool_call(self, call, fn_name, fn_args, server_lookup, provider):
+        # Route to MCP or local @tool
+        if fn_name in server_lookup:
+            # → MCP‐backed tool
+            server = server_lookup[fn_name]
+            logger.info(f"Invoking MCP tool '{fn_name}' with args {fn_args}")
+            result_obj = await server.call_tool(fn_name, fn_args)
+            tool_output = result_obj.dict().get("content")
+        else:
+            # → local decorator‐registered function
+            logger.info(f"Invoking local @tool function '{fn_name}' with args {fn_args}")
+            fn = FUNCTION_REGISTRY.get(fn_name)
+            if fn is None:
+                raise KeyError(f"Tool '{fn_name}' not registered")
+            tool_output = fn(**fn_args)
+
+        # Format the tool call and output as messages
+        if provider == "openai":
+            return [
+                {"role": "assistant", "tool_calls": [call]},
+                {"role": "tool", "name": fn_name,
+                 "content": str(tool_output),
+                 "tool_call_id": call.id}
+            ]
+        else:
+            call_id = call.get("id", None)
+            return [
+                {"role": "assistant", "tool_calls": [call]},
+                {"role": "tool", "name": fn_name,
+                 "content": str(tool_output),
+                 "tool_call_id": call_id}
+            ]
 
     @wraps(Completions.create)
     def patched_completions_sync(self, *args, model=None, messages=None,
