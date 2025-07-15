@@ -1,11 +1,12 @@
-# openai_mcp_patch.py
-
 import asyncio
 import json
 import logging
 from functools import wraps
+
 from openai.resources.chat.completions import Completions, AsyncCompletions
+from openai.resources.responses import Responses, AsyncResponses
 from openai.resources.embeddings import Embeddings, AsyncEmbeddings
+
 from agents.mcp.util import MCPUtil
 import litellm.utils as llm_utils
 import litellm
@@ -28,286 +29,301 @@ def _run_async(coro):
 
 def patch_openai_with_mcp(client):
     """
-    Monkey-patch both sync and async chat.completions.create to:
-      - accept explicit tools=[…], mcp_servers=[…], mcp_strict flag
-      - fetch tools via MCPUtil.get_all_function_tools
-      - merge explicit, MCP, and decorator @tool schemas
-      - resolve collisions (explicit > MCP > decorator)
-      - invoke MCP tools if requested, otherwise run local @tool functions
-      - support OpenAI vs LiteLLM providers seamlessly
+    Monkey-patch Completions, Responses, and Embeddings to integrate MCP tools,
+    local @tool functions, and LiteLLM support.
     """
     is_async = client.__class__.__name__ == 'AsyncOpenAI'
 
-    # Keep references to the original methods
+    # Keep references to the original OpenAI SDK methods
     orig_completions_sync = Completions.create
     orig_completions_async = AsyncCompletions.create
+    orig_responses_sync = Responses.create
+    orig_responses_async = AsyncResponses.create
     orig_embeddings_sync = Embeddings.create
     orig_embeddings_async = AsyncEmbeddings.create
 
     async def _prepare_mcp_tools(servers, strict):
-        """
-        Connect to each MCP server (via _ensure_connected),
-        call MCPUtil.get_all_function_tools on the list of connected servers,
-        and return a list of JSON-Schema dicts in the format OpenAI expects.
-        """
         connected = [await _ensure_connected(s) for s in servers]
         tool_objs = await MCPUtil.get_all_function_tools(connected, strict)
-        mcp_schema_list = []
+        schemas = []
         for t in tool_objs:
-            mcp_schema_list.append({
-                "type": "function",
-                "function": {
-                    "name": t.name,
-                    "description": t.description,
-                    "parameters": t.params_json_schema
-                }
+            schemas.append({
+                "name": t.name,
+                "description": t.description,
+                "parameters": t.params_json_schema
             })
-        return mcp_schema_list
+        return schemas
 
     def _clean_kwargs(kwargs):
-        """Strip out custom arguments so OpenAI/LiteLLM doesn't complain."""
         cleaned = kwargs.copy()
         cleaned.pop('mcp_servers', None)
         cleaned.pop('mcp_strict', None)
         return cleaned
 
-    MAX_TOOL_LOOPS = 20  # safety cap for recursive tool calls
+    MAX_TOOL_LOOPS = 20
 
-    async def _process_tool_call(call, fn_name, fn_args, server_lookup, provider):
-        # Route to MCP or local @tool
+    def _normalize_schema(schema):
+        # Flatten either dict with nested 'function' or flat dict
+        if 'function' in schema:
+            fn = schema['function']
+            return {
+                'name': fn.get('name'),
+                'description': fn.get('description'),
+                'parameters': fn.get('parameters') or fn.get('params_json_schema')
+            }
+        return {
+            'name': schema.get('name'),
+            'description': schema.get('description'),
+            'parameters': schema.get('parameters') or schema.get('params_json_schema')
+        }
+
+    async def _process_tool_call(call, fn_name, fn_args, server_lookup, provider, is_responses=False):
         if fn_name in server_lookup:
-            # → MCP‐backed tool
             server = server_lookup[fn_name]
             logger.info(f"Invoking MCP tool '{fn_name}' with args {fn_args}")
-            result_obj = await server.call_tool(fn_name, fn_args)
-            tool_output = result_obj.dict().get("content")
+            try:
+                result = await server.call_tool(fn_name, fn_args)
+                output = result.dict().get('content')
+            except Exception as e:
+                logger.error(f"MCP tool call failed: {e}")
+                output = f"Error calling MCP tool {fn_name}: {str(e)}"
         else:
-            # → local decorator‐registered function
             logger.info(f"Invoking local @tool function '{fn_name}' with args {fn_args}")
             fn = FUNCTION_REGISTRY.get(fn_name)
             if fn is None:
                 raise KeyError(f"Tool '{fn_name}' not registered")
-            tool_output = fn(**fn_args)
-            if asyncio.iscoroutinefunction(fn):
-                tool_output = await tool_output
+            output = fn(**fn_args)
+            if asyncio.iscoroutine(output):
+                output = await output
 
+        if is_responses:
+            call_id = getattr(call, 'call_id', getattr(call, 'id', None))
+            return {"type": "function_call_output", "call_id": call_id, "output": str(output)}
 
-    # Format the tool call and output as messages
-        if provider == "openai":
-            return [
-                {"role": "assistant", "tool_calls": [call]},
-                {"role": "tool", "name": fn_name,
-                 "content": str(tool_output),
-                 "tool_call_id": call.id}
-            ]
-        else:
-            call_id = call.get("id", None)
-            return [
-                {"role": "assistant", "tool_calls": [call]},
-                {"role": "tool", "name": fn_name,
-                 "content": str(tool_output),
-                 "tool_call_id": call_id}
-            ]
+        # Completions path: inject back as chat messages
+        call_id = getattr(call, 'id', None)
+        return [
+            {"role": "assistant", "tool_calls": [call]},
+            {"role": "tool", "name": fn_name, "content": str(output), "tool_call_id": call_id}
+        ]
 
-    async def _handle_completion(
-            self, args, model, messages,
-            mcp_servers, mcp_strict, tools, kwargs, async_mode
+    async def _handle_llm_call(
+            self, args, model, payload,
+            mcp_servers, mcp_strict, tools, kwargs,
+            async_mode, orig_fn_sync, orig_fn_async,
+            is_responses=False
     ):
-        # Build the three separate "buckets" of schemas (explicit, MCP, decorator)
-        explicit_schema_list = tools or []  # if the user passed tools=[…], take it as-is
-        mcp_schema_list = []
-        decorator_schema_list = list(SCHEMA_REGISTRY.values())
+        # 1) Gather explicit, MCP, and decorator schemas
+        explicit = tools or []
+        mcp_schemas = await _prepare_mcp_tools(mcp_servers, mcp_strict) if mcp_servers else []
+        decorator = list(SCHEMA_REGISTRY.values())
 
-        #  If MCP servers were provided (and explicit tools is None),
-        #    fetch MCP schemas now
-        if mcp_servers is not None:
-            mcp_schema_list = await _prepare_mcp_tools(mcp_servers, mcp_strict)
-
-        #  If explicit tools were provided but they also passed mcp_servers (rare),
-        #     we still want to merge: so fetch MCP schemas as well.
-        #     (Above we only have an error if both mcp_servers and tools are non-None,
-        #     so to actually allow all three merging, we COMMENT OUT the error above
-        #     or handle it separately if we truly want to combine explicit + MCP + decorator.)
-        #
-        # For the requirement "merge all three together," we modify step 1 to:
-        # if tools is not None and mcp_servers is not None:
-        #     # Instead of error, proceed to fetch MCP and merge below
-        #     pass
-        #
-        # But if you still want to forbid explicit AND MCP in the same call,
-        # keep the ValueError. Here, we assume merging is allowed, so remove the ValueError:
-        #
-        #     # if mcp_servers is not None and tools is not None:
-        #     #     raise ValueError(...)
-        #
-        # Then fetch MCP even if tools is set:
-        #
-        # mcp_schema_list = await _prepare_mcp_tools(mcp_servers, mcp_strict) if mcp_servers else []
-        #
-        # We've implemented that logic here.
-
-        # Concatenate all three buckets in priority order: explicit → MCP → decorator
-        #    (explicit_schema_list may be empty list if no explicit tools provided)
-        explicit_tool_names = {schema["function"]["name"] for schema in explicit_schema_list}
-
-        combined = explicit_schema_list + mcp_schema_list + decorator_schema_list
-
-        # Deduplicate by function name, keeping first‐seen (explicit wins → MCP wins → decorator)
-        final_tools_dict = {}
+        # 2) Merge & dedupe by tool name
+        combined = explicit + mcp_schemas + decorator
+        deduped = {}
         for schema in combined:
-            fname = schema["function"]["name"]
-            if fname not in final_tools_dict:
-                final_tools_dict[fname] = schema
-            else:
-                # Collision detected. We silently ignore duplicates because
-                # earlier entries in `combined` have higher priority.
-                logger.debug(f"Ignoring duplicate tool schema for name '{fname}'")
-        final_tools = list(final_tools_dict.values())
+            name = schema.get('name') or (schema.get('function') or {}).get('name')
+            if name and name not in deduped:
+                deduped[name] = schema
 
-        # Build a lookup from tool name → MCP server (if any)
+        # 3) Format tools based on API type
+        final_tools = []
+        for schema in deduped.values():
+            flat = _normalize_schema(schema)
+            if is_responses:
+                # Responses API expects type, name, description, parameters at top level
+                final_tools.append({
+                    'type': 'function',
+                    'name': flat['name'],
+                    'description': flat['description'],
+                    'parameters': flat['parameters']
+                })
+            else:
+                # Chat completions API expects nested function object
+                final_tools.append({
+                    'type': 'function',
+                    'function': {
+                        'name': flat['name'],
+                        'description': flat['description'],
+                        'parameters': flat['parameters']
+                    }
+                })
+
+        # 4) Build MCP server lookup
         server_lookup = {}
         if mcp_servers:
             for srv in mcp_servers:
-                # Each server.list_tools() gives us tool objects with `name`
-                tool_list = await srv.list_tools()
-                for t in tool_list:
-                    server_lookup[t.name] = await _ensure_connected(srv)
+                conn = await _ensure_connected(srv)
+                for t in await conn.list_tools():
+                    server_lookup[t.name] = conn
 
-        # Determine the LLM provider (OpenAI vs LiteLLM) for embeddings/completions
+        # Debug: Log final tools
+        if final_tools:
+            print(f"DEBUG: Final tools count: {len(final_tools)}")
+            for i, tool in enumerate(final_tools):
+                print(f"DEBUG: Tool {i}: {tool.get('name', tool.get('function', {}).get('name', 'unknown'))}")
+
+        # 5) Determine provider and clean kwargs
         _, provider, api_key, _ = llm_utils.get_llm_provider(model)
         clean_kwargs = _clean_kwargs(kwargs)
+        if final_tools and 'tool_choice' not in clean_kwargs:
+            clean_kwargs['tool_choice'] = 'auto'
 
-        # If we have at least one function schema, force tool_choice="auto" unless overridden
-        if final_tools and "tool_choice" not in clean_kwargs:
-            clean_kwargs["tool_choice"] = "auto"
-
-        # Loop, letting the model call tools until no more `tool_calls` appear
+        # 6) Choose between Completions vs Responses
         loop_count = 0
-        current_messages = messages
+        if is_responses:
+            current_input = payload
+            prev_id = None
+        else:
+            current_messages = payload
+            prev_id = None
 
         while True:
             loop_count += 1
-
-            #  Make the chat completion call with the merged `final_tools`
-            if provider == "openai":
-                response = (
-                    await orig_completions_async(self, *args,
-                                                 model=model,
-                                                 messages=current_messages,
-                                                 tools=final_tools,
-                                                 **clean_kwargs)
-                    if async_mode else
-                    orig_completions_sync(self, *args,
-                                          model=model,
-                                          messages=current_messages,
-                                          tools=final_tools,
-                                          **clean_kwargs)
-                )
+            # Build call args
+            if is_responses:
+                call_args = {
+                    'model': model,
+                    'input': current_input,
+                    'previous_response_id': prev_id,
+                    'tools': final_tools,
+                    **clean_kwargs
+                }
             else:
-                response = (
-                    await litellm.acompletion(model=model,
-                                              messages=current_messages,
-                                              tools=final_tools,
-                                              api_key=api_key,
-                                              **clean_kwargs)
-                    if async_mode else
-                    litellm.completion(model=model,
-                                       messages=current_messages,
-                                       tools=final_tools,
-                                       api_key=api_key,
-                                       **clean_kwargs)
-                )
+                call_args = {
+                    'model': model,
+                    'messages': current_messages,
+                    'tools': final_tools,
+                    **clean_kwargs
+                }
 
-            #  Extract tool_calls from the model’s response
-            if provider == "openai":
-                tool_calls = response.choices[0].message.tool_calls
+            # 7) Invoke the SDK or LiteLLM
+            if provider == 'openai':
+                resp = (await orig_fn_async(self, *args, **call_args)
+                        if async_mode else orig_fn_sync(self, *args, **call_args))
             else:
-                tool_calls = getattr(response["choices"][0]["message"], "tool_calls", [])
+                if is_responses:
+                    resp = (await litellm.aresponses(**call_args, api_key=api_key)
+                            if async_mode else litellm.responses(**call_args, api_key=api_key))
+                else:
+                    resp = (await litellm.acompletion(**call_args, api_key=api_key)
+                            if async_mode else litellm.completion(**call_args, api_key=api_key))
 
-            #  If no tool_calls or we hit the max loop count, return the response
+            # 8) Extract any function calls
+            if is_responses:
+                tool_calls = [o for o in getattr(resp, 'output', []) if getattr(o, 'type', None) == 'function_call']
+            else:
+                if provider == 'openai':
+                    tool_calls = getattr(resp.choices[0].message, 'tool_calls', [])
+                else:
+                    tool_calls = getattr(resp['choices'][0]['message'], 'tool_calls', [])
+
+            # 9) Stop if no calls or max loops
             if not tool_calls or loop_count >= MAX_TOOL_LOOPS:
                 if loop_count >= MAX_TOOL_LOOPS:
                     logger.warning(f"Reached max tool loops ({MAX_TOOL_LOOPS})")
-                return response
+                return resp
 
-            # Process all tool calls concurrently
-            tool_call_tasks = []
+            # 10) Execute all calls
+            tasks = []
+            explicit_names = {s.get('name') for s in explicit if isinstance(s, dict)}
             for call in tool_calls:
-                # Extract name and arguments robustly (OpenAI vs LiteLLM differences)
-                if provider == "openai":
-                    fn_name = call.function.name
-                    fn_args = call.function.arguments
+                # unpack
+                if is_responses:
+                    fn_name = getattr(call, 'name', None)
+                    args_obj = getattr(call, 'arguments', {})
+                    fn_args = json.loads(args_obj) if isinstance(args_obj, str) else args_obj
                 else:
-                    fn_name = call["function"]["name"]
-                    fn_args = call["function"]["arguments"]
+                    if provider == 'openai':
+                        fn_name = call.function.name
+                        raw_args = call.function.arguments
+                    else:
+                        fn_name = call['function']['name']
+                        raw_args = call['function']['arguments']
+                    fn_args = json.loads(raw_args) if isinstance(raw_args, str) else raw_args
 
-                if not isinstance(fn_args, dict):
-                    fn_args = json.loads(fn_args)
+                # bail on explicit-only
+                if fn_name in explicit_names and fn_name not in server_lookup and fn_name not in SCHEMA_REGISTRY:
+                    return resp
 
-                # If this name is in explicit_tool_names—and *not* in MCP or decorator—
-                # then we bail out and return the response directly to the caller.
-                if fn_name in explicit_tool_names and fn_name not in server_lookup and fn_name not in SCHEMA_REGISTRY:
-                    # Don't execute it locally. Instead, hand back the raw GPT response
-                    # (which still contains call.function.arguments) so the caller can run it.
-                    return response
+                tasks.append(_process_tool_call(call, fn_name, fn_args, server_lookup, provider, is_responses))
 
-                # Create a task for each tool call
-                tool_call_tasks.append(_process_tool_call(call, fn_name, fn_args, server_lookup, provider))
+            results = await asyncio.gather(*tasks)
+            if is_responses:
+                current_input = results
+                prev_id = resp.id
+            else:
+                for part in results:
+                    current_messages.extend(part)
 
-            # Wait for all tool calls to complete
-            tool_results = await asyncio.gather(*tool_call_tasks)
-            
-            # Update messages with all tool call results
-            for result in tool_results:
-                current_messages.extend(result)
+            # 11) prepare for next iteration
+            clean_kwargs.pop('tools', None)
+            clean_kwargs.pop('tool_choice', None)
+            final_tools = None
 
-            # Clear out `tools` and `tool_choice` for any subsequent loops
-            clean_kwargs.pop("tools", None)
-            clean_kwargs.pop("tool_choice", None)
-            final_tools = None  # don't resend schemas again
-
-    @wraps(Completions.create)
+    # Patch into the SDK
+    @wraps(orig_completions_sync)
     def patched_completions_sync(self, *args, model=None, messages=None,
                                  mcp_servers=None, mcp_strict=False,
                                  tools=None, **kwargs):
-        return _run_async(_handle_completion(
+        return _run_async(_handle_llm_call(
             self, args, model, messages,
-            mcp_servers, mcp_strict, tools, kwargs, False
+            mcp_servers, mcp_strict, tools, kwargs,
+            False, orig_completions_sync, orig_completions_async, False
         ))
 
-    @wraps(AsyncCompletions.create)
+    @wraps(orig_completions_async)
     async def patched_completions_async(self, *args, model=None, messages=None,
                                         mcp_servers=None, mcp_strict=False,
                                         tools=None, **kwargs):
-        return await _handle_completion(
+        return await _handle_llm_call(
             self, args, model, messages,
-            mcp_servers, mcp_strict, tools, kwargs, True
+            mcp_servers, mcp_strict, tools, kwargs,
+            True, orig_completions_sync, orig_completions_async, False
+        )
+
+    @wraps(orig_responses_sync)
+    def patched_responses_sync(self, *args, model=None, input=None,
+                               mcp_servers=None, mcp_strict=False,
+                               tools=None, **kwargs):
+        return _run_async(_handle_llm_call(
+            self, args, model, input,
+            mcp_servers, mcp_strict, tools, kwargs,
+            False, orig_responses_sync, orig_responses_async, True
+        ))
+
+    @wraps(orig_responses_async)
+    async def patched_responses_async(self, *args, model=None, input=None,
+                                      mcp_servers=None, mcp_strict=False,
+                                      tools=None, **kwargs):
+        return await _handle_llm_call(
+            self, args, model, input,
+            mcp_servers, mcp_strict, tools, kwargs,
+            True, orig_responses_sync, orig_responses_async, True
         )
 
     @wraps(orig_embeddings_sync)
     def patched_embeddings_sync(self, *args, model=None, input=None, **kwargs):
         _, provider, api_key, _ = llm_utils.get_llm_provider(model)
-        if provider == "openai":
+        if provider == 'openai':
             return orig_embeddings_sync(self, *args, model=model, input=input, **kwargs)
-        else:
-            logger.debug(f"Routing embedding request for model={model} to LiteLLM")
-            return litellm.embedding(model=model, input=input, api_key=api_key, **kwargs)
+        return litellm.embedding(model=model, input=input, api_key=api_key, **kwargs)
 
     @wraps(orig_embeddings_async)
     async def patched_embeddings_async(self, *args, model=None, input=None, **kwargs):
         _, provider, api_key, _ = llm_utils.get_llm_provider(model)
-        if provider == "openai":
+        if provider == 'openai':
             return await orig_embeddings_async(self, *args, model=model, input=input, **kwargs)
-        else:
-            logger.debug(f"Routing async embedding request for model={model} to LiteLLM")
-            return await litellm.aembedding(model=model, input=input, api_key=api_key, **kwargs)
+        return await litellm.aembedding(model=model, input=input, api_key=api_key, **kwargs)
 
-    # Patch the client based on sync vs. async
+    # Apply patches
     if is_async:
         AsyncCompletions.create = patched_completions_async
+        AsyncResponses.create = patched_responses_async
         AsyncEmbeddings.create = patched_embeddings_async
     else:
         Completions.create = patched_completions_sync
+        Responses.create = patched_responses_sync
         Embeddings.create = patched_embeddings_sync
 
     return client

@@ -98,15 +98,18 @@ client = patch_openai_with_mcp(OpenAI())
 
 def print_response(label, response):
     """Helper to print out content or function_call, whichever is present."""
-    msg = response.choices[0].message
-    if getattr(msg, "function_call", None):
-        print(f"\n[{label}] Model wants to call a function:\n",
-              json.dumps({
-                  "name": msg.function_call.name,
-                  "arguments": json.loads(msg.function_call.arguments)
-              }, indent=2))
-    else:
-        print(f"\n[{label}] Assistant says:\n{msg.content}")
+    # For responses API, check output for text content
+    output = getattr(response, 'output', [])
+    
+    for item in output:
+        if getattr(item, 'type', None) == 'message':
+            content = getattr(item, 'content', [])
+            for content_item in content:
+                if getattr(content_item, 'type', None) == 'output_text':
+                    print(f"\n[{label}] Assistant says:\n{content_item.text}")
+                    return
+    
+    print(f"\n[{label}] No text output found. Output: {output}")
 
 def test_decorator_only():
     """
@@ -115,13 +118,10 @@ def test_decorator_only():
       - greet
     """
     print("\n=== Test: Decorator-Only ===")
-    messages = [
-        {"role": "system", "content": "You are a helpful assistant."},
-        {"role": "user", "content": "What is add_numbers(10, 5)? Then greet 'Alice'."}
-    ]
-    response = client.chat.completions.create(
-        model="gemini/gemini-2.0-flash",
-        messages=messages
+    input = "What is add_numbers(10, 5)? Then greet 'Alice'."
+    response = client.responses.create(
+        model="gpt-4o-mini",
+        input=input
     )
     print_response("Decorator-Only", response)
 
@@ -132,14 +132,11 @@ def test_fs_mcp_only():
       - Also still includes decorator tools, but here we ask only for FS action
     """
     print("\n=== Test: Filesystem MCP Only ===")
-    messages = [
-        {"role": "system", "content": "You are a helpful assistant."},
-        {"role": "user", "content": "List files in '/tmp/' using the filesystem tool."}
-    ]
-    response = client.chat.completions.create(
+    input = "List files in '/tmp/' using the filesystem tool."
+    response = client.responses.create(
         #model="gemini/gemini-2.0-flash",
         model="gpt-4o-mini",
-        messages=messages,
+        input=input,
         mcp_servers=[fs_server],
         mcp_strict=True
     )
@@ -152,13 +149,10 @@ def test_explicit_local_only():
       - Since we provided a local function multiply_numbers, it should run in-process
     """
     print("\n=== Test: Explicit-Local Only ===")
-    messages = [
-        {"role": "system", "content": "You are a helpful assistant."},
-        {"role": "user", "content": "Use multiply_numbers to multiply 7 and 8."}
-    ]
-    response = client.chat.completions.create(
-        model="gemini/gemini-2.0-flash",
-        messages=messages,
+    input = "Use multiply_numbers to multiply 7 and 8."
+    response = client.responses.create(
+        model="gpt-4o-mini",
+        input=input,
         tools=[explicit_tool_schema]
     )
     print_response("Explicit-Local-Only", response)
@@ -176,20 +170,15 @@ def test_all_three_combined():
         • add_numbers, greet (local decorator)
     """
     print("\n=== Test: All Three Combined ===")
-    messages = [
-        {"role": "system", "content": "You are a helpful assistant."},
-        {
-            "role": "user",
-            "content": (
-                "First, multiply 3 and 5 using multiply_numbers. "
-                "Then list '/tmp/' via filesystem MCP. "
-                "Finally, greet 'Bob' using the local greet function."
-            )
-        }
-    ]
-    response = client.chat.completions.create(
-        model="gemini/gemini-2.0-flash",
-        messages=messages,
+    input = (
+        "First, multiply 3 and 5 using multiply_numbers. "
+        "Then list '/tmp/' via filesystem MCP. "
+        "Finally, greet 'Bob' using the local greet function."
+    )
+    response = client.responses.create(
+        #model="gemini/gemini-2.0-flash",
+        model="gpt-4o-mini",
+        input=input,
         tools=[explicit_tool_schema],
         mcp_servers=[fs_server],
         mcp_strict=False
@@ -203,6 +192,15 @@ if __name__ == "__main__":
     os.makedirs("/tmp/test_dir", exist_ok=True)
 
     test_decorator_only()
-    test_fs_mcp_only()
+    
+    try:
+        test_fs_mcp_only()
+    except Exception as e:
+        print(f"\n[FS-MCP-Only] Failed with error: {e}")
+    
     test_explicit_local_only()
-    test_all_three_combined()
+    
+    try:
+        test_all_three_combined()
+    except Exception as e:
+        print(f"\n[All-Three-Combined] Failed with error: {e}")
