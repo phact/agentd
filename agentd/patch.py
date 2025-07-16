@@ -1,6 +1,7 @@
 import asyncio
 import json
 import logging
+import types
 from functools import wraps
 
 from openai.resources.chat.completions import Completions, AsyncCompletions
@@ -377,12 +378,12 @@ def patch_openai_with_mcp(client):
 
     # Apply patches
     if is_async:
-        AsyncCompletions.create = patched_completions_async
-        AsyncResponses.create = patched_responses_async
-        AsyncEmbeddings.create = patched_embeddings_async
+        client.chat.completions.create = types.MethodType(patched_completions_async, client.chat.completions)
+        client.responses.create = types.MethodType(patched_responses_async, client.responses)
+        client.embeddings.create = types.MethodType(patched_embeddings_async, client.embeddings)
     else:
-        Completions.create = patched_completions_sync
-        Responses.create = patched_responses_sync
-        Embeddings.create = patched_embeddings_sync
+        client.chat.completions.create = types.MethodType(patched_completions_sync, client.chat.completions)
+        client.responses.create = types.MethodType(patched_responses_sync, client.responses)
+        client.embeddings.create = types.MethodType(patched_embeddings_sync, client.embeddings)
 
     return client
