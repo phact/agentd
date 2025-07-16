@@ -115,28 +115,30 @@ def patch_openai_with_mcp(client):
             async_mode, orig_fn_sync, orig_fn_async,
             is_responses=False
     ):
-        # 1) Gather explicit, MCP, and decorator schemas
+        """
+        Unified handler for both Chat Completions (is_responses=False)
+        and Responses API (is_responses=True). Supports OpenAI and LiteLLM providers.
+        """
+        # 1) Gather tool schemas
         explicit = tools or []
-        # Get client from the API object to access server cache
         client_obj = getattr(self, '_client', None) or getattr(self, 'client', None)
         server_cache = getattr(client_obj, '_mcp_server_cache', {}) if client_obj else {}
         mcp_schemas = await _prepare_mcp_tools(mcp_servers, mcp_strict, server_cache) if mcp_servers else []
         decorator = list(SCHEMA_REGISTRY.values())
-
-        # 2) Merge & dedupe by tool name
         combined = explicit + mcp_schemas + decorator
+        # Deduplicate tools by normalized name
         deduped = {}
         for schema in combined:
-            name = schema.get('name') or (schema.get('function') or {}).get('name')
+            flat = _normalize_schema(schema)
+            name = flat['name']
             if name and name not in deduped:
                 deduped[name] = schema
 
-        # 3) Format tools based on API type
+        # 2) Build tool definitions
         final_tools = []
         for schema in deduped.values():
             flat = _normalize_schema(schema)
             if is_responses:
-                # Responses API expects type, name, description, parameters at top level
                 final_tools.append({
                     'type': 'function',
                     'name': flat['name'],
@@ -144,127 +146,210 @@ def patch_openai_with_mcp(client):
                     'parameters': flat['parameters']
                 })
             else:
-                # Chat completions API expects nested function object
-                final_tools.append({
-                    'type': 'function',
-                    'function': {
-                        'name': flat['name'],
-                        'description': flat['description'],
-                        'parameters': flat['parameters']
-                    }
-                })
+                final_tools.append({'type': 'function', 'function': flat})
 
-        # 4) Build MCP server lookup
+        # 3) Connect MCP servers
         server_lookup = {}
-        if mcp_servers:
-            for srv in mcp_servers:
-                conn = await _ensure_connected(srv, server_cache)
-                for t in await conn.list_tools():
-                    server_lookup[t.name] = conn
+        for srv in mcp_servers or []:
+            conn = await _ensure_connected(srv, server_cache)
+            for t in await conn.list_tools():
+                server_lookup[t.name] = conn
 
-        # Debug: Log final tools
-        if final_tools:
-            print(f"DEBUG: Final tools count: {len(final_tools)}")
-            for i, tool in enumerate(final_tools):
-                print(f"DEBUG: Tool {i}: {tool.get('name', tool.get('function', {}).get('name', 'unknown'))}")
-
-        # 5) Determine provider and clean kwargs
+        # 4) Determine provider & clean kwargs
         _, provider, api_key, _ = llm_utils.get_llm_provider(model)
         clean_kwargs = _clean_kwargs(kwargs)
         if final_tools and 'tool_choice' not in clean_kwargs:
             clean_kwargs['tool_choice'] = 'auto'
 
-        # 6) Choose between Completions vs Responses
-        loop_count = 0
+        # === RESPONSES API ===
         if is_responses:
-            current_input = payload
-            prev_id = None
-        else:
-            current_messages = payload
-            prev_id = None
+            # Ensure payload is a list of message dicts
+            input_history = payload.copy() if isinstance(payload, list) else [{'role': 'user', 'content': str(payload)}]
 
+            # 1) Initial call: let model emit any function_call messages
+            if provider == 'openai':
+                if async_mode:
+                    resp = await orig_fn_async(
+                        self, *args,
+                        model=model,
+                        input=input_history,
+                        tools=final_tools,
+                        **clean_kwargs
+                    )
+                else:
+                    resp = orig_fn_sync(
+                        self, *args,
+                        model=model,
+                        input=input_history,
+                        tools=final_tools,
+                        **clean_kwargs
+                    )
+            else:
+                if async_mode:
+                    resp = await litellm.aresponses(
+                        model=model,
+                        input=input_history,
+                        tools=final_tools,
+                        api_key=api_key,
+                        **clean_kwargs
+                    )
+                else:
+                    resp = litellm.responses(
+                        model=model,
+                        input=input_history,
+                        tools=final_tools,
+                        api_key=api_key,
+                        **clean_kwargs
+                    )
+
+            # Extract all function calls
+            calls = [o for o in getattr(resp, 'output', []) if getattr(o, 'type', None) == 'function_call']
+            if not calls:
+                return resp
+
+            # Execute all tool calls in parallel
+            tasks = [
+                _execute_tool(call.name,
+                              json.loads(call.arguments) if isinstance(call.arguments, str) else call.arguments,
+                              server_lookup)
+                for call in calls
+            ]
+            results = await asyncio.gather(*tasks)
+
+            # Build follow-up input preserving full history
+            follow_input = input_history
+            for call, result in zip(calls, results):
+                follow_input.append({
+                    'type': 'function_call_output',
+                    'call_id': call.call_id,
+                    'output': json.dumps(result) if not isinstance(result, str) else result
+                })
+
+            # 2) Follow-up call with full history + tool outputs
+            if provider == 'openai':
+                if async_mode:
+                    follow = await orig_fn_async(
+                        self, *args,
+                        model=model,
+                        input=follow_input,
+                        previous_response_id=resp.id,
+                        **clean_kwargs
+                    )
+                else:
+                    follow = orig_fn_sync(
+                        self, *args,
+                        model=model,
+                        input=follow_input,
+                        previous_response_id=resp.id,
+                        **clean_kwargs
+                    )
+            else:
+                if async_mode:
+                    follow = await litellm.aresponses(
+                        model=model,
+                        input=follow_input,
+                        previous_response_id=resp.id,
+                        api_key=api_key,
+                        **clean_kwargs
+                    )
+                else:
+                    follow = litellm.responses(
+                        model=model,
+                        input=follow_input,
+                        previous_response_id=resp.id,
+                        api_key=api_key,
+                        **clean_kwargs
+                    )
+            return follow
+            if provider == 'openai':
+                if async_mode:
+                    follow = await orig_fn_async(
+                        self, *args,
+                        model=model,
+                        previous_response_id=resp.id,
+                        input=follow_inputs,
+                        **clean_kwargs
+                    )
+                else:
+                    follow = orig_fn_sync(
+                        self, *args,
+                        model=model,
+                        previous_response_id=resp.id,
+                        input=follow_inputs,
+                        **clean_kwargs
+                    )
+            else:
+                if async_mode:
+                    follow = await litellm.aresponses(
+                        model=model,
+                        previous_response_id=resp.id,
+                        input=follow_inputs,
+                        api_key=api_key,
+                        **clean_kwargs
+                    )
+                else:
+                    follow = litellm.responses(
+                        model=model,
+                        previous_response_id=resp.id,
+                        input=follow_inputs,
+                        api_key=api_key,
+                        **clean_kwargs
+                    )
+            return follow
+
+        # === CHAT COMPLETIONS: multi-call tool loop ===
+        current_messages = payload
+        loop_count = 0
         while True:
             loop_count += 1
-            # Build call args
-            if is_responses:
-                call_args = {
-                    'model': model,
-                    'input': current_input,
-                    'previous_response_id': prev_id,
-                    'tools': final_tools,
-                    **clean_kwargs
-                }
-            else:
-                call_args = {
-                    'model': model,
-                    'messages': current_messages,
-                    'tools': final_tools,
-                    **clean_kwargs
-                }
+            call_args = {'model': model, 'messages': current_messages, **clean_kwargs}
+            if provider != 'openai':
+                call_args['api_key'] = api_key
+            if final_tools and 'tool_choice' in clean_kwargs:
+                call_args['tools'] = final_tools
 
-            # 7) Invoke the SDK or LiteLLM
             if provider == 'openai':
-                resp = (await orig_fn_async(self, *args, **call_args)
-                        if async_mode else orig_fn_sync(self, *args, **call_args))
+                resp = await orig_fn_async(self, *args, **call_args) if async_mode else orig_fn_sync(self, *args, **call_args)
             else:
-                if is_responses:
-                    resp = (await litellm.aresponses(**call_args, api_key=api_key)
-                            if async_mode else litellm.responses(**call_args, api_key=api_key))
-                else:
-                    resp = (await litellm.acompletion(**call_args, api_key=api_key)
-                            if async_mode else litellm.completion(**call_args, api_key=api_key))
+                resp = await litellm.acompletion(**call_args) if async_mode else litellm.completion(**call_args)
 
-            # 8) Extract any function calls
-            if is_responses:
-                tool_calls = [o for o in getattr(resp, 'output', []) if getattr(o, 'type', None) == 'function_call']
-            else:
-                if provider == 'openai':
-                    tool_calls = getattr(resp.choices[0].message, 'tool_calls', [])
-                else:
-                    tool_calls = getattr(resp['choices'][0]['message'], 'tool_calls', [])
-
-            # 9) Stop if no calls or max loops
+            tool_calls = (
+                getattr(resp.choices[0].message, 'tool_calls', []) if provider == 'openai'
+                else getattr(resp['choices'][0]['message'], 'tool_calls', [])
+            )
             if not tool_calls or loop_count >= MAX_TOOL_LOOPS:
                 if loop_count >= MAX_TOOL_LOOPS:
                     logger.warning(f"Reached max tool loops ({MAX_TOOL_LOOPS})")
                 return resp
 
-            # 10) Execute all calls
             tasks = []
             explicit_names = {s.get('name') for s in explicit if isinstance(s, dict)}
             for call in tool_calls:
-                # unpack
-                if is_responses:
-                    fn_name = getattr(call, 'name', None)
-                    args_obj = getattr(call, 'arguments', {})
-                    fn_args = json.loads(args_obj) if isinstance(args_obj, str) else args_obj
+                if provider == 'openai':
+                    name, raw = call.function.name, call.function.arguments
                 else:
-                    if provider == 'openai':
-                        fn_name = call.function.name
-                        raw_args = call.function.arguments
-                    else:
-                        fn_name = call['function']['name']
-                        raw_args = call['function']['arguments']
-                    fn_args = json.loads(raw_args) if isinstance(raw_args, str) else raw_args
-
-                # bail on explicit-only
-                if fn_name in explicit_names and fn_name not in server_lookup and fn_name not in SCHEMA_REGISTRY:
+                    name, raw = call['function']['name'], call['function']['arguments']
+                parsed = json.loads(raw) if isinstance(raw, str) else raw
+                if name in explicit_names and name not in server_lookup and name not in SCHEMA_REGISTRY:
                     return resp
+                tasks.append(_process_tool_call(call, name, parsed, server_lookup, provider, False))
 
-                tasks.append(_process_tool_call(call, fn_name, fn_args, server_lookup, provider, is_responses))
-
-            results = await asyncio.gather(*tasks)
-            if is_responses:
-                current_input = results
-                prev_id = resp.id
-            else:
-                for part in results:
-                    current_messages.extend(part)
-
-            # 11) prepare for next iteration
+            parts = await asyncio.gather(*tasks)
+            for part in parts:
+                current_messages.extend(part)
             clean_kwargs.pop('tools', None)
             clean_kwargs.pop('tool_choice', None)
             final_tools = None
+
+    # Helper to execute MCP or local tools
+    async def _execute_tool(fn_name, fn_args, server_lookup):
+        if fn_name in server_lookup:
+            res = await server_lookup[fn_name].call_tool(fn_name, fn_args)
+            return res.dict().get('content')
+        fn = FUNCTION_REGISTRY.get(fn_name)
+        out = fn(**fn_args)
+        return await out if asyncio.iscoroutine(out) else out
+
 
     # Patch into the SDK
     @wraps(orig_completions_sync)
