@@ -226,6 +226,10 @@ def patch_openai_with_mcp(client):
                 })
 
             # 2) Follow-up call with full history + tool outputs
+            # Prepare follow-up kwargs, avoid duplicating previous_response_id
+            follow_kwargs = clean_kwargs.copy()
+            follow_kwargs.pop('previous_response_id', None)
+
             if provider == 'openai':
                 if async_mode:
                     follow = await orig_fn_async(
@@ -233,7 +237,7 @@ def patch_openai_with_mcp(client):
                         model=model,
                         input=follow_input,
                         previous_response_id=resp.id,
-                        **clean_kwargs
+                        **follow_kwargs
                     )
                 else:
                     follow = orig_fn_sync(
@@ -241,7 +245,7 @@ def patch_openai_with_mcp(client):
                         model=model,
                         input=follow_input,
                         previous_response_id=resp.id,
-                        **clean_kwargs
+                        **follow_kwargs
                     )
             else:
                 if async_mode:
@@ -250,7 +254,7 @@ def patch_openai_with_mcp(client):
                         input=follow_input,
                         previous_response_id=resp.id,
                         api_key=api_key,
-                        **clean_kwargs
+                        **follow_kwargs
                     )
                 else:
                     follow = litellm.responses(
@@ -258,42 +262,7 @@ def patch_openai_with_mcp(client):
                         input=follow_input,
                         previous_response_id=resp.id,
                         api_key=api_key,
-                        **clean_kwargs
-                    )
-            return follow
-            if provider == 'openai':
-                if async_mode:
-                    follow = await orig_fn_async(
-                        self, *args,
-                        model=model,
-                        previous_response_id=resp.id,
-                        input=follow_inputs,
-                        **clean_kwargs
-                    )
-                else:
-                    follow = orig_fn_sync(
-                        self, *args,
-                        model=model,
-                        previous_response_id=resp.id,
-                        input=follow_inputs,
-                        **clean_kwargs
-                    )
-            else:
-                if async_mode:
-                    follow = await litellm.aresponses(
-                        model=model,
-                        previous_response_id=resp.id,
-                        input=follow_inputs,
-                        api_key=api_key,
-                        **clean_kwargs
-                    )
-                else:
-                    follow = litellm.responses(
-                        model=model,
-                        previous_response_id=resp.id,
-                        input=follow_inputs,
-                        api_key=api_key,
-                        **clean_kwargs
+                        **follow_kwargs
                     )
             return follow
 
