@@ -28,9 +28,6 @@ def greet(name: str) -> str:
     name: person’s name
     """
     return f"Hello, {name}!"
-# ------------------------------------------------------------------------------
-# 1. Instantiate MCP servers
-# ------------------------------------------------------------------------------
 
 env = os.environ.copy()
 nvm_bin = os.path.expanduser("~/.nvm/versions/node/v22.16.0/bin")
@@ -53,10 +50,6 @@ remote_server = MCPServerSse(
     },
     cache_tools_list=True
 )
-
-# ------------------------------------------------------------------------------
-# 2. Define an explicit tool schema and its Python implementation
-# ------------------------------------------------------------------------------
 
 # This is an explicit schema that the model can choose to call. By default,
 # our patch will detect it and bubble back the function_call so we must
@@ -86,16 +79,6 @@ def multiply_numbers(x: int, y: int) -> int:
 from agentd.tool_decorator import FUNCTION_REGISTRY
 FUNCTION_REGISTRY["multiply_numbers"] = multiply_numbers
 
-# ------------------------------------------------------------------------------
-# 3. Patch the OpenAI client
-# ------------------------------------------------------------------------------
-
-client = patch_openai_with_mcp(OpenAI())
-
-# ------------------------------------------------------------------------------
-# 4. Test Cases
-# ------------------------------------------------------------------------------
-
 def print_response(label, response):
     """Helper to print out content or function_call, whichever is present."""
     # For responses API, check output for text content
@@ -117,6 +100,7 @@ def test_decorator_only():
       - add_numbers
       - greet
     """
+    client = patch_openai_with_mcp(OpenAI())
     print("\n=== Test: Decorator-Only ===")
     input = "What is add_numbers(10, 5)? Then greet 'Alice'."
     response = client.responses.create(
@@ -132,6 +116,7 @@ def test_fs_mcp_only():
       - Uses filesystem MCP tool (e.g. `list_dir /tmp`)
       - Also still includes decorator tools, but here we ask only for FS action
     """
+    client = patch_openai_with_mcp(OpenAI())
     print("\n=== Test: Filesystem MCP Only ===")
     input = "List files in '/tmp/' using the filesystem tool."
     response = client.responses.create(
@@ -149,6 +134,7 @@ def test_explicit_local_only():
       - Supplies only the explicit 'multiply_numbers' schema
       - Since we provided a local function multiply_numbers, it should run in-process
     """
+    client = patch_openai_with_mcp(OpenAI())
     print("\n=== Test: Explicit-Local Only ===")
     input = "Use multiply_numbers to multiply 7 and 8."
     response = client.responses.create(
@@ -171,6 +157,7 @@ def test_all_three_combined():
         • Remote tools (from remote_server)
         • add_numbers, greet (local decorator)
     """
+    client = patch_openai_with_mcp(OpenAI())
     print("\n=== Test: All Three Combined ===")
     input = (
         "First, multiply 3 and 5 using multiply_numbers. "
