@@ -13,15 +13,14 @@ import litellm
 
 from agentd.tool_decorator import SCHEMA_REGISTRY, FUNCTION_REGISTRY
 
-_SERVER_CACHE = {}
 logger = logging.getLogger(__name__)
 
-async def _ensure_connected(server):
+async def _ensure_connected(server, server_cache):
     """Cache-connected MCP servers so we only connect once per named server."""
-    if server.name not in _SERVER_CACHE:
+    if server.name not in server_cache:
         await server.connect()
-        _SERVER_CACHE[server.name] = server
-    return _SERVER_CACHE[server.name]
+        server_cache[server.name] = server
+    return server_cache[server.name]
 
 def _run_async(coro):
     """Run an async coroutine from sync context."""
@@ -33,6 +32,9 @@ def patch_openai_with_mcp(client):
     local @tool functions, and LiteLLM support.
     """
     is_async = client.__class__.__name__ == 'AsyncOpenAI'
+    
+    # Add per-client server cache
+    client._mcp_server_cache = {}
 
     # Keep references to the original OpenAI SDK methods
     orig_completions_sync = Completions.create
@@ -42,8 +44,8 @@ def patch_openai_with_mcp(client):
     orig_embeddings_sync = Embeddings.create
     orig_embeddings_async = AsyncEmbeddings.create
 
-    async def _prepare_mcp_tools(servers, strict):
-        connected = [await _ensure_connected(s) for s in servers]
+    async def _prepare_mcp_tools(servers, strict, server_cache):
+        connected = [await _ensure_connected(s, server_cache) for s in servers]
         tool_objs = await MCPUtil.get_all_function_tools(connected, strict)
         schemas = []
         for t in tool_objs:
@@ -115,7 +117,10 @@ def patch_openai_with_mcp(client):
     ):
         # 1) Gather explicit, MCP, and decorator schemas
         explicit = tools or []
-        mcp_schemas = await _prepare_mcp_tools(mcp_servers, mcp_strict) if mcp_servers else []
+        # Get client from the API object to access server cache
+        client_obj = getattr(self, '_client', None) or getattr(self, 'client', None)
+        server_cache = getattr(client_obj, '_mcp_server_cache', {}) if client_obj else {}
+        mcp_schemas = await _prepare_mcp_tools(mcp_servers, mcp_strict, server_cache) if mcp_servers else []
         decorator = list(SCHEMA_REGISTRY.values())
 
         # 2) Merge & dedupe by tool name
@@ -153,7 +158,7 @@ def patch_openai_with_mcp(client):
         server_lookup = {}
         if mcp_servers:
             for srv in mcp_servers:
-                conn = await _ensure_connected(srv)
+                conn = await _ensure_connected(srv, server_cache)
                 for t in await conn.list_tools():
                     server_lookup[t.name] = conn
 

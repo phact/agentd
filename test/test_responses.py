@@ -42,7 +42,7 @@ fs_server = MCPServerStdio(
         "args": ["-y", "@modelcontextprotocol/server-filesystem", "/tmp/"],
         "env": env
     },
-    cache_tools_list=True
+    cache_tools_list=True,
 )
 
 remote_server = MCPServerSse(
@@ -120,7 +120,8 @@ def test_decorator_only():
     print("\n=== Test: Decorator-Only ===")
     input = "What is add_numbers(10, 5)? Then greet 'Alice'."
     response = client.responses.create(
-        model="gpt-4o-mini",
+        #model="gpt-4o-mini",
+        model="gemini/gemini-2.0-flash",
         input=input
     )
     print_response("Decorator-Only", response)
@@ -134,8 +135,8 @@ def test_fs_mcp_only():
     print("\n=== Test: Filesystem MCP Only ===")
     input = "List files in '/tmp/' using the filesystem tool."
     response = client.responses.create(
-        #model="gemini/gemini-2.0-flash",
-        model="gpt-4o-mini",
+        model="gemini/gemini-2.0-flash",
+        #model="gpt-4o-mini",
         input=input,
         mcp_servers=[fs_server],
         mcp_strict=True
@@ -151,7 +152,8 @@ def test_explicit_local_only():
     print("\n=== Test: Explicit-Local Only ===")
     input = "Use multiply_numbers to multiply 7 and 8."
     response = client.responses.create(
-        model="gpt-4o-mini",
+        #model="gpt-4o-mini",
+        model="gemini/gemini-2.0-flash",
         input=input,
         tools=[explicit_tool_schema]
     )
@@ -176,8 +178,8 @@ def test_all_three_combined():
         "Finally, greet 'Bob' using the local greet function."
     )
     response = client.responses.create(
-        #model="gemini/gemini-2.0-flash",
-        model="gpt-4o-mini",
+        model="gemini/gemini-2.0-flash",
+        #model="gpt-4o-mini",
         input=input,
         tools=[explicit_tool_schema],
         mcp_servers=[fs_server],
