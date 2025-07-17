@@ -114,7 +114,7 @@ def patch_openai_with_mcp(client):
             self, args, model, payload,
             mcp_servers, mcp_strict, tools, kwargs,
             async_mode, orig_fn_sync, orig_fn_async,
-            is_responses=False
+            is_responses=False, is_streaming=False
     ):
         """
         Unified handler for both Chat Completions (is_responses=False)
@@ -167,6 +167,17 @@ def patch_openai_with_mcp(client):
             # Ensure payload is a list of message dicts
             input_history = payload.copy() if isinstance(payload, list) else [{'role': 'user', 'content': str(payload)}]
 
+            # Handle streaming responses
+            if is_streaming:
+                stream_result = await _handle_streaming_responses(
+                    self, args, model, input_history, final_tools, clean_kwargs,
+                    provider, api_key, async_mode, orig_fn_sync, orig_fn_async,
+                    server_lookup
+                )
+                if stream_result is not None:
+                    return stream_result
+                # If None returned, continue with non-streaming logic below
+
             # 1) Initial call: let model emit any function_call messages
             if provider == 'openai':
                 if async_mode:
@@ -208,6 +219,225 @@ def patch_openai_with_mcp(client):
             if not calls:
                 return resp
 
+            # If streaming was requested, synthesize tool call events to show what tools are being executed
+            if is_streaming:
+                # Execute tools first (avoiding event loop conflicts)
+                tasks = [
+                    _execute_tool(call.name,
+                                  json.loads(call.arguments) if isinstance(call.arguments, str) else call.arguments,
+                                  server_lookup)
+                    for call in calls
+                ]
+                results = await asyncio.gather(*tasks)
+                
+                # Build follow-up input with tool outputs
+                follow_input = input_history[:]
+                for call, result in zip(calls, results):
+                    follow_input.append({
+                        'type': 'function_call_output',
+                        'call_id': call.call_id,
+                        'output': json.dumps(result) if not isinstance(result, str) else result
+                    })
+                
+                # Create a generator that yields tool call events followed by the final response
+                def create_streaming_with_tool_events():
+                    # Create proper event objects that match OpenAI format
+                    class MockResponseOutputItemAddedEvent:
+                        def __init__(self, item, output_index, sequence_number):
+                            self.item = item
+                            self.output_index = output_index
+                            self.type = 'response.output_item.added'
+                            self.sequence_number = sequence_number
+                    
+                    class MockResponseOutputItemDoneEvent:
+                        def __init__(self, item, output_index, sequence_number):
+                            self.item = item
+                            self.output_index = output_index
+                            self.type = 'response.output_item.done'
+                            self.sequence_number = sequence_number
+                    
+                    class MockResponseFunctionToolCall:
+                        def __init__(self, name, arguments, call_id, fc_id, status='completed'):
+                            self.name = name
+                            self.arguments = arguments
+                            self.call_id = call_id
+                            self.type = 'function_call'
+                            self.id = fc_id
+                            self.status = status
+                    
+                    # First yield tool call events to show what tools were executed
+                    seq_num = 0
+                    for i, call in enumerate(calls):
+                        # Create a mock tool call object with result in a comment-like format
+                        result_str = str(results[i])
+                        mock_call = MockResponseFunctionToolCall(
+                            name=call.name,
+                            arguments=call.arguments,
+                            call_id=call.call_id,
+                            fc_id=getattr(call, 'id', f'fc_{call.call_id}'),
+                            status='completed'
+                        )
+                        
+                        # Add result as a custom attribute for visibility
+                        mock_call.tool_result = result_str
+                        
+                        # Yield output item added event
+                        yield MockResponseOutputItemAddedEvent(
+                            item=mock_call,
+                            output_index=i,
+                            sequence_number=seq_num
+                        )
+                        seq_num += 1
+                        
+                        # Yield output item done event
+                        yield MockResponseOutputItemDoneEvent(
+                            item=mock_call,
+                            output_index=i,
+                            sequence_number=seq_num
+                        )
+                        seq_num += 1
+                    
+                    # Make streaming follow-up call
+                    follow_kwargs = clean_kwargs.copy()
+                    follow_kwargs.pop('previous_response_id', None)
+                    follow_kwargs['stream'] = True
+                    
+                    if provider == 'openai':
+                        if async_mode:
+                            # Can't use _run_async here due to loop conflicts
+                            # This will only work for async mode
+                            follow_stream = orig_fn_async(
+                                self, *args,
+                                model=model,
+                                input=follow_input,
+                                previous_response_id=resp.id,
+                                **follow_kwargs
+                            )
+                        else:
+                            follow_stream = orig_fn_sync(
+                                self, *args,
+                                model=model,
+                                input=follow_input,
+                                previous_response_id=resp.id,
+                                **follow_kwargs
+                            )
+                    else:
+                        if async_mode:
+                            follow_stream = litellm.aresponses(
+                                model=model,
+                                input=follow_input,
+                                previous_response_id=resp.id,
+                                api_key=api_key,
+                                **follow_kwargs
+                            )
+                        else:
+                            follow_stream = litellm.responses(
+                                model=model,
+                                input=follow_input,
+                                previous_response_id=resp.id,
+                                api_key=api_key,
+                                **follow_kwargs
+                            )
+                    
+                    # Stream the follow-up response
+                    if async_mode:
+                        # For async mode, we need to handle the async stream properly
+                        for event in follow_stream:
+                            yield event
+                    else:
+                        # For sync mode, the stream should be sync
+                        for event in follow_stream:
+                            yield event
+                
+                if async_mode:
+                    # For async mode, we can handle the async generator properly
+                    async def async_streaming_with_tool_events():
+                        # Create proper event objects that match OpenAI format
+                        class MockResponseOutputItemAddedEvent:
+                            def __init__(self, item, output_index, sequence_number):
+                                self.item = item
+                                self.output_index = output_index
+                                self.type = 'response.output_item.added'
+                                self.sequence_number = sequence_number
+                        
+                        class MockResponseOutputItemDoneEvent:
+                            def __init__(self, item, output_index, sequence_number):
+                                self.item = item
+                                self.output_index = output_index
+                                self.type = 'response.output_item.done'
+                                self.sequence_number = sequence_number
+                        
+                        class MockResponseFunctionToolCall:
+                            def __init__(self, name, arguments, call_id, fc_id, status='completed'):
+                                self.name = name
+                                self.arguments = arguments
+                                self.call_id = call_id
+                                self.type = 'function_call'
+                                self.id = fc_id
+                                self.status = status
+                        
+                        # First yield tool call events to show what tools were executed
+                        seq_num = 0
+                        for i, call in enumerate(calls):
+                            # Create a mock tool call object with result in a comment-like format
+                            result_str = str(results[i])
+                            mock_call = MockResponseFunctionToolCall(
+                                name=call.name,
+                                arguments=call.arguments,
+                                call_id=call.call_id,
+                                fc_id=getattr(call, 'id', f'fc_{call.call_id}'),
+                                status='completed'
+                            )
+                            
+                            # Add result as a custom attribute for visibility
+                            mock_call.tool_result = result_str
+                            
+                            # Yield output item added event
+                            yield MockResponseOutputItemAddedEvent(
+                                item=mock_call,
+                                output_index=i,
+                                sequence_number=seq_num
+                            )
+                            seq_num += 1
+                            
+                            # Yield output item done event
+                            yield MockResponseOutputItemDoneEvent(
+                                item=mock_call,
+                                output_index=i,
+                                sequence_number=seq_num
+                            )
+                            seq_num += 1
+                        
+                        # Make streaming follow-up call
+                        follow_kwargs = clean_kwargs.copy()
+                        follow_kwargs.pop('previous_response_id', None)
+                        follow_kwargs['stream'] = True
+                        
+                        if provider == 'openai':
+                            follow_stream = await orig_fn_async(
+                                self, *args,
+                                model=model,
+                                input=follow_input,
+                                previous_response_id=resp.id,
+                                **follow_kwargs
+                            )
+                        else:
+                            follow_stream = await litellm.aresponses(
+                                model=model,
+                                input=follow_input,
+                                previous_response_id=resp.id,
+                                api_key=api_key,
+                                **follow_kwargs
+                            )
+                        
+                        # Stream the follow-up response
+                        async for event in follow_stream:
+                            yield event
+                    
+                    return async_streaming_with_tool_events()
+                else:
+                    return create_streaming_with_tool_events()
+
             # Execute all tool calls in parallel
             tasks = [
                 _execute_tool(call.name,
@@ -230,6 +460,10 @@ def patch_openai_with_mcp(client):
             # Prepare follow-up kwargs, avoid duplicating previous_response_id
             follow_kwargs = clean_kwargs.copy()
             follow_kwargs.pop('previous_response_id', None)
+            
+            # Re-enable streaming for the follow-up call if it was originally requested
+            if is_streaming:
+                follow_kwargs['stream'] = True
 
             if provider == 'openai':
                 if async_mode:
@@ -311,6 +545,219 @@ def patch_openai_with_mcp(client):
             clean_kwargs.pop('tool_choice', None)
             final_tools = None
 
+    async def _handle_streaming_responses(
+            self, args, model, input_history, final_tools, clean_kwargs,
+            provider, api_key, async_mode, orig_fn_sync, orig_fn_async,
+            server_lookup
+    ):
+        """Handle streaming responses with automatic tool call execution."""
+        
+        async def stream_with_tool_handling():
+            # 1) Initial streaming call
+            if provider == 'openai':
+                if async_mode:
+                    stream = await orig_fn_async(
+                        self, *args,
+                        model=model,
+                        input=input_history,
+                        tools=final_tools,
+                        **clean_kwargs
+                    )
+                else:
+                    stream = orig_fn_sync(
+                        self, *args,
+                        model=model,
+                        input=input_history,
+                        tools=final_tools,
+                        **clean_kwargs
+                    )
+            else:
+                if async_mode:
+                    stream = await litellm.aresponses(
+                        model=model,
+                        input=input_history,
+                        tools=final_tools,
+                        api_key=api_key,
+                        **clean_kwargs
+                    )
+                else:
+                    stream = litellm.responses(
+                        model=model,
+                        input=input_history,
+                        tools=final_tools,
+                        api_key=api_key,
+                        **clean_kwargs
+                    )
+            
+            response_id = None
+            
+            if async_mode:
+                async for event in stream:
+                    event_type = getattr(event, 'type', None)
+                    
+                    if event_type == 'response.created':
+                        response_id = getattr(event.response, 'id', None) if hasattr(event, 'response') else None
+                        yield event
+                        
+                    elif event_type == 'response.completed':
+                        # Response complete - check if function calls are in the completed response
+                        response_obj = getattr(event, 'response', None)
+                        if response_obj and hasattr(response_obj, 'output'):
+                            tool_calls = [
+                                item for item in response_obj.output 
+                                if getattr(item, 'type', None) == 'function_call'
+                            ]
+                            
+                            if tool_calls:
+                                # Execute all function calls in parallel
+                                tasks = []
+                                for call in tool_calls:
+                                    fn_name = getattr(call, 'name', None)
+                                    fn_args = getattr(call, 'arguments', '{}')
+                                    if isinstance(fn_args, str):
+                                        fn_args = json.loads(fn_args)
+                                    tasks.append(_execute_tool(fn_name, fn_args, server_lookup))
+                                
+                                results = await asyncio.gather(*tasks)
+                                
+                                # Build follow-up input with tool outputs
+                                follow_input = input_history[:]
+                                for call, result in zip(tool_calls, results):
+                                    call_id = getattr(call, 'call_id', None)
+                                    call_alt_id = getattr(call, 'id', None)
+                                    print(f"[ASYNC] Processing tool call - name: {call.name}, call_id: {call_id}, id: {call_alt_id}, type: {type(call)}")
+                                    print(f"[ASYNC] Call object attributes: {[attr for attr in dir(call) if not attr.startswith('_')]}")
+                                    
+                                    follow_input.append({
+                                        'type': 'function_call_output',
+                                        'call_id': call_id,
+                                        'output': json.dumps(result) if not isinstance(result, str) else result
+                                    })
+                                    print(f"[ASYNC] Added function_call_output with call_id: {call_id}")
+                                
+                                print(f"[ASYNC] Follow-up input: {follow_input}")
+                                print(f"[ASYNC] Input history type: {type(input_history)}, value: {input_history}")
+                                
+                                # Make follow-up streaming call
+                                follow_kwargs = clean_kwargs.copy()
+                                # Keep previous_response_id for call_id context
+                                # follow_kwargs.pop('previous_response_id', None)
+                                
+                                # Add a small delay to ensure the response is fully processed
+                                await asyncio.sleep(0.1)
+                                
+                                if provider == 'openai':
+                                    # Include previous_response_id for call_id context
+                                    follow_stream = await orig_fn_async(
+                                        self, *args,
+                                        model=model,
+                                        input=follow_input,
+                                        previous_response_id=response_id,
+                                        **follow_kwargs
+                                    )
+                                else:
+                                    follow_stream = await litellm.aresponses(
+                                        model=model,
+                                        input=follow_input,
+                                        previous_response_id=response_id,
+                                        api_key=api_key,
+                                        **follow_kwargs
+                                    )
+                                
+                                # Stream the follow-up response
+                                async for follow_event in follow_stream:
+                                    yield follow_event
+                            else:
+                                # No function calls, just yield the final event
+                                yield event
+                        else:
+                            # No function calls, just yield the final event
+                            yield event
+                    else:
+                        # Pass through all other events
+                        yield event
+            else:
+                for event in stream:
+                    event_type = getattr(event, 'type', None)
+                    
+                    if event_type == 'response.created':
+                        response_id = getattr(event.response, 'id', None) if hasattr(event, 'response') else None
+                        yield event
+                        
+                    elif event_type == 'response.completed':
+                        # Response complete - check if function calls are in the completed response
+                        response_obj = getattr(event, 'response', None)
+                        if response_obj and hasattr(response_obj, 'output'):
+                            tool_calls = [
+                                item for item in response_obj.output 
+                                if getattr(item, 'type', None) == 'function_call'
+                            ]
+                            
+                            if tool_calls:
+                                # Execute all function calls in parallel
+                                tasks = []
+                                for call in tool_calls:
+                                    fn_name = getattr(call, 'name', None)
+                                    fn_args = getattr(call, 'arguments', '{}')
+                                    if isinstance(fn_args, str):
+                                        fn_args = json.loads(fn_args)
+                                    tasks.append(_execute_tool(fn_name, fn_args, server_lookup))
+                                
+                                results = await asyncio.gather(*tasks)
+                                
+                                # Build follow-up input with tool outputs
+                                follow_input = input_history[:]
+                                for call, result in zip(tool_calls, results):
+                                    follow_input.append({
+                                        'type': 'function_call_output',
+                                        'call_id': getattr(call, 'call_id', None),
+                                        'output': json.dumps(result) if not isinstance(result, str) else result
+                                    })
+                                
+                                # Make follow-up streaming call
+                                follow_kwargs = clean_kwargs.copy()
+                                follow_kwargs.pop('previous_response_id', None)
+                                
+                                if provider == 'openai':
+                                    follow_stream = orig_fn_sync(
+                                        self, *args,
+                                        model=model,
+                                        input=follow_input,
+                                        previous_response_id=response_id,
+                                        **follow_kwargs
+                                    )
+                                else:
+                                    follow_stream = litellm.responses(
+                                        model=model,
+                                        input=follow_input,
+                                        previous_response_id=response_id,
+                                        api_key=api_key,
+                                        **follow_kwargs
+                                    )
+                                
+                                # Stream the follow-up response
+                                for follow_event in follow_stream:
+                                    yield follow_event
+                            else:
+                                # No function calls, just yield the final event
+                                yield event
+                        else:
+                            # No function calls, just yield the final event
+                            yield event
+                    else:
+                        # Pass through all other events
+                        yield event
+        
+        if async_mode:
+            return stream_with_tool_handling()
+        else:
+            # For sync mode, streaming tool calls are complex due to event loop requirements
+            # For now, fall back to non-streaming behavior to avoid MCP server conflicts
+            logger.warning("Streaming with tool calls not supported in sync mode, falling back to non-streaming")
+            clean_kwargs.pop('stream', None)
+            # Fall through to non-streaming handling below
+            return None  # Signal to continue with non-streaming logic
+
     # Helper to execute MCP or local tools
     async def _execute_tool(fn_name, fn_args, server_lookup):
         if fn_name in server_lookup:
@@ -345,21 +792,23 @@ def patch_openai_with_mcp(client):
     @wraps(orig_responses_sync)
     def patched_responses_sync(self, *args, model=None, input=None,
                                mcp_servers=None, mcp_strict=False,
-                               tools=None, **kwargs):
+                               tools=None, stream=False, **kwargs):
+        kwargs['stream'] = stream
         return _run_async(_handle_llm_call(
             self, args, model, input,
             mcp_servers, mcp_strict, tools, kwargs,
-            False, orig_responses_sync, orig_responses_async, True
+            False, orig_responses_sync, orig_responses_async, True, stream
         ))
 
     @wraps(orig_responses_async)
     async def patched_responses_async(self, *args, model=None, input=None,
                                       mcp_servers=None, mcp_strict=False,
-                                      tools=None, **kwargs):
+                                      tools=None, stream=False, **kwargs):
+        kwargs['stream'] = stream
         return await _handle_llm_call(
             self, args, model, input,
             mcp_servers, mcp_strict, tools, kwargs,
-            True, orig_responses_sync, orig_responses_async, True
+            True, orig_responses_sync, orig_responses_async, True, stream
         )
 
     @wraps(orig_embeddings_sync)
