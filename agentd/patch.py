@@ -7,6 +7,14 @@ from functools import wraps
 from openai.resources.chat.completions import Completions, AsyncCompletions
 from openai.resources.responses import Responses, AsyncResponses
 from openai.resources.embeddings import Embeddings, AsyncEmbeddings
+from openai.types.responses import (
+    ResponseFunctionCallArgumentsDeltaEvent,
+    ResponseFunctionCallArgumentsDoneEvent,
+    ResponseOutputItemAddedEvent,
+    ResponseOutputItemDoneEvent,
+    ResponseOutputMessage,
+    ResponseFunctionToolCall
+)
 
 from agents.mcp.util import MCPUtil
 import litellm.utils as llm_utils
@@ -57,10 +65,25 @@ def patch_openai_with_mcp(client):
             })
         return schemas
 
+    def _should_stream_tool_results(kwargs):
+        """Check if tool_call.results streaming is requested."""
+        include = kwargs.get('include')
+        return include and isinstance(include, list) and "tool_call.results" in include
+
     def _clean_kwargs(kwargs):
         cleaned = kwargs.copy()
         cleaned.pop('mcp_servers', None)
         cleaned.pop('mcp_strict', None)
+        
+        # Only remove "tool_call.results" from include list, preserve other include values
+        include = kwargs.get('include')
+        if include and isinstance(include, list):
+            filtered_include = [item for item in include if item != "tool_call.results"]
+            if filtered_include:
+                cleaned['include'] = filtered_include
+            else:
+                cleaned.pop('include', None)
+        
         return cleaned
 
     MAX_TOOL_LOOPS = 20
@@ -172,7 +195,7 @@ def patch_openai_with_mcp(client):
                 stream_result = await _handle_streaming_responses(
                     self, args, model, input_history, final_tools, clean_kwargs,
                     provider, api_key, async_mode, orig_fn_sync, orig_fn_async,
-                    server_lookup
+                    server_lookup, kwargs.get('include')
                 )
                 if stream_result is not None:
                     return stream_result
@@ -548,7 +571,7 @@ def patch_openai_with_mcp(client):
     async def _handle_streaming_responses(
             self, args, model, input_history, final_tools, clean_kwargs,
             provider, api_key, async_mode, orig_fn_sync, orig_fn_async,
-            server_lookup
+            server_lookup, include=None
     ):
         """Handle streaming responses with automatic tool call execution."""
         
@@ -620,13 +643,81 @@ def patch_openai_with_mcp(client):
                                 
                                 results = await asyncio.gather(*tasks)
                                 
+                                # Check if we should emit tool call streaming events
+                                should_stream_tools = include and isinstance(include, list) and "tool_call.results" in include
+                                print(f"[ASYNC] Should stream tool results: {should_stream_tools}")
+                                
                                 # Build follow-up input with tool outputs
                                 follow_input = input_history[:]
-                                for call, result in zip(tool_calls, results):
+                                for i, (call, result) in enumerate(zip(tool_calls, results)):
                                     call_id = getattr(call, 'call_id', None)
                                     call_alt_id = getattr(call, 'id', None)
-                                    print(f"[ASYNC] Processing tool call - name: {call.name}, call_id: {call_id}, id: {call_alt_id}, type: {type(call)}")
+                                    fn_name = getattr(call, 'name', None)
+                                    fn_args = getattr(call, 'arguments', '{}')
+                                    
+                                    print(f"[ASYNC] Processing tool call - name: {fn_name}, call_id: {call_id}, id: {call_alt_id}, type: {type(call)}")
                                     print(f"[ASYNC] Call object attributes: {[attr for attr in dir(call) if not attr.startswith('_')]}")
+                                    
+                                    if should_stream_tools:
+                                        print(f"[ASYNC] Emitting streaming events for tool call {i+1}")
+                                        # Emit tool call streaming events
+                                        tool_call_item = ResponseFunctionToolCall(
+                                            arguments='',
+                                            call_id=call_id,
+                                            name=fn_name,
+                                            type='function_call',
+                                            id=call_alt_id or f'fc_{i+1}',
+                                            status='in_progress'
+                                        )
+                                        
+                                        # Emit output item added event
+                                        yield ResponseOutputItemAddedEvent(
+                                            item=tool_call_item,
+                                            output_index=i,
+                                            sequence_number=i * 4,
+                                            type='response.output_item.added'
+                                        )
+                                        
+                                        # Emit arguments delta event
+                                        yield ResponseFunctionCallArgumentsDeltaEvent(
+                                            delta=fn_args,
+                                            item_id=call_alt_id or f'fc_{i+1}',
+                                            output_index=i,
+                                            sequence_number=i * 4 + 1,
+                                            type='response.function_call_arguments.delta'
+                                        )
+                                        
+                                        # Emit arguments done event
+                                        yield ResponseFunctionCallArgumentsDoneEvent(
+                                            arguments=fn_args,
+                                            item_id=call_alt_id or f'fc_{i+1}',
+                                            output_index=i,
+                                            sequence_number=i * 4 + 2,
+                                            type='response.function_call_arguments.done'
+                                        )
+                                        
+                                        # Create completed tool call with results
+                                        completed_tool_call = ResponseFunctionToolCall(
+                                            arguments=fn_args,
+                                            call_id=call_id,
+                                            name=fn_name,
+                                            type='function_call',
+                                            id=call_alt_id or f'fc_{i+1}',
+                                            status='completed'
+                                        )
+                                        
+                                        # Add custom attributes for tool results (like in your example)
+                                        completed_tool_call.inputs = json.loads(fn_args) if isinstance(fn_args, str) else fn_args
+                                        completed_tool_call.tool_name = fn_name
+                                        completed_tool_call.results = result if isinstance(result, list) else [result]
+                                        
+                                        # Emit output item done event with results
+                                        yield ResponseOutputItemDoneEvent(
+                                            item=completed_tool_call,
+                                            output_index=i,
+                                            sequence_number=i * 4 + 3,
+                                            type='response.output_item.done'
+                                        )
                                     
                                     follow_input.append({
                                         'type': 'function_call_output',
@@ -705,14 +796,87 @@ def patch_openai_with_mcp(client):
                                 
                                 results = await asyncio.gather(*tasks)
                                 
+                                # Check if we should emit tool call streaming events
+                                should_stream_tools = include and isinstance(include, list) and "tool_call.results" in include
+                                print(f"[SYNC] Should stream tool results: {should_stream_tools}")
+                                
                                 # Build follow-up input with tool outputs
                                 follow_input = input_history[:]
-                                for call, result in zip(tool_calls, results):
+                                for i, (call, result) in enumerate(zip(tool_calls, results)):
+                                    call_id = getattr(call, 'call_id', None)
+                                    call_alt_id = getattr(call, 'id', None)
+                                    fn_name = getattr(call, 'name', None)
+                                    fn_args = getattr(call, 'arguments', '{}')
+                                    
+                                    print(f"[SYNC] Processing tool call - name: {fn_name}, call_id: {call_id}, id: {call_alt_id}")
+                                    
+                                    if should_stream_tools:
+                                        print(f"[SYNC] Emitting streaming events for tool call {i+1}")
+                                        # Emit tool call streaming events
+                                        tool_call_item = ResponseFunctionToolCall(
+                                            arguments='',
+                                            call_id=call_id,
+                                            name=fn_name,
+                                            type='function_call',
+                                            id=call_alt_id or f'fc_{i+1}',
+                                            status='in_progress'
+                                        )
+                                        
+                                        # Emit output item added event
+                                        yield ResponseOutputItemAddedEvent(
+                                            item=tool_call_item,
+                                            output_index=i,
+                                            sequence_number=i * 4,
+                                            type='response.output_item.added'
+                                        )
+                                        
+                                        # Emit arguments delta event
+                                        yield ResponseFunctionCallArgumentsDeltaEvent(
+                                            delta=fn_args,
+                                            item_id=call_alt_id or f'fc_{i+1}',
+                                            output_index=i,
+                                            sequence_number=i * 4 + 1,
+                                            type='response.function_call_arguments.delta'
+                                        )
+                                        
+                                        # Emit arguments done event
+                                        yield ResponseFunctionCallArgumentsDoneEvent(
+                                            arguments=fn_args,
+                                            item_id=call_alt_id or f'fc_{i+1}',
+                                            output_index=i,
+                                            sequence_number=i * 4 + 2,
+                                            type='response.function_call_arguments.done'
+                                        )
+                                        
+                                        # Create completed tool call with results
+                                        completed_tool_call = ResponseFunctionToolCall(
+                                            arguments=fn_args,
+                                            call_id=call_id,
+                                            name=fn_name,
+                                            type='function_call',
+                                            id=call_alt_id or f'fc_{i+1}',
+                                            status='completed'
+                                        )
+                                        
+                                        # Add custom attributes for tool results (like in your example)
+                                        completed_tool_call.inputs = json.loads(fn_args) if isinstance(fn_args, str) else fn_args
+                                        completed_tool_call.tool_name = fn_name
+                                        completed_tool_call.results = result if isinstance(result, list) else [result]
+                                        
+                                        # Emit output item done event with results
+                                        yield ResponseOutputItemDoneEvent(
+                                            item=completed_tool_call,
+                                            output_index=i,
+                                            sequence_number=i * 4 + 3,
+                                            type='response.output_item.done'
+                                        )
+                                    
                                     follow_input.append({
                                         'type': 'function_call_output',
-                                        'call_id': getattr(call, 'call_id', None),
+                                        'call_id': call_id,
                                         'output': json.dumps(result) if not isinstance(result, str) else result
                                     })
+                                    print(f"[SYNC] Added function_call_output with call_id: {call_id}")
                                 
                                 # Make follow-up streaming call
                                 follow_kwargs = clean_kwargs.copy()
@@ -792,8 +956,9 @@ def patch_openai_with_mcp(client):
     @wraps(orig_responses_sync)
     def patched_responses_sync(self, *args, model=None, input=None,
                                mcp_servers=None, mcp_strict=False,
-                               tools=None, stream=False, **kwargs):
+                               tools=None, stream=False, include=None, **kwargs):
         kwargs['stream'] = stream
+        kwargs['include'] = include
         return _run_async(_handle_llm_call(
             self, args, model, input,
             mcp_servers, mcp_strict, tools, kwargs,
@@ -803,8 +968,9 @@ def patch_openai_with_mcp(client):
     @wraps(orig_responses_async)
     async def patched_responses_async(self, *args, model=None, input=None,
                                       mcp_servers=None, mcp_strict=False,
-                                      tools=None, stream=False, **kwargs):
+                                      tools=None, stream=False, include=None, **kwargs):
         kwargs['stream'] = stream
+        kwargs['include'] = include
         return await _handle_llm_call(
             self, args, model, input,
             mcp_servers, mcp_strict, tools, kwargs,
