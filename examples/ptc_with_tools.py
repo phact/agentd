@@ -70,20 +70,24 @@ To run a bash command:
 <command>
 ```
 
+To run Python code:
+```python:execute
+from <skill_name>.lib.tools import some_function
+result = some_function(arg="value")
+print(result)
+```
+
 To create a file:
 ```filename.ext:create
 <contents>
 ```
 
-You have a ./skills/ directory with Python tools. To use them:
-1. First explore: `ls skills/` and `cat skills/SKILL.md`
-2. Import and call:
-```python:execute
-from _lib.tools import calculate
-print(calculate(expression="2 + 2"))
-```
+You have a ./skills/ directory with available tools. Each subdirectory is a skill with:
+- `lib/tools.py` - importable functions
+- `examples/` - usage examples for each function
+- `SKILL.md` - documentation
 
-Always explore available tools before trying to use them."""
+Explore with `ls skills/` to see available skills."""
 
 
 def main():

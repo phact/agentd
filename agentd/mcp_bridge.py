@@ -20,12 +20,14 @@ logger = logging.getLogger(__name__)
 class MCPBridge:
     """Local HTTP server that proxies MCP tool calls."""
 
-    def __init__(self, port: int = 0):
+    def __init__(self, port: int = 0, main_loop: asyncio.AbstractEventLoop | None = None):
         """
         Initialize the MCP bridge.
 
         Args:
             port: Port to listen on (0 = auto-assign)
+            main_loop: The event loop where MCP connections were established.
+                       Tool calls will be dispatched to this loop.
         """
         self.port = port
         self.servers: dict[str, Any] = {}  # tool_name -> server connection
@@ -33,7 +35,8 @@ class MCPBridge:
         self._runner: web.AppRunner | None = None
         self._site: web.TCPSite | None = None
         self._thread: threading.Thread | None = None
-        self._loop: asyncio.AbstractEventLoop | None = None
+        self._loop: asyncio.AbstractEventLoop | None = None  # Bridge's own loop
+        self._main_loop: asyncio.AbstractEventLoop | None = main_loop  # MCP connection loop
         self._started = threading.Event()
 
     async def start(self) -> int:
@@ -97,6 +100,20 @@ class MCPBridge:
         self._started.wait(timeout=10)
         return self.port
 
+    async def start_async(self) -> int:
+        """
+        Start the bridge server in the current async context.
+
+        This allows the bridge to handle requests while other async
+        operations (like subprocess execution) are awaited.
+
+        Returns:
+            The port number the server is listening on.
+        """
+        port = await self.start()
+        self._started.set()
+        return port
+
     def stop_thread(self):
         """Stop the bridge server running in background thread."""
         if self._loop:
@@ -127,7 +144,20 @@ class MCPBridge:
         if tool_name in self.servers:
             try:
                 server = self.servers[tool_name]
-                result = await server.call_tool(tool_name, args)
+
+                # If running in a separate thread with main_loop reference,
+                # dispatch the call there (MCP connections must be used from the loop that created them)
+                # If running in the main async context (no thread), just await directly
+                if self._main_loop is not None and self._thread is not None:
+                    future = asyncio.run_coroutine_threadsafe(
+                        server.call_tool(tool_name, args),
+                        self._main_loop
+                    )
+                    result = future.result(timeout=60)  # Wait up to 60 seconds
+                else:
+                    # Running in same async context - await directly
+                    result = await server.call_tool(tool_name, args)
+
                 content = result.dict().get('content', result.dict())
                 return web.json_response(content)
             except Exception as e:

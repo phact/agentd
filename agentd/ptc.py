@@ -449,6 +449,80 @@ class SubprocessExecutor:
         except Exception as e:
             return f"Error creating file {filename}: {e}"
 
+    async def execute_python_async(self, code: str, cwd: Path, pythonpath: Path | None = None) -> tuple[str, int]:
+        """Run Python code asynchronously (keeps event loop running for MCP calls)."""
+        import tempfile
+        try:
+            # Write code to temp file in cwd
+            with tempfile.NamedTemporaryFile(
+                mode='w', suffix='.py', dir=cwd, delete=False
+            ) as f:
+                f.write(code)
+                temp_path = f.name
+
+            try:
+                env = {
+                    **os.environ,
+                    'MCP_BRIDGE_URL': os.environ.get('MCP_BRIDGE_URL', 'http://localhost:8765')
+                }
+                if pythonpath:
+                    existing = os.environ.get('PYTHONPATH', '')
+                    env['PYTHONPATH'] = f"{pythonpath}:{existing}" if existing else str(pythonpath)
+
+                proc = await asyncio.create_subprocess_exec(
+                    'python', temp_path,
+                    cwd=cwd,
+                    stdout=asyncio.subprocess.PIPE,
+                    stderr=asyncio.subprocess.PIPE,
+                    env=env
+                )
+
+                try:
+                    stdout, stderr = await asyncio.wait_for(
+                        proc.communicate(),
+                        timeout=self.timeout
+                    )
+                    output = stdout.decode()
+                    if stderr:
+                        err = stderr.decode()
+                        output += f"\n{err}" if output else err
+                    return output.strip(), proc.returncode or 0
+                except asyncio.TimeoutError:
+                    proc.kill()
+                    await proc.wait()
+                    return f"Python execution timed out after {self.timeout}s", 1
+            finally:
+                Path(temp_path).unlink(missing_ok=True)
+        except Exception as e:
+            return f"Error executing Python: {e}", 1
+
+    async def execute_bash_async(self, command: str, cwd: Path) -> tuple[str, int]:
+        """Run bash command asynchronously (keeps event loop running for MCP calls)."""
+        try:
+            proc = await asyncio.create_subprocess_shell(
+                command,
+                cwd=cwd,
+                stdout=asyncio.subprocess.PIPE,
+                stderr=asyncio.subprocess.PIPE
+            )
+
+            try:
+                stdout, stderr = await asyncio.wait_for(
+                    proc.communicate(),
+                    timeout=self.timeout
+                )
+                output = stdout.decode()
+                if stderr:
+                    err = stderr.decode()
+                    output += f"\n{err}" if output else err
+                return output.strip(), proc.returncode or 0
+            except asyncio.TimeoutError:
+                proc.kill()
+                await proc.wait()
+                return f"Command timed out after {self.timeout}s", 1
+        except Exception as e:
+            return f"Error executing command: {e}", 1
+
 
 # =============================================================================
 # Skill Generator - Creates skills from MCP tools and @tool functions
@@ -504,7 +578,7 @@ def {name}({sig}) -> dict:
 
 def generate_tools_module(tools: dict[str, dict], bridge_port: int = 8765) -> str:
     """Generate the complete tools.py module with all tool functions."""
-    header = f'''"""Auto-generated MCP tool bindings."""
+    header = f'''"""Auto-generated tool bindings."""
 import os
 import json
 import urllib.request
@@ -512,7 +586,7 @@ import urllib.request
 _BRIDGE_URL = os.environ.get('MCP_BRIDGE_URL', 'http://localhost:{bridge_port}')
 
 def _call(name: str, **kwargs):
-    """Call an MCP tool via the bridge."""
+    """Call a tool via the bridge."""
     # Filter out None values
     filtered = {{k: v for k, v in kwargs.items() if v is not None}}
     req = urllib.request.Request(
@@ -538,30 +612,133 @@ def _call(name: str, **kwargs):
     return header + "\n".join(functions)
 
 
-def generate_skill_md(name: str, description: str, tools: list[str]) -> str:
-    """Generate SKILL.md content."""
-    tools_list = "\n".join(f"  - {t}" for t in tools)
-    return f'''---
-name: {name}
-description: {description}
-tools:
-{tools_list}
----
-# {name}
+def _get_example_value(param_name: str, param_schema: dict) -> str:
+    """Get an example value for a parameter, using schema hints or smart defaults."""
+    # 1. Use 'examples' array if available (JSON Schema standard)
+    if 'examples' in param_schema and param_schema['examples']:
+        val = param_schema['examples'][0]
+        return repr(val)
+
+    # 2. Use 'default' if available
+    if 'default' in param_schema:
+        return repr(param_schema['default'])
+
+    # 3. Use 'example' (singular, common in OpenAPI)
+    if 'example' in param_schema:
+        return repr(param_schema['example'])
+
+    # 4. Fall back to smart defaults based on name/type
+    param_type = param_schema.get('type', 'string')
+    name_lower = param_name.lower()
+
+    if param_type == 'string':
+        if 'url' in name_lower:
+            return '"https://example.com"'
+        elif 'path' in name_lower:
+            return '"/path/to/file"'
+        elif 'content' in name_lower or 'text' in name_lower or 'body' in name_lower:
+            return '"Hello, world!"'
+        elif 'name' in name_lower:
+            return '"example"'
+        elif 'query' in name_lower:
+            return '"search term"'
+        else:
+            return '"value"'
+    elif param_type == 'integer' or param_type == 'number':
+        if 'length' in name_lower or 'size' in name_lower or 'limit' in name_lower:
+            return '1000'
+        elif 'port' in name_lower:
+            return '8080'
+        else:
+            return '10'
+    elif param_type == 'boolean':
+        return 'True'
+    elif param_type == 'array':
+        return '[]'
+    elif param_type == 'object':
+        return '{}'
+    else:
+        return '"value"'
+
+
+def generate_example_file(tool_name: str, schema: dict) -> str:
+    """Generate an example file showing how to call a tool."""
+    # Handle both flat schema and nested {type: function, function: {...}} format
+    if 'function' in schema:
+        schema = schema['function']
+    params = schema.get('parameters', {}).get('properties', {})
+    required = schema.get('parameters', {}).get('required', [])
+
+    # Build example args
+    example_args = []
+    for param_name, param_schema in params.items():
+        example_val = _get_example_value(param_name, param_schema)
+        example_args.append(f'{param_name}={example_val}')
+
+    args_str = ', '.join(example_args) if example_args else ''
+    desc = schema.get('description', f'Call the {tool_name} function')
+
+    return f'''"""Example: {tool_name}
+
+{desc}
+"""
+from lib.tools import {tool_name}
+
+result = {tool_name}({args_str})
+print(result)
+'''
+
+
+def generate_skill_md(skill_name: str, description: str, tools: list[str]) -> str:
+    """Generate SKILL.md content for a skill directory."""
+    tools_list = "\n".join(f"- `{t}`" for t in tools)
+    return f'''# {skill_name}
 
 {description}
 
-## Available Tools
+## Available Functions
 
-Use `from _lib.tools import <tool_name>` to import tools.
+{tools_list}
+
+## Usage
+
+Import from `lib.tools`:
 
 ```python
-from _lib.tools import {tools[0] if tools else 'tool_name'}
-
-result = {tools[0] if tools else 'tool_name'}(...)
+from lib.tools import {tools[0] if tools else 'function_name'}
+result = {tools[0] if tools else 'function_name'}(...)
 print(result)
 ```
+
+See the `examples/` directory for usage examples of each function.
 '''
+
+
+def _setup_skill_dir(skill_dir: Path, skill_name: str, tools: dict[str, dict], bridge_port: int):
+    """Setup a single skill directory with lib/, examples/, and SKILL.md."""
+    skill_dir.mkdir(exist_ok=True)
+    lib_dir = skill_dir / 'lib'
+    lib_dir.mkdir(exist_ok=True)
+    examples_dir = skill_dir / 'examples'
+    examples_dir.mkdir(exist_ok=True)
+
+    # Generate lib/tools.py
+    tools_py = generate_tools_module(tools, bridge_port)
+    (lib_dir / 'tools.py').write_text(tools_py)
+    (lib_dir / '__init__.py').write_text('from .tools import *\n')
+
+    # Generate example files
+    for tool_name, schema in tools.items():
+        example_file = examples_dir / f'{tool_name}.py'
+        example_file.write_text(generate_example_file(tool_name, schema))
+
+    # Generate SKILL.md
+    skill_md = generate_skill_md(
+        skill_name,
+        f'Tools from {skill_name}',
+        list(tools.keys())
+    )
+    (skill_dir / 'SKILL.md').write_text(skill_md)
 
 
 async def setup_skills_directory(
@@ -574,30 +751,47 @@ async def setup_skills_directory(
     """
     Setup the skills directory with tool bindings and start MCP bridge.
 
+    Directory structure:
+        skills/
+          <server_name>/      # One per MCP server
+            lib/
+              __init__.py
+              tools.py
+            examples/
+              tool_name.py
+            SKILL.md
+          local/              # @tool decorated functions
+            lib/
+            examples/
+            SKILL.md
+
     Returns:
         Tuple of (server_lookup dict, bridge_port)
     """
     from agentd.mcp_bridge import MCPBridge
 
     skills_dir.mkdir(parents=True, exist_ok=True)
-    lib_dir = skills_dir / '_lib'
-    lib_dir.mkdir(exist_ok=True)
 
-    # Collect all tools
-    all_tools = {}  # name -> schema
-    server_lookup = {}  # name -> server connection
+    server_lookup = {}  # tool_name -> server connection
+    skill_dirs = []  # Track created skill dirs for PYTHONPATH
 
-    # Start MCP bridge in background thread (reuse if already running)
+    # Start MCP bridge (reuse if already running)
+    # If MCP servers are present, use async mode so tool calls work properly
     if bridge_cache and 'bridge' in bridge_cache:
         bridge = bridge_cache['bridge']
         actual_port = bridge.port
     else:
         bridge = MCPBridge(port=bridge_port or 0)
-        actual_port = bridge.start_in_thread()
+        if mcp_servers:
+            # Use async start - bridge runs in same event loop as MCP connections
+            actual_port = await bridge.start_async()
+        else:
+            # No MCP servers - use thread mode for local tools
+            actual_port = bridge.start_in_thread()
         if bridge_cache is not None:
             bridge_cache['bridge'] = bridge
 
-    # 1) Gather MCP tools
+    # 1) Setup each MCP server as its own skill
     if mcp_servers:
         for server in mcp_servers:
             if server.name not in server_cache:
@@ -605,9 +799,11 @@ async def setup_skills_directory(
                 server_cache[server.name] = server
             conn = server_cache[server.name]
 
+            # Collect tools for this server
+            server_tools = {}
             tools = await conn.list_tools()
             for t in tools:
-                all_tools[t.name] = {
+                server_tools[t.name] = {
                     'name': t.name,
                     'description': t.description or '',
                     'parameters': t.inputSchema if hasattr(t, 'inputSchema') else {'type': 'object', 'properties': {}}
@@ -615,28 +811,51 @@ async def setup_skills_directory(
                 server_lookup[t.name] = conn
                 bridge.register_server(t.name, conn)
 
-    # 2) Gather @tool decorated functions
-    for name, schema in SCHEMA_REGISTRY.items():
-        if name not in all_tools:
-            all_tools[name] = schema
+            # Create skill directory for this server
+            # Clean up server name for valid Python module name
+            # Try to extract a meaningful name from the server params (e.g. package name)
+            skill_name = None
+
+            # Check if this looks like an MCP stdio server with command args
+            if hasattr(server, 'params'):
+                params = server.params
+                # params might be a dict or a StdioServerParameters object
+                args = getattr(params, 'args', None) or (params.get('args', []) if isinstance(params, dict) else [])
+                # Look for package name in args (e.g. "@modelcontextprotocol/server-everything")
+                for arg in args:
+                    if '/' in str(arg) and not str(arg).startswith('-'):
+                        # Extract last component: "server-everything" -> "everything"
+                        skill_name = str(arg).split('/')[-1]
+                        skill_name = skill_name.replace('server-', '')
+                        break
+
+            # Fallback to server name
+            if not skill_name:
+                skill_name = server.name.split('/')[-1]
+                skill_name = skill_name.replace('server-', '')
+
+            # Remove any characters invalid for Python identifiers
+            skill_name = ''.join(c if c.isalnum() or c == '_' else '_' for c in skill_name)
+            skill_name = skill_name.strip('_')  # Remove leading/trailing underscores
+            if not skill_name or skill_name[0].isdigit():
+                skill_name = 'mcp_' + skill_name  # Ensure valid identifier
+            skill_dir = skills_dir / skill_name
+            _setup_skill_dir(skill_dir, skill_name, server_tools, actual_port)
+            skill_dirs.append(skill_dir)
+
+    # 2) Setup @tool decorated functions as "local" skill
+    if SCHEMA_REGISTRY:
+        local_tools = {}
+        for name, schema in SCHEMA_REGISTRY.items():
+            local_tools[name] = schema
             bridge.register_local_tool(name, FUNCTION_REGISTRY[name])
 
-    # 3) Generate tools.py module with correct bridge URL
-    tools_py = generate_tools_module(all_tools, actual_port)
-    (lib_dir / 'tools.py').write_text(tools_py)
-    (lib_dir / '__init__.py').write_text('from .tools import *\n')
+        if local_tools:
+            skill_dir = skills_dir / 'local'
+            _setup_skill_dir(skill_dir, 'local', local_tools, actual_port)
+            skill_dirs.append(skill_dir)
 
-    # 4) Generate a default SKILL.md if it doesn't exist
-    skill_md_path = skills_dir / 'SKILL.md'
-    if not skill_md_path.exists():
-        skill_md = generate_skill_md(
-            'tools',
-            'Available tools and utilities',
-            list(all_tools.keys())[:10]  # First 10 tools
-        )
-        skill_md_path.write_text(skill_md)
-
-    logger.info(f"Setup skills directory with {len(all_tools)} tools at {skills_dir}")
+    logger.info(f"Setup {len(skill_dirs)} skill(s) at {skills_dir}")
     logger.info(f"MCP Bridge running on http://localhost:{actual_port}")
     return server_lookup, actual_port
 
@@ -764,15 +983,23 @@ async def _handle_ptc_call(
         logger.info(f"Found {len(fences)} code fences to execute")
 
         # Execute each fence
+        # Execute fences
+        # Use async execution if MCP servers are present (keeps loop running for callbacks)
         results = []
         for fence in fences:
             if fence.action == 'execute':
                 if fence.fence_type == 'bash':
                     # Bash runs in user's cwd
-                    output, code = executor.execute_bash(fence.content, cwd)
+                    if mcp_servers:
+                        output, code = await executor.execute_bash_async(fence.content, cwd)
+                    else:
+                        output, code = executor.execute_bash(fence.content, cwd)
                 else:
                     # Python runs in skills_dir so imports work
-                    output, code = executor.execute_python(fence.content, cwd, pythonpath=skills_dir)
+                    if mcp_servers:
+                        output, code = await executor.execute_python_async(fence.content, cwd, pythonpath=skills_dir)
+                    else:
+                        output, code = executor.execute_python(fence.content, cwd, pythonpath=skills_dir)
                 results.append((fence, output))
                 logger.info(f"Executed {fence.fence_type}: exit_code={code}")
             elif fence.action == 'create':
@@ -879,11 +1106,18 @@ async def _handle_ptc_streaming(
                             break
 
                         # Execute fence immediately
+                        # Use async execution if MCP servers are present
                         if fence.action == 'execute':
                             if fence.fence_type == 'bash':
-                                output, code = executor.execute_bash(fence.content, cwd)
+                                if mcp_servers:
+                                    output, code = await executor.execute_bash_async(fence.content, cwd)
+                                else:
+                                    output, code = executor.execute_bash(fence.content, cwd)
                             else:
-                                output, code = executor.execute_python(fence.content, cwd, pythonpath=skills_dir)
+                                if mcp_servers:
+                                    output, code = await executor.execute_python_async(fence.content, cwd, pythonpath=skills_dir)
+                                else:
+                                    output, code = executor.execute_python(fence.content, cwd, pythonpath=skills_dir)
                         else:
                             output = executor.create_file(fence.fence_type, fence.content, skills_dir)
 
@@ -900,11 +1134,18 @@ async def _handle_ptc_streaming(
                         if not fence:
                             break
 
+                        # Use async execution if MCP servers are present
                         if fence.action == 'execute':
                             if fence.fence_type == 'bash':
-                                output, code = executor.execute_bash(fence.content, cwd)
+                                if mcp_servers:
+                                    output, code = await executor.execute_bash_async(fence.content, cwd)
+                                else:
+                                    output, code = executor.execute_bash(fence.content, cwd)
                             else:
-                                output, code = executor.execute_python(fence.content, cwd, pythonpath=skills_dir)
+                                if mcp_servers:
+                                    output, code = await executor.execute_python_async(fence.content, cwd, pythonpath=skills_dir)
+                                else:
+                                    output, code = executor.execute_python(fence.content, cwd, pythonpath=skills_dir)
                         else:
                             output = executor.create_file(fence.fence_type, fence.content, skills_dir)
 
@@ -1050,13 +1291,20 @@ async def _handle_ptc_responses_call(
         logger.info(f"[Responses] Found {len(fences)} code fences to execute")
 
         # Execute fences
+        # Use async execution if MCP servers are present (keeps loop running for callbacks)
         results = []
         for fence in fences:
             if fence.action == 'execute':
                 if fence.fence_type == 'bash':
-                    output, code = executor.execute_bash(fence.content, cwd)
+                    if mcp_servers:
+                        output, code = await executor.execute_bash_async(fence.content, cwd)
+                    else:
+                        output, code = executor.execute_bash(fence.content, cwd)
                 else:
-                    output, code = executor.execute_python(fence.content, cwd, pythonpath=skills_dir)
+                    if mcp_servers:
+                        output, code = await executor.execute_python_async(fence.content, cwd, pythonpath=skills_dir)
+                    else:
+                        output, code = executor.execute_python(fence.content, cwd, pythonpath=skills_dir)
                 results.append((fence, output))
             elif fence.action == 'create':
                 msg = executor.create_file(fence.fence_type, fence.content, skills_dir)
@@ -1169,11 +1417,18 @@ async def _handle_ptc_responses_streaming(
                                 break
 
                             # Execute fence
+                            # Use async execution if MCP servers are present (keeps loop running for callbacks)
                             if fence.action == 'execute':
                                 if fence.fence_type == 'bash':
-                                    output, code = executor.execute_bash(fence.content, cwd)
+                                    if mcp_servers:
+                                        output, code = await executor.execute_bash_async(fence.content, cwd)
+                                    else:
+                                        output, code = executor.execute_bash(fence.content, cwd)
                                 else:
-                                    output, code = executor.execute_python(fence.content, cwd, pythonpath=skills_dir)
+                                    if mcp_servers:
+                                        output, code = await executor.execute_python_async(fence.content, cwd, pythonpath=skills_dir)
+                                    else:
+                                        output, code = executor.execute_python(fence.content, cwd, pythonpath=skills_dir)
                                 status = "completed" if code == 0 else "failed"
                             else:
                                 output = executor.create_file(fence.fence_type, fence.content, skills_dir)
@@ -1208,9 +1463,15 @@ async def _handle_ptc_responses_streaming(
 
                             if fence.action == 'execute':
                                 if fence.fence_type == 'bash':
-                                    output, code = executor.execute_bash(fence.content, cwd)
+                                    if mcp_servers:
+                                        output, code = await executor.execute_bash_async(fence.content, cwd)
+                                    else:
+                                        output, code = executor.execute_bash(fence.content, cwd)
                                 else:
-                                    output, code = executor.execute_python(fence.content, cwd, pythonpath=skills_dir)
+                                    if mcp_servers:
+                                        output, code = await executor.execute_python_async(fence.content, cwd, pythonpath=skills_dir)
+                                    else:
+                                        output, code = executor.execute_python(fence.content, cwd, pythonpath=skills_dir)
                                 status = "completed" if code == 0 else "failed"
                             else:
                                 output = executor.create_file(fence.fence_type, fence.content, skills_dir)

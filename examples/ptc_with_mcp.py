@@ -3,7 +3,7 @@
 PTC Example with MCP servers.
 
 Shows how to use MCP servers with PTC. The MCP tools are exposed
-via the HTTP bridge and can be called from skill scripts.
+as Python functions the LLM can import and call.
 """
 import tempfile
 from pathlib import Path
@@ -13,11 +13,18 @@ from agents.mcp.server import MCPServerStdio
 from openai import OpenAI
 
 
-SYSTEM_PROMPT = """You are an AI assistant with filesystem tools available.
+SYSTEM_PROMPT = """You are an AI assistant that can run bash commands and Python code.
 
-To run a bash command:
+To run bash:
 ```bash:execute
 <command>
+```
+
+To run Python:
+```python:execute
+from <skill_name>.lib.tools import some_function
+result = some_function(arg="value")
+print(result)
 ```
 
 To create a file:
@@ -25,41 +32,27 @@ To create a file:
 <contents>
 ```
 
-You have a ./skills/ directory with tools including filesystem operations.
-Explore with `ls skills/` and `cat skills/SKILL.md` to see what's available.
+You have a ./skills/ directory with available tools. Each subdirectory is a skill with:
+- `lib/tools.py` - importable functions
+- `examples/` - usage examples for each function
+- `SKILL.md` - documentation
 
-To use MCP tools:
-```python:execute
-from _lib.tools import read_file, list_directory
-print(read_file(path="/some/path"))
-```
-
-Always explore the skills directory first to discover available tools."""
+Explore with `ls skills/` to see available skills."""
 
 
 def main():
     with tempfile.TemporaryDirectory() as workspace:
-        # Create some test files
-        (Path(workspace) / "notes.txt").write_text(
-            "Meeting notes:\n- Discuss Q4 roadmap\n- Review budget\n- Team updates"
-        )
-        (Path(workspace) / "config.json").write_text(
-            '{"debug": true, "port": 8080, "name": "myapp"}'
-        )
-        subdir = Path(workspace) / "src"
-        subdir.mkdir()
-        (subdir / "main.py").write_text('print("Hello, World!")')
-
         print(f"Workspace: {workspace}")
         print("=" * 60)
 
-        # Setup MCP filesystem server
-        fs_server = MCPServerStdio(
+        # Setup MCP "everything" server (reference server with sample tools)
+        mcp_server = MCPServerStdio(
             params={
                 "command": "npx",
-                "args": ["-y", "@modelcontextprotocol/server-filesystem", workspace],
+                "args": ["-y", "@modelcontextprotocol/server-everything"],
             },
-            cache_tools_list=True
+            cache_tools_list=True,
+            client_session_timeout_seconds=60  # Longer timeout for tool calls
         )
 
         client = patch_openai_with_ptc(OpenAI(), cwd=workspace)
@@ -68,7 +61,7 @@ def main():
             {"role": "system", "content": SYSTEM_PROMPT},
             {
                 "role": "user",
-                "content": f"Explore {workspace} using the available tools. List all files recursively and show me the contents of config.json."
+                "content": "Check out the available skills, then use one of the tools to do something interesting."
             }
         ]
 
@@ -77,7 +70,7 @@ def main():
         stream = client.responses.create(
             model="anthropic/claude-haiku-4-5",
             input=messages,
-            mcp_servers=[fs_server],
+            mcp_servers=[mcp_server],
             stream=True
         )
 
