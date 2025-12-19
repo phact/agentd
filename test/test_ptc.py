@@ -156,6 +156,43 @@ To execute code, use fenced blocks:
             mcp_servers=[fs_server],
         )
 
+        # Verify skills directory structure (AgentSkills spec compliant)
+        skills_dir = Path(tmpdir) / "skills"
+        assert skills_dir.exists(), "skills/ directory should be created"
+
+        # Shared lib/ at root
+        lib_dir = skills_dir / "lib"
+        assert lib_dir.exists(), "skills/lib/ should exist"
+        assert (lib_dir / "tools.py").exists(), "skills/lib/tools.py should exist"
+        assert (lib_dir / "__init__.py").exists(), "skills/lib/__init__.py should exist"
+
+        # Check tools.py has MCP tool bindings
+        tools_content = (lib_dir / "tools.py").read_text()
+        assert "def _call(" in tools_content, "tools.py should have _call helper"
+        assert "MCP_BRIDGE_URL" in tools_content, "tools.py should reference MCP bridge"
+
+        # MCP server skill directory (filesystem)
+        skill_dirs = [d for d in skills_dir.iterdir() if d.is_dir() and d.name != "lib"]
+        assert len(skill_dirs) >= 1, "Should have at least one skill directory"
+
+        # Check SKILL.md has frontmatter
+        for skill_dir in skill_dirs:
+            skill_md = skill_dir / "SKILL.md"
+            assert skill_md.exists(), f"{skill_dir.name}/SKILL.md should exist"
+            content = skill_md.read_text()
+            assert content.startswith("---"), "SKILL.md should have YAML frontmatter"
+            assert "name:" in content, "SKILL.md frontmatter should have name"
+            assert "description:" in content, "SKILL.md frontmatter should have description"
+
+            # scripts/ directory instead of examples/
+            scripts_dir = skill_dir / "scripts"
+            assert scripts_dir.exists(), f"{skill_dir.name}/scripts/ should exist"
+            assert not (skill_dir / "examples").exists(), "examples/ should not exist (use scripts/)"
+            assert not (skill_dir / "lib").exists(), "per-skill lib/ should not exist (use shared)"
+
+        # Verify response exists
+        assert response.choices[0].message.content, "Response should have content"
+
         print(f"\nResponse:\n{response.choices[0].message.content}")
         print("✓ test_ptc_with_filesystem passed")
 
@@ -179,12 +216,51 @@ Always use this format to run commands."""
                 },
                 {
                     "role": "user",
-                    "content": "Browse the file system and show what skills you have. Only read the beginning of each SKILLS.md"
+                    "content": "Browse the file system and show what skills you have. Only read the beginning of each SKILL.md"
                 }
             ],
         )
 
-        print(f"\nResponse:\n{response.choices[0].message.content}")
+        # Verify skills directory structure for local tools
+        skills_dir = Path(tmpdir) / "skills"
+        assert skills_dir.exists(), "skills/ directory should be created"
+
+        # Shared lib/ at root with local tool bindings
+        lib_dir = skills_dir / "lib"
+        assert lib_dir.exists(), "skills/lib/ should exist"
+        tools_py = lib_dir / "tools.py"
+        assert tools_py.exists(), "skills/lib/tools.py should exist"
+
+        # Check that local @tool functions are in tools.py
+        tools_content = tools_py.read_text()
+        assert "add_numbers" in tools_content, "tools.py should have add_numbers binding"
+        assert "greet" in tools_content, "tools.py should have greet binding"
+
+        # Local skill directory
+        local_skill = skills_dir / "local"
+        assert local_skill.exists(), "skills/local/ should exist for @tool functions"
+
+        # SKILL.md with frontmatter
+        skill_md = local_skill / "SKILL.md"
+        assert skill_md.exists(), "local/SKILL.md should exist"
+        md_content = skill_md.read_text()
+        assert md_content.startswith("---"), "SKILL.md should have YAML frontmatter"
+        assert "name: local" in md_content, "frontmatter should have name: local"
+
+        # scripts/ directory
+        scripts_dir = local_skill / "scripts"
+        assert scripts_dir.exists(), "local/scripts/ should exist"
+        assert not (local_skill / "examples").exists(), "examples/ should not exist"
+        assert not (local_skill / "lib").exists(), "per-skill lib/ should not exist"
+
+        # Verify response has content and shows evidence of execution
+        content = response.choices[0].message.content
+        assert content, "Response should have content"
+        # LLM should have explored and found skills
+        assert "local" in content.lower() or "skill" in content.lower(), \
+            "Response should mention skills found"
+
+        print(f"\nResponse:\n{content}")
         print("✓ test_ptc_simple passed")
 
 
