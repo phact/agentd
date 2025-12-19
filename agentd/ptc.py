@@ -690,9 +690,17 @@ print(result)
 
 
 def generate_skill_md(skill_name: str, description: str, tools: list[str]) -> str:
-    """Generate SKILL.md content for a skill directory."""
+    """Generate SKILL.md content for a skill directory (AgentSkills spec compliant)."""
     tools_list = "\n".join(f"- `{t}`" for t in tools)
-    return f'''# {skill_name}
+    # Format skill name for frontmatter (lowercase, hyphens)
+    formatted_name = skill_name.lower().replace('_', '-')
+
+    return f'''---
+name: {formatted_name}
+description: {description}
+---
+
+# {skill_name}
 
 {description}
 
@@ -702,7 +710,7 @@ def generate_skill_md(skill_name: str, description: str, tools: list[str]) -> st
 
 ## Usage
 
-Import from `lib.tools`:
+Import from the shared `lib.tools` module:
 
 ```python
 from lib.tools import {tools[0] if tools else 'function_name'}
@@ -710,35 +718,39 @@ result = {tools[0] if tools else 'function_name'}(...)
 print(result)
 ```
 
-See the `examples/` directory for usage examples of each function.
+See the `scripts/` directory for usage examples.
 '''
 
 
-def _setup_skill_dir(skill_dir: Path, skill_name: str, tools: dict[str, dict], bridge_port: int):
-    """Setup a single skill directory with lib/, examples/, and SKILL.md."""
+def _setup_skill_dir(skill_dir: Path, skill_name: str, tools: dict[str, dict], description: str = None):
+    """Setup a single skill directory with SKILL.md and scripts/ (AgentSkills spec compliant)."""
     skill_dir.mkdir(exist_ok=True)
-    lib_dir = skill_dir / 'lib'
-    lib_dir.mkdir(exist_ok=True)
-    examples_dir = skill_dir / 'examples'
-    examples_dir.mkdir(exist_ok=True)
+    scripts_dir = skill_dir / 'scripts'
+    scripts_dir.mkdir(exist_ok=True)
 
-    # Generate lib/tools.py
-    tools_py = generate_tools_module(tools, bridge_port)
-    (lib_dir / 'tools.py').write_text(tools_py)
-    (lib_dir / '__init__.py').write_text('from .tools import *\n')
-
-    # Generate example files
+    # Generate example scripts
     for tool_name, schema in tools.items():
-        example_file = examples_dir / f'{tool_name}.py'
-        example_file.write_text(generate_example_file(tool_name, schema))
+        script_file = scripts_dir / f'{tool_name}_example.py'
+        script_file.write_text(generate_example_file(tool_name, schema))
 
-    # Generate SKILL.md
+    # Generate SKILL.md with frontmatter
     skill_md = generate_skill_md(
         skill_name,
-        f'Tools from {skill_name}',
+        description or f'Tools from {skill_name}',
         list(tools.keys())
     )
     (skill_dir / 'SKILL.md').write_text(skill_md)
+
+
+def _setup_shared_lib(skills_dir: Path, all_tools: dict[str, dict], bridge_port: int):
+    """Setup the shared lib/ directory at skills root with all tool bindings."""
+    lib_dir = skills_dir / 'lib'
+    lib_dir.mkdir(exist_ok=True)
+
+    # Generate lib/tools.py with ALL tools
+    tools_py = generate_tools_module(all_tools, bridge_port)
+    (lib_dir / 'tools.py').write_text(tools_py)
+    (lib_dir / '__init__.py').write_text('from .tools import *\n')
 
 
 async def setup_skills_directory(
@@ -751,19 +763,18 @@ async def setup_skills_directory(
     """
     Setup the skills directory with tool bindings and start MCP bridge.
 
-    Directory structure:
+    Directory structure (AgentSkills spec compliant):
         skills/
-          <server_name>/      # One per MCP server
-            lib/
-              __init__.py
-              tools.py
-            examples/
-              tool_name.py
+          lib/                  # Shared - all tool bindings
+            __init__.py
+            tools.py
+          <server_name>/        # One per MCP server
+            SKILL.md            # With YAML frontmatter
+            scripts/
+              tool_example.py
+          local/                # @tool decorated functions
             SKILL.md
-          local/              # @tool decorated functions
-            lib/
-            examples/
-            SKILL.md
+            scripts/
 
     Returns:
         Tuple of (server_lookup dict, bridge_port)
@@ -773,7 +784,8 @@ async def setup_skills_directory(
     skills_dir.mkdir(parents=True, exist_ok=True)
 
     server_lookup = {}  # tool_name -> server connection
-    skill_dirs = []  # Track created skill dirs for PYTHONPATH
+    all_tools = {}  # All tools for shared lib/tools.py
+    skill_configs = []  # (skill_name, tools_dict, description) for each skill
 
     # Start MCP bridge (reuse if already running)
     # If MCP servers are present, use async mode so tool calls work properly
@@ -791,7 +803,7 @@ async def setup_skills_directory(
         if bridge_cache is not None:
             bridge_cache['bridge'] = bridge
 
-    # 1) Setup each MCP server as its own skill
+    # 1) Collect tools from each MCP server
     if mcp_servers:
         for server in mcp_servers:
             if server.name not in server_cache:
@@ -803,17 +815,17 @@ async def setup_skills_directory(
             server_tools = {}
             tools = await conn.list_tools()
             for t in tools:
-                server_tools[t.name] = {
+                tool_schema = {
                     'name': t.name,
                     'description': t.description or '',
                     'parameters': t.inputSchema if hasattr(t, 'inputSchema') else {'type': 'object', 'properties': {}}
                 }
+                server_tools[t.name] = tool_schema
+                all_tools[t.name] = tool_schema  # Add to shared tools
                 server_lookup[t.name] = conn
                 bridge.register_server(t.name, conn)
 
-            # Create skill directory for this server
-            # Clean up server name for valid Python module name
-            # Try to extract a meaningful name from the server params (e.g. package name)
+            # Derive skill name from server
             skill_name = None
 
             # Check if this looks like an MCP stdio server with command args
@@ -839,23 +851,31 @@ async def setup_skills_directory(
             skill_name = skill_name.strip('_')  # Remove leading/trailing underscores
             if not skill_name or skill_name[0].isdigit():
                 skill_name = 'mcp_' + skill_name  # Ensure valid identifier
-            skill_dir = skills_dir / skill_name
-            _setup_skill_dir(skill_dir, skill_name, server_tools, actual_port)
-            skill_dirs.append(skill_dir)
 
-    # 2) Setup @tool decorated functions as "local" skill
+            skill_configs.append((skill_name, server_tools, f'MCP tools from {server.name}'))
+
+    # 2) Collect @tool decorated functions
     if SCHEMA_REGISTRY:
         local_tools = {}
         for name, schema in SCHEMA_REGISTRY.items():
             local_tools[name] = schema
+            all_tools[name] = schema  # Add to shared tools
             bridge.register_local_tool(name, FUNCTION_REGISTRY[name])
 
         if local_tools:
-            skill_dir = skills_dir / 'local'
-            _setup_skill_dir(skill_dir, 'local', local_tools, actual_port)
-            skill_dirs.append(skill_dir)
+            skill_configs.append(('local', local_tools, 'Locally registered Python tools'))
 
-    logger.info(f"Setup {len(skill_dirs)} skill(s) at {skills_dir}")
+    # 3) Create shared lib/ with ALL tools
+    if all_tools:
+        _setup_shared_lib(skills_dir, all_tools, actual_port)
+
+    # 4) Create each skill directory (without lib/)
+    for skill_name, tools, description in skill_configs:
+        skill_dir = skills_dir / skill_name
+        _setup_skill_dir(skill_dir, skill_name, tools, description)
+
+    logger.info(f"Setup {len(skill_configs)} skill(s) at {skills_dir}")
+    logger.info(f"Shared lib/ contains {len(all_tools)} tools")
     logger.info(f"MCP Bridge running on http://localhost:{actual_port}")
     return server_lookup, actual_port
 
