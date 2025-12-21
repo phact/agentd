@@ -6,10 +6,11 @@ readme = "README.md"
 requires-python = ">=3.10"
 dependencies = [
     "mcp-subscribe",
-    "openai-agents>=0.0.13",
+    "openai-agents>=0.6.4",
     "openai>=1.76.0",
     "pyyaml>=6.0.2",
-    "litellm>=1.74.0",
+    "litellm>=1.80.0",
+    "mcp>=1.25.0",
 ]
 
 [dependency-groups]
