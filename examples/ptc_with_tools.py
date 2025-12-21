@@ -72,7 +72,7 @@ To run a bash command:
 
 To run Python code:
 ```python:execute
-from <skill_name>.lib.tools import some_function
+from lib.tools import some_function
 result = some_function(arg="value")
 print(result)
 ```
@@ -82,12 +82,15 @@ To create a file:
 <contents>
 ```
 
-You have a ./skills/ directory with available tools. Each subdirectory is a skill with:
-- `lib/tools.py` - importable functions
-- `examples/` - usage examples for each function
-- `SKILL.md` - documentation
+You have a ./skills/ directory with available tools:
+- `skills/lib/tools.py` - shared module with all tool functions
+- `skills/<name>/SKILL.md` - documentation for each skill (YAML frontmatter + instructions)
+- `skills/<name>/scripts/` - example scripts
 
-Explore with `ls skills/` to see available skills."""
+To discover skills:
+1. `ls skills/` to list available skills
+2. `head -5 skills/<name>/SKILL.md` to read frontmatter (name, description)
+3. Read full SKILL.md only if you need detailed instructions"""
 
 
 def main():

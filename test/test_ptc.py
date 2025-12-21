@@ -73,6 +73,58 @@ echo "Second"
     print("✓ test_parse_multiple_bash passed")
 
 
+def test_parse_xml_function_calls():
+    """Test parsing XML function_calls format."""
+    content = '''
+I'll help you explore.
+<function_calls>
+<invoke name="bash:execute">
+<parameter name="command">ls -la skills/</parameter>
+</invoke>
+</function_calls>
+
+Let me also check Python:
+<function_calls>
+<invoke name="python:execute">
+<parameter name="code">import math
+result = math.sqrt(144)
+print(result)</parameter>
+</invoke>
+</function_calls>
+'''
+    fences = parse_code_fences(content)
+    assert len(fences) == 2
+
+    assert fences[0].fence_type == 'bash'
+    assert fences[0].action == 'execute'
+    assert 'ls -la skills/' in fences[0].content
+
+    assert fences[1].fence_type == 'python'
+    assert fences[1].action == 'execute'
+    assert 'math.sqrt(144)' in fences[1].content
+    print("✓ test_parse_xml_function_calls passed")
+
+
+def test_parse_mixed_formats():
+    """Test parsing mixed code fence and XML formats."""
+    content = '''
+```bash:execute
+echo "fence format"
+```
+
+<function_calls>
+<invoke name="bash:execute">
+<parameter name="command">echo "xml format"</parameter>
+</invoke>
+</function_calls>
+'''
+    fences = parse_code_fences(content)
+    assert len(fences) == 2
+    assert 'fence format' in fences[0].content
+    assert 'xml format' in fences[1].content
+    print("✓ test_parse_mixed_formats passed")
+
+
 # =============================================================================
 # Test with Local @tool Functions
 # =============================================================================

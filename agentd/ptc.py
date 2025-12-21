@@ -16,6 +16,7 @@ import os
 import re
 import subprocess
 import types
+from contextlib import AsyncExitStack
 from dataclasses import dataclass
 from functools import wraps
 from pathlib import Path
@@ -221,30 +222,71 @@ def _make_execution_event(
     )
 
 
-def parse_code_fences(content: str) -> list[CodeFence]:
+def _parse_xml_function_calls(content: str) -> list[CodeFence]:
     """
-    Parse ```lang:action blocks from LLM response.
+    Parse XML function_calls format that Claude sometimes uses.
 
     Supports:
-    - ```bash:execute
-    - ```script.py:create
-    - ```my_tool.py:execute
+    <function_calls>
+    <invoke name="bash:execute">
+    <parameter name="command">ls -la</parameter>
+    </invoke>
+    </function_calls>
+
+    Returns list of CodeFence objects.
+    """
+    fences = []
+
+    # Pattern for invoke blocks with name="type:action"
+    invoke_pattern = r'<invoke\s+name="(\w+(?:\.\w+)?):(\w+)"[^>]*>(.*?)</invoke>'
+    invoke_matches = re.findall(invoke_pattern, content, re.DOTALL)
+
+    for fence_type, action, invoke_content in invoke_matches:
+        # Extract parameter content - could be named "command" or just raw content
+        param_pattern = r'<parameter[^>]*>(.*?)</parameter>'
+        param_match = re.search(param_pattern, invoke_content, re.DOTALL)
+        if param_match:
+            fence_content = param_match.group(1).strip()
+        else:
+            # Fallback: use raw content between tags
+            fence_content = invoke_content.strip()
+
+        if fence_content:
+            fences.append(CodeFence(
+                fence_type=fence_type,
+                action=action.lower(),
+                content=fence_content
+            ))
+
+    return fences
+
+
+def parse_code_fences(content: str) -> list[CodeFence]:
+    """
+    Parse code execution blocks from LLM response.
+
+    Supports two formats:
+    1. Code fences: ```bash:execute ... ```
+    2. XML function calls: <invoke name="bash:execute">...</invoke>
 
     Returns list of CodeFence objects in order of appearance.
     """
-    # Pattern: ```type:action\ncontent```
-    # type can be "bash" or a filename like "script.py"
-    # action is "execute" or "create"
-    pattern = r'```(\w+(?:\.\w+)?):(\w+)\n(.*?)```'
-    matches = re.findall(pattern, content, re.DOTALL)
-
     fences = []
-    for fence_type, action, fence_content in matches:
+
+    # Pattern 1: ```type:action\ncontent```
+    fence_pattern = r'```(\w+(?:\.\w+)?):(\w+)\n(.*?)```'
+    fence_matches = re.findall(fence_pattern, content, re.DOTALL)
+
+    for fence_type, action, fence_content in fence_matches:
         fences.append(CodeFence(
             fence_type=fence_type,
             action=action.lower(),
             content=fence_content.strip()
         ))
+
+    # Pattern 2: XML function_calls format
+    xml_fences = _parse_xml_function_calls(content)
+    fences.extend(xml_fences)
 
     return fences
 
@@ -254,21 +296,35 @@ def extract_complete_fence(buffer: str) -> CodeFence | None:
     Extract the first complete fence from buffer for streaming.
     Returns None if no complete fence found.
     """
-    pattern = r'```(\w+(?:\.\w+)?):(\w+)\n(.*?)```'
-    match = re.search(pattern, buffer, re.DOTALL)
+    # Try code fence format first
+    fence_pattern = r'```(\w+(?:\.\w+)?):(\w+)\n(.*?)```'
+    match = re.search(fence_pattern, buffer, re.DOTALL)
     if match:
         return CodeFence(
             fence_type=match.group(1),
             action=match.group(2).lower(),
             content=match.group(3).strip()
         )
+
+    # Try XML format
+    xml_fences = _parse_xml_function_calls(buffer)
+    if xml_fences:
+        return xml_fences[0]
+
     return None
 
 
 def remove_fence_from_buffer(buffer: str, fence: CodeFence) -> str:
     """Remove the first occurrence of a fence from the buffer."""
-    pattern = r'```' + re.escape(fence.fence_type) + r':' + re.escape(fence.action) + r'\n.*?```'
-    return re.sub(pattern, '', buffer, count=1, flags=re.DOTALL)
+    # Try code fence format
+    fence_pattern = r'```' + re.escape(fence.fence_type) + r':' + re.escape(fence.action) + r'\n.*?```'
+    new_buffer = re.sub(fence_pattern, '', buffer, count=1, flags=re.DOTALL)
+    if new_buffer != buffer:
+        return new_buffer
+
+    # Try XML format
+    xml_pattern = r'<invoke\s+name="' + re.escape(fence.fence_type) + r':' + re.escape(fence.action) + r'"[^>]*>.*?</invoke>'
+    return re.sub(xml_pattern, '', buffer, count=1, flags=re.DOTALL)
 
 
 # =============================================================================
@@ -758,7 +814,8 @@ async def setup_skills_directory(
     mcp_servers: list | None,
     server_cache: dict,
     bridge_port: int | None = None,
-    bridge_cache: dict | None = None
+    bridge_cache: dict | None = None,
+    exit_stack: AsyncExitStack | None = None
 ) -> tuple[dict[str, any], int]:
     """
     Setup the skills directory with tool bindings and start MCP bridge.
@@ -775,6 +832,11 @@ async def setup_skills_directory(
           local/                # @tool decorated functions
             SKILL.md
             scripts/
+
+    Args:
+        exit_stack: If provided, MCP servers will be entered as async context
+                   managers for proper cleanup. The caller is responsible for
+                   closing the exit stack when done.
 
     Returns:
         Tuple of (server_lookup dict, bridge_port)
@@ -807,7 +869,11 @@ async def setup_skills_directory(
     if mcp_servers:
         for server in mcp_servers:
             if server.name not in server_cache:
-                await server.connect()
+                # Use context manager if exit_stack provided (proper cleanup)
+                if exit_stack is not None:
+                    await exit_stack.enter_async_context(server)
+                else:
+                    await server.connect()
                 server_cache[server.name] = server
             conn = server_cache[server.name]
 
@@ -889,17 +955,63 @@ def _run_async(coro):
     return asyncio.new_event_loop().run_until_complete(coro)
 
 
-def _sync_generator_wrapper(async_gen):
-    """Wrap an async generator for synchronous iteration."""
-    loop = asyncio.new_event_loop()
+def _sync_generator_wrapper(async_gen_or_coro):
+    """Wrap an async generator for synchronous iteration.
+
+    Uses a persistent event loop in a background thread so that
+    aiohttp servers (like MCP bridge) keep running between iterations.
+
+    Handles both:
+    - Async generators directly
+    - Coroutines that return async generators (need to await first)
+    """
+    import threading
+    import queue
+    import inspect
+
+    result_queue = queue.Queue()
+    cleanup_queue = queue.Queue()
+
+    def run_loop():
+        loop = asyncio.new_event_loop()
+        asyncio.set_event_loop(loop)
+
+        async def iterate():
+            try:
+                # Handle coroutine that returns async generator
+                gen = async_gen_or_coro
+                if inspect.iscoroutine(gen):
+                    gen = await gen
+
+                async for item in gen:
+                    result_queue.put(('item', item))
+                result_queue.put(('done', None))
+            except Exception as e:
+                result_queue.put(('error', e))
+
+            # Wait for cleanup signal before closing loop
+            # This allows graceful shutdown of MCP connections
+            cleanup_queue.get(timeout=5)
+
+        loop.run_until_complete(iterate())
+        loop.close()
+
+    thread = threading.Thread(target=run_loop, daemon=True)
+    thread.start()
+
     try:
         while True:
-            try:
-                yield loop.run_until_complete(async_gen.__anext__())
-            except StopAsyncIteration:
+            kind, value = result_queue.get()
+            if kind == 'item':
+                yield value
+            elif kind == 'done':
                 break
+            elif kind == 'error':
+                raise value
     finally:
-        loop.close()
+        # Signal cleanup can proceed
+        cleanup_queue.put(True)
+        thread.join(timeout=2)
 
 
 def _extract_content(response, provider: str) -> str:
@@ -1055,130 +1167,134 @@ async def _handle_ptc_streaming(
     # Detect provider
     _, provider, api_key, _ = llm_utils.get_llm_provider(model)
 
-    # Setup skills directory
-    skills_dir = cwd / 'skills'
-    server_lookup, bridge_port = await setup_skills_directory(
-        skills_dir, mcp_servers, server_cache, bridge_cache=bridge_cache
-    )
-
-    # Set environment variable for subprocess executor
-    os.environ['MCP_BRIDGE_URL'] = f'http://localhost:{bridge_port}'
-
     # Clean kwargs
     clean_kwargs = {k: v for k, v in kwargs.items()
                     if k not in ('mcp_servers', 'mcp_strict', 'ptc_enabled', 'cwd', 'stream')}
     clean_kwargs['stream'] = True
 
     current_messages = list(messages)
+    skills_dir = cwd / 'skills'
 
     async def stream_with_execution():
-        nonlocal current_messages
+        """Generator that manages MCP lifecycle via AsyncExitStack."""
+        async with AsyncExitStack() as exit_stack:
+            # Setup skills directory with exit stack for proper MCP cleanup
+            server_lookup, bridge_port = await setup_skills_directory(
+                skills_dir, mcp_servers, server_cache,
+                bridge_cache=bridge_cache, exit_stack=exit_stack
+            )
 
-        loop_count = 0
-        while loop_count < MAX_LOOPS:
-            loop_count += 1
-            buffer = ""
-            executed_fences = []
+            # Set environment variable for subprocess executor
+            os.environ['MCP_BRIDGE_URL'] = f'http://localhost:{bridge_port}'
 
-            # Get stream
-            if provider == 'openai':
-                if async_mode:
-                    stream = await orig_fn_async(
-                        self, *args,
-                        model=model,
-                        messages=current_messages,
-                        **clean_kwargs
-                    )
+            nonlocal current_messages
+
+            loop_count = 0
+            while loop_count < MAX_LOOPS:
+                loop_count += 1
+                buffer = ""
+                executed_fences = []
+
+                # Get stream
+                if provider == 'openai':
+                    if async_mode:
+                        stream = await orig_fn_async(
+                            self, *args,
+                            model=model,
+                            messages=current_messages,
+                            **clean_kwargs
+                        )
+                    else:
+                        stream = orig_fn_sync(
+                            self, *args,
+                            model=model,
+                            messages=current_messages,
+                            **clean_kwargs
+                        )
                 else:
-                    stream = orig_fn_sync(
-                        self, *args,
-                        model=model,
-                        messages=current_messages,
-                        **clean_kwargs
-                    )
-            else:
+                    if async_mode:
+                        stream = await litellm.acompletion(
+                            model=model,
+                            messages=current_messages,
+                            api_key=api_key,
+                            **clean_kwargs
+                        )
+                    else:
+                        stream = litellm.completion(
+                            model=model,
+                            messages=current_messages,
+                            api_key=api_key,
+                            **clean_kwargs
+                        )
+
+                # Process stream
                 if async_mode:
-                    stream = await litellm.acompletion(
-                        model=model,
-                        messages=current_messages,
-                        api_key=api_key,
-                        **clean_kwargs
-                    )
+                    async for chunk in stream:
+                        delta = chunk.choices[0].delta.content or ""
+                        buffer += delta
+                        yield chunk
+
+                        # Check for complete fences
+                        while True:
+                            fence = extract_complete_fence(buffer)
+                            if not fence:
+                                break
+
+                            # Execute fence immediately
+                            # Use async execution if MCP servers are present
+                            if fence.action == 'execute':
+                                if fence.fence_type == 'bash':
+                                    if mcp_servers:
+                                        output, code = await executor.execute_bash_async(fence.content, cwd)
+                                    else:
+                                        output, code = executor.execute_bash(fence.content, cwd)
+                                else:
+                                    if mcp_servers:
+                                        output, code = await executor.execute_python_async(fence.content, cwd, pythonpath=skills_dir)
+                                    else:
+                                        output, code = executor.execute_python(fence.content, cwd, pythonpath=skills_dir)
+                            else:
+                                output = executor.create_file(fence.fence_type, fence.content, skills_dir)
+
+                            executed_fences.append((fence, output))
+                            buffer = remove_fence_from_buffer(buffer, fence)
                 else:
-                    stream = litellm.completion(
-                        model=model,
-                        messages=current_messages,
-                        api_key=api_key,
-                        **clean_kwargs
-                    )
+                    for chunk in stream:
+                        delta = chunk.choices[0].delta.content or ""
+                        buffer += delta
+                        yield chunk
 
-            # Process stream
-            if async_mode:
-                async for chunk in stream:
-                    delta = chunk.choices[0].delta.content or ""
-                    buffer += delta
-                    yield chunk
+                        while True:
+                            fence = extract_complete_fence(buffer)
+                            if not fence:
+                                break
 
-                    # Check for complete fences
-                    while True:
-                        fence = extract_complete_fence(buffer)
-                        if not fence:
-                            break
-
-                        # Execute fence immediately
-                        # Use async execution if MCP servers are present
-                        if fence.action == 'execute':
-                            if fence.fence_type == 'bash':
-                                if mcp_servers:
-                                    output, code = await executor.execute_bash_async(fence.content, cwd)
+                            # Use async execution if MCP servers are present
+                            if fence.action == 'execute':
+                                if fence.fence_type == 'bash':
+                                    if mcp_servers:
+                                        output, code = await executor.execute_bash_async(fence.content, cwd)
+                                    else:
+                                        output, code = executor.execute_bash(fence.content, cwd)
                                 else:
-                                    output, code = executor.execute_bash(fence.content, cwd)
+                                    if mcp_servers:
+                                        output, code = await executor.execute_python_async(fence.content, cwd, pythonpath=skills_dir)
+                                    else:
+                                        output, code = executor.execute_python(fence.content, cwd, pythonpath=skills_dir)
                             else:
-                                if mcp_servers:
-                                    output, code = await executor.execute_python_async(fence.content, cwd, pythonpath=skills_dir)
-                                else:
-                                    output, code = executor.execute_python(fence.content, cwd, pythonpath=skills_dir)
-                        else:
-                            output = executor.create_file(fence.fence_type, fence.content, skills_dir)
+                                output = executor.create_file(fence.fence_type, fence.content, skills_dir)
 
-                        executed_fences.append((fence, output))
-                        buffer = remove_fence_from_buffer(buffer, fence)
-            else:
-                for chunk in stream:
-                    delta = chunk.choices[0].delta.content or ""
-                    buffer += delta
-                    yield chunk
+                            executed_fences.append((fence, output))
+                            buffer = remove_fence_from_buffer(buffer, fence)
 
-                    while True:
-                        fence = extract_complete_fence(buffer)
-                        if not fence:
-                            break
+                # If no fences were executed, we're done
+                if not executed_fences:
+                    return
 
-                        # Use async execution if MCP servers are present
-                        if fence.action == 'execute':
-                            if fence.fence_type == 'bash':
-                                if mcp_servers:
-                                    output, code = await executor.execute_bash_async(fence.content, cwd)
-                                else:
-                                    output, code = executor.execute_bash(fence.content, cwd)
-                            else:
-                                if mcp_servers:
-                                    output, code = await executor.execute_python_async(fence.content, cwd, pythonpath=skills_dir)
-                                else:
-                                    output, code = executor.execute_python(fence.content, cwd, pythonpath=skills_dir)
-                        else:
-                            output = executor.create_file(fence.fence_type, fence.content, skills_dir)
-
-                        executed_fences.append((fence, output))
-                        buffer = remove_fence_from_buffer(buffer, fence)
-
-            # If no fences were executed, we're done
-            if not executed_fences:
-                return
-
-            # Continue conversation with results
-            current_messages.append({"role": "assistant", "content": buffer})
-            current_messages.append({"role": "user", "content": _format_results(executed_fences)})
+                # Continue conversation with results
+                current_messages.append({"role": "assistant", "content": buffer})
+                current_messages.append({"role": "user", "content": _format_results(executed_fences)})
+            # Exit stack closes here, properly cleaning up MCP servers
 
     if async_mode:
         return stream_with_execution()
@@ -1357,13 +1473,7 @@ async def _handle_ptc_responses_streaming(
     # Detect provider
     _, provider, api_key, _ = llm_utils.get_llm_provider(model)
 
-    # Setup skills directory
     skills_dir = cwd / 'skills'
-    server_lookup, bridge_port = await setup_skills_directory(
-        skills_dir, mcp_servers, server_cache, bridge_cache=bridge_cache
-    )
-
-    os.environ['MCP_BRIDGE_URL'] = f'http://localhost:{bridge_port}'
 
     # Clean kwargs
     clean_kwargs = {k: v for k, v in kwargs.items()
@@ -1377,146 +1487,157 @@ async def _handle_ptc_responses_streaming(
         current_input = list(input_data)
 
     async def stream_with_execution():
-        nonlocal current_input
+        """Generator that manages MCP lifecycle via AsyncExitStack."""
+        async with AsyncExitStack() as exit_stack:
+            # Setup skills directory with exit stack for proper MCP cleanup
+            server_lookup, bridge_port = await setup_skills_directory(
+                skills_dir, mcp_servers, server_cache,
+                bridge_cache=bridge_cache, exit_stack=exit_stack
+            )
 
-        loop_count = 0
-        seq_num = 0  # Track sequence numbers for events
-        while loop_count < MAX_LOOPS:
-            loop_count += 1
-            buffer = ""
-            executed_fences = []
+            os.environ['MCP_BRIDGE_URL'] = f'http://localhost:{bridge_port}'
 
-            # Get stream
-            if provider == 'openai':
-                if async_mode:
-                    stream = await orig_fn_async(
-                        self, *args,
-                        model=model,
-                        input=current_input,
-                        **clean_kwargs
-                    )
+            nonlocal current_input
+
+            loop_count = 0
+            seq_num = 0  # Track sequence numbers for events
+            while loop_count < MAX_LOOPS:
+                loop_count += 1
+                buffer = ""
+                executed_fences = []
+
+                # Get stream
+                if provider == 'openai':
+                    if async_mode:
+                        stream = await orig_fn_async(
+                            self, *args,
+                            model=model,
+                            input=current_input,
+                            **clean_kwargs
+                        )
+                    else:
+                        stream = orig_fn_sync(
+                            self, *args,
+                            model=model,
+                            input=current_input,
+                            **clean_kwargs
+                        )
                 else:
-                    stream = orig_fn_sync(
-                        self, *args,
-                        model=model,
-                        input=current_input,
-                        **clean_kwargs
-                    )
-            else:
+                    if async_mode:
+                        stream = await litellm.aresponses(
+                            model=model,
+                            input=current_input,
+                            api_key=api_key,
+                            **clean_kwargs
+                        )
+                    else:
+                        stream = litellm.responses(
+                            model=model,
+                            input=current_input,
+                            api_key=api_key,
+                            **clean_kwargs
+                        )
+
+                # Process stream - extract text from response events
                 if async_mode:
-                    stream = await litellm.aresponses(
-                        model=model,
-                        input=current_input,
-                        api_key=api_key,
-                        **clean_kwargs
-                    )
+                    async for event in stream:
+                        yield event
+                        seq_num += 1
+
+                        # Extract text from streaming events
+                        event_type = getattr(event, 'type', None)
+                        if event_type == 'response.output_text.delta':
+                            delta = getattr(event, 'delta', '')
+                            buffer += delta
+
+                            # Check for complete fences
+                            while True:
+                                fence = extract_complete_fence(buffer)
+                                if not fence:
+                                    break
+
+                                # Execute fence
+                                # Use async execution if MCP servers are present (keeps loop running for callbacks)
+                                if fence.action == 'execute':
+                                    if fence.fence_type == 'bash':
+                                        if mcp_servers:
+                                            output, code = await executor.execute_bash_async(fence.content, cwd)
+                                        else:
+                                            output, code = executor.execute_bash(fence.content, cwd)
+                                    else:
+                                        if mcp_servers:
+                                            output, code = await executor.execute_python_async(fence.content, cwd, pythonpath=skills_dir)
+                                        else:
+                                            output, code = executor.execute_python(fence.content, cwd, pythonpath=skills_dir)
+                                    status = "completed" if code == 0 else "failed"
+                                else:
+                                    output = executor.create_file(fence.fence_type, fence.content, skills_dir)
+                                    status = "completed"
+
+                                # Emit OpenAI-compatible code interpreter event
+                                seq_num += 1
+                                yield _make_execution_event(
+                                    fence_type=fence.fence_type,
+                                    code=fence.content,
+                                    output=output,
+                                    sequence_number=seq_num,
+                                    status=status
+                                )
+
+                                executed_fences.append((fence, output))
+                                buffer = remove_fence_from_buffer(buffer, fence)
                 else:
-                    stream = litellm.responses(
-                        model=model,
-                        input=current_input,
-                        api_key=api_key,
-                        **clean_kwargs
-                    )
+                    for event in stream:
+                        yield event
+                        seq_num += 1
 
-            # Process stream - extract text from response events
-            if async_mode:
-                async for event in stream:
-                    yield event
-                    seq_num += 1
+                        event_type = getattr(event, 'type', None)
+                        if event_type == 'response.output_text.delta':
+                            delta = getattr(event, 'delta', '')
+                            buffer += delta
 
-                    # Extract text from streaming events
-                    event_type = getattr(event, 'type', None)
-                    if event_type == 'response.output_text.delta':
-                        delta = getattr(event, 'delta', '')
-                        buffer += delta
+                            while True:
+                                fence = extract_complete_fence(buffer)
+                                if not fence:
+                                    break
 
-                        # Check for complete fences
-                        while True:
-                            fence = extract_complete_fence(buffer)
-                            if not fence:
-                                break
-
-                            # Execute fence
-                            # Use async execution if MCP servers are present (keeps loop running for callbacks)
-                            if fence.action == 'execute':
-                                if fence.fence_type == 'bash':
-                                    if mcp_servers:
-                                        output, code = await executor.execute_bash_async(fence.content, cwd)
+                                if fence.action == 'execute':
+                                    if fence.fence_type == 'bash':
+                                        if mcp_servers:
+                                            output, code = await executor.execute_bash_async(fence.content, cwd)
+                                        else:
+                                            output, code = executor.execute_bash(fence.content, cwd)
                                     else:
-                                        output, code = executor.execute_bash(fence.content, cwd)
+                                        if mcp_servers:
+                                            output, code = await executor.execute_python_async(fence.content, cwd, pythonpath=skills_dir)
+                                        else:
+                                            output, code = executor.execute_python(fence.content, cwd, pythonpath=skills_dir)
+                                    status = "completed" if code == 0 else "failed"
                                 else:
-                                    if mcp_servers:
-                                        output, code = await executor.execute_python_async(fence.content, cwd, pythonpath=skills_dir)
-                                    else:
-                                        output, code = executor.execute_python(fence.content, cwd, pythonpath=skills_dir)
-                                status = "completed" if code == 0 else "failed"
-                            else:
-                                output = executor.create_file(fence.fence_type, fence.content, skills_dir)
-                                status = "completed"
+                                    output = executor.create_file(fence.fence_type, fence.content, skills_dir)
+                                    status = "completed"
 
-                            # Emit OpenAI-compatible code interpreter event
-                            seq_num += 1
-                            yield _make_execution_event(
-                                fence_type=fence.fence_type,
-                                code=fence.content,
-                                output=output,
-                                sequence_number=seq_num,
-                                status=status
-                            )
+                                # Emit OpenAI-compatible code interpreter event
+                                seq_num += 1
+                                yield _make_execution_event(
+                                    fence_type=fence.fence_type,
+                                    code=fence.content,
+                                    output=output,
+                                    sequence_number=seq_num,
+                                    status=status
+                                )
 
-                            executed_fences.append((fence, output))
-                            buffer = remove_fence_from_buffer(buffer, fence)
-            else:
-                for event in stream:
-                    yield event
-                    seq_num += 1
+                                executed_fences.append((fence, output))
+                                buffer = remove_fence_from_buffer(buffer, fence)
 
-                    event_type = getattr(event, 'type', None)
-                    if event_type == 'response.output_text.delta':
-                        delta = getattr(event, 'delta', '')
-                        buffer += delta
+                # If no fences executed, we're done
+                if not executed_fences:
+                    return
 
-                        while True:
-                            fence = extract_complete_fence(buffer)
-                            if not fence:
-                                break
-
-                            if fence.action == 'execute':
-                                if fence.fence_type == 'bash':
-                                    if mcp_servers:
-                                        output, code = await executor.execute_bash_async(fence.content, cwd)
-                                    else:
-                                        output, code = executor.execute_bash(fence.content, cwd)
-                                else:
-                                    if mcp_servers:
-                                        output, code = await executor.execute_python_async(fence.content, cwd, pythonpath=skills_dir)
-                                    else:
-                                        output, code = executor.execute_python(fence.content, cwd, pythonpath=skills_dir)
-                                status = "completed" if code == 0 else "failed"
-                            else:
-                                output = executor.create_file(fence.fence_type, fence.content, skills_dir)
-                                status = "completed"
-
-                            # Emit OpenAI-compatible code interpreter event
-                            seq_num += 1
-                            yield _make_execution_event(
-                                fence_type=fence.fence_type,
-                                code=fence.content,
-                                output=output,
-                                sequence_number=seq_num,
-                                status=status
-                            )
-
-                            executed_fences.append((fence, output))
-                            buffer = remove_fence_from_buffer(buffer, fence)
-
-            # If no fences executed, we're done
-            if not executed_fences:
-                return
-
-            # Continue with results
-            current_input.append({"role": "assistant", "content": buffer})
-            current_input.extend(_format_results_for_responses(executed_fences))
+                # Continue with results
+                current_input.append({"role": "assistant", "content": buffer})
+                current_input.extend(_format_results_for_responses(executed_fences))
+            # Exit stack closes here, properly cleaning up MCP servers
 
     if async_mode:
         return stream_with_execution()
@@ -1577,10 +1698,12 @@ def patch_openai_with_ptc(
         bridge_cache = getattr(client_obj, '_bridge_cache', {}) if client_obj else {}
 
         if stream:
-            return _run_async(_handle_ptc_streaming(
+            # For sync streaming, wrap async generator directly (don't use _run_async)
+            async_gen = _handle_ptc_streaming(
                 self, args, model, messages, mcp_servers, cwd_path, executor,
                 kwargs, False, orig_completions_sync, orig_completions_async, server_cache, bridge_cache
-            ))
+            )
+            return _sync_generator_wrapper(async_gen)
         else:
             return _run_async(_handle_ptc_call(
                 self, args, model, messages, mcp_servers, cwd_path, executor,
@@ -1625,11 +1748,11 @@ def patch_openai_with_ptc(
         bridge_cache = getattr(client_obj, '_bridge_cache', {}) if client_obj else {}
 
         if stream:
-            # For sync streaming, create a wrapper that yields from async generator
-            async_gen = _run_async(_handle_ptc_responses_streaming(
+            # For sync streaming, wrap async generator directly (don't use _run_async)
+            async_gen = _handle_ptc_responses_streaming(
                 self, args, model, input, mcp_servers, cwd_path, executor,
                 kwargs, False, orig_responses_sync, orig_responses_async, server_cache, bridge_cache
-            ))
+            )
             return _sync_generator_wrapper(async_gen)
         else:
             return _run_async(_handle_ptc_responses_call(
@@ -1666,5 +1789,27 @@ def patch_openai_with_ptc(
     else:
         client.chat.completions.create = types.MethodType(patched_completions_sync, client.chat.completions)
         client.responses.create = types.MethodType(patched_responses_sync, client.responses)
+
+    # Add cleanup method to client
+    def cleanup_ptc():
+        """Clean up bridge (MCP servers are cleaned up by AsyncExitStack)."""
+        # Stop bridge if running
+        if 'bridge' in client._bridge_cache:
+            bridge = client._bridge_cache['bridge']
+            try:
+                if hasattr(bridge, '_thread') and bridge._thread:
+                    bridge.stop_thread()
+            except Exception:
+                pass
+            client._bridge_cache.clear()
+
+        # Clear server cache (servers already cleaned up by context managers)
+        client._mcp_server_cache.clear()
+
+    client.cleanup_ptc = cleanup_ptc
+
+    # Register cleanup on exit
+    import atexit
+    atexit.register(cleanup_ptc)
 
     return client
