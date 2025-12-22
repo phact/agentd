@@ -7,6 +7,7 @@ name = "agentd"
 version = "0.2.2"
 source = { editable = "." }
 dependencies = [
+    { name = "httpx" },
     { name = "litellm" },
     { name = "mcp" },
     { name = "mcp-subscribe" },
@@ -22,6 +23,7 @@ dev = [
 
 [package.metadata]
 requires-dist = [
+    { name = "httpx", specifier = ">=0.27.0" },
     { name = "litellm", specifier = ">=1.80.0" },
     { name = "mcp", specifier = ">=1.25.0" },
     { name = "mcp-subscribe" },

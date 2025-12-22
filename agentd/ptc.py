@@ -1296,16 +1296,9 @@ async def _handle_ptc_streaming(
                 current_messages.append({"role": "user", "content": _format_results(executed_fences)})
             # Exit stack closes here, properly cleaning up MCP servers
 
-    if async_mode:
-        return stream_with_execution()
-    else:
-        # For sync mode, convert async generator to sync
-        async def collect_sync():
-            results = []
-            async for chunk in stream_with_execution():
-                results.append(chunk)
-            return results
-        return iter(_run_async(collect_sync()))
+    # Always return async generator - caller handles sync/async bridging
+    # via _sync_generator_wrapper for sync calls
+    return stream_with_execution()
 
 
 # =============================================================================
