@@ -159,6 +159,61 @@ for event in display_events(stream):
             print("\n---")
 ```
 
+### Microsandbox Executor
+
+Run code in hardware-isolated microVMs instead of subprocesses for secure execution.
+
+**Install microsandbox:**
+```bash
+# Linux (requires KVM) or macOS (Apple Silicon only)
+curl -sSL https://get.microsandbox.dev | sh
+
+# Start the server
+msb server start --dev
+```
+
+**Usage:**
+```python
+from agentd import patch_openai_with_ptc, create_microsandbox_cli_executor
+from openai import OpenAI
+
+# Create sandboxed executor
+executor = create_microsandbox_cli_executor(
+    conversation_id="my_session",
+    image="python",
+    memory=1024,
+    timeout=60,
+)
+
+client = patch_openai_with_ptc(
+    OpenAI(),
+    cwd=str(executor.snapshot_manager.workspace_dir),
+    executor=executor,
+)
+
+stream = client.responses.create(
+    model="claude-sonnet-4-20250514",
+    input=[{"role": "user", "content": "Run some Python code"}],
+    stream=True
+)
+
+# ... handle events ...
+
+# Create snapshot for time travel
+executor.snapshot("checkpoint_1")
+
+# Restore to previous state
+executor.restore("checkpoint_1")
+
+executor.close()
+```
+
+**Features:**
+- **Hardware isolation:** Code runs in microVMs, not just containers
+- **Persistent workspace:** Volume mounting preserves files across executions
+- **Snapshots:** Save and restore workspace state at any point
+- **Drop-in replacement:** Same interface as the default subprocess executor
+
 ---
 
 ## Traditional Tool Calling
@@ -262,8 +317,34 @@ from agentd import patch_openai_with_mcp, patch_openai_with_ptc
 # PTC: bash + skills
 client = patch_openai_with_ptc(OpenAI(), cwd="./workspace")
 
+# PTC with microsandbox isolation
+from agentd import create_microsandbox_cli_executor
+executor = create_microsandbox_cli_executor(conversation_id="my_session")
+client = patch_openai_with_ptc(OpenAI(), executor=executor)
+
 # Traditional tool_calls
 client = patch_openai_with_mcp(OpenAI())
+```
+
+### Microsandbox Executor
+
+```python
+from agentd import create_microsandbox_cli_executor, SandboxConfig
+
+# Simple usage
+executor = create_microsandbox_cli_executor(
+    conversation_id="session_1",  # Sandbox name prefix
+    image="python",               # microsandbox image
+    memory=1024,                  # MB
+    timeout=60,                   # seconds
+)
+
+# Snapshot API
+snapshot = executor.snapshot("label")     # Save state
+executor.restore(snapshot.id)             # Restore state
+snapshots = executor.list_snapshots()     # List all snapshots
+
+executor.close()  # Cleanup
 ```
 
 ### Tool Decorator
@@ -288,6 +369,7 @@ def my_function(arg1: str, arg2: int = 10) -> str:
 See [`examples/`](./examples/):
 - `ptc_with_mcp.py` - PTC with MCP servers
 - `ptc_with_tools.py` - PTC with @tool decorator
+- `ptc_microsandbox.py` - PTC with microsandbox isolation
 
 See [`config/`](./config/) for agent daemon configs.
 
@@ -296,31 +378,40 @@ See [`config/`](./config/) for agent daemon configs.
 ## Architecture
 
 ```
+┌─────────────────────────────┐     ┌─────────────────────────────┐
+│            PTC              │     │       Agent Daemon          │
+│     (bash, skills, MCP)     │     │    (YAML, subscriptions)    │
+└──────────────┬──────────────┘     └──────────────┬──────────────┘
+               │                                   │
+               ▼                                   ▼
 ┌──────────────────────────────────────────────────────────────────┐
-│                                                                  │
-│  ┌─────────────────────────┐      ┌─────────────────────────┐   │
-│  │          PTC            │      │     Agent Daemon        │   │
-│  │  (bash, skills, MCP)    │      │  (YAML, subscriptions)  │   │
-│  └───────────┬─────────────┘      └───────────┬─────────────┘   │
-│              │                                │                  │
-│              ▼                                ▼                  │
-│  ┌─────────────────────┐          ┌─────────────────────┐       │
-│  │ patch_openai_ptc    │          │ patch_openai_mcp    │       │
-│  │ (fence parse/exec)  │          │ (tool_calls loop)   │       │
-│  └─────────┬───────────┘          └─────────┬───────────┘       │
-│            │                                │                    │
-│   ┌────────┴────────┐                       │                    │
-│   │   MCP Bridge    │                       │                    │
-│   │  (HTTP server)  │                       │                    │
-│   └────────┬────────┘                       │                    │
-│            │                                │                    │
-│            └────────────────┬───────────────┘                   │
-│                             ▼                                    │
-│                  ┌─────────────────────┐                        │
-│                  │    MCP Servers      │                        │
-│                  └─────────────────────┘                        │
-│                                                                  │
-└──────────────────────────────────────────────────────────────────┘
+│                       Patched OpenAI Client                      │
+│  ┌────────────────────────┐    ┌────────────────────────────┐   │
+│  │   patch_openai_ptc     │    │     patch_openai_mcp       │   │
+│  │   (fence parse/exec)   │    │     (tool_calls loop)      │   │
+│  └───────────┬────────────┘    └─────────────┬──────────────┘   │
+└──────────────┼───────────────────────────────┼──────────────────┘
+               │                               │
+               ▼                               │
+┌──────────────────────────────┐               │
+│          Executors           │               │
+│  ┌────────┐  ┌────────────┐  │               │
+│  │Subprocess│ │Microsandbox│  │               │
+│  │(default)│  │  (microVM) │  │               │
+│  └────────┘  └────────────┘  │               │
+└──────────────┬───────────────┘               │
+               │                               │
+               ▼                               │
+┌──────────────────────────────┐               │
+│         MCP Bridge           │               │
+│        (HTTP server)         │               │
+└──────────────┬───────────────┘               │
+               │                               │
+               └───────────────┬───────────────┘
+                               ▼
+               ┌───────────────────────────────┐
+               │          MCP Servers          │
+               └───────────────────────────────┘
 ```
 
 ---
