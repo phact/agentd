@@ -289,31 +289,67 @@ class MicrosandboxCLIExecutor:
 
     def execute_bash(self, command: str, cwd: Path) -> tuple[str, int]:
         """Run bash command in sandbox."""
-        cmd = self._build_command(
-            exec_cmd="bash",
-            args=["-c", command],
-            volumes=self._get_volumes(),
-            envs=self._get_envs(),
-            workdir="/workspace"
-        )
-
-        output, exit_code = self._run_command(cmd)
-        self._execution_count += 1
-        return output, exit_code
+        # Write command to temp file if it contains newlines (microsandbox rejects non-ASCII 32-126)
+        if '\n' in command:
+            temp_name = f"_temp_{uuid.uuid4().hex[:8]}.sh"
+            temp_path = self.snapshot_manager.workspace_dir / temp_name
+            temp_path.write_text(command)
+            try:
+                cmd = self._build_command(
+                    exec_cmd="bash",
+                    args=[f"/workspace/{temp_name}"],
+                    volumes=self._get_volumes(),
+                    envs=self._get_envs(),
+                    workdir="/workspace"
+                )
+                output, exit_code = self._run_command(cmd)
+                self._execution_count += 1
+                return output, exit_code
+            finally:
+                temp_path.unlink(missing_ok=True)
+        else:
+            cmd = self._build_command(
+                exec_cmd="bash",
+                args=["-c", command],
+                volumes=self._get_volumes(),
+                envs=self._get_envs(),
+                workdir="/workspace"
+            )
+            output, exit_code = self._run_command(cmd)
+            self._execution_count += 1
+            return output, exit_code
 
     async def execute_bash_async(self, command: str, cwd: Path) -> tuple[str, int]:
         """Run bash command in sandbox asynchronously."""
-        cmd = self._build_command(
-            exec_cmd="bash",
-            args=["-c", command],
-            volumes=self._get_volumes(),
-            envs=self._get_envs(),
-            workdir="/workspace"
-        )
-
-        output, exit_code = await self._run_command_async(cmd)
-        self._execution_count += 1
-        return output, exit_code
+        # Write command to temp file if it contains newlines (microsandbox rejects non-ASCII 32-126)
+        if '\n' in command:
+            temp_name = f"_temp_{uuid.uuid4().hex[:8]}.sh"
+            temp_path = self.snapshot_manager.workspace_dir / temp_name
+            temp_path.write_text(command)
+            try:
+                cmd = self._build_command(
+                    exec_cmd="bash",
+                    args=[f"/workspace/{temp_name}"],
+                    volumes=self._get_volumes(),
+                    envs=self._get_envs(),
+                    workdir="/workspace"
+                )
+                output, exit_code = await self._run_command_async(cmd)
+                self._execution_count += 1
+                return output, exit_code
+            finally:
+                temp_path.unlink(missing_ok=True)
+        else:
+            cmd = self._build_command(
+                exec_cmd="bash",
+                args=["-c", command],
+                volumes=self._get_volumes(),
+                envs=self._get_envs(),
+                workdir="/workspace"
+            )
+            output, exit_code = await self._run_command_async(cmd)
+            self._execution_count += 1
+            return output, exit_code
 
     def execute_python(
         self,
