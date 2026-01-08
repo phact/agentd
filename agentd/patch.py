@@ -55,7 +55,10 @@ def patch_openai_with_mcp(client):
 
     async def _prepare_mcp_tools(servers, strict, server_cache):
         connected = [await _ensure_connected(s, server_cache) for s in servers]
-        tool_objs = await MCPUtil.get_all_function_tools(connected, strict)
+        try:
+            tool_objs = await MCPUtil.get_all_function_tools(connected, strict, None, None)
+        except TypeError:
+            tool_objs = await MCPUtil.get_all_function_tools(connected, strict)
         schemas = []
         for t in tool_objs:
             schemas.append({
