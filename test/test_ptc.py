@@ -48,6 +48,125 @@ Done!
     print("✓ test_parse_code_fences passed")
 
 
+def test_hallucination_after_fence():
+    """Test that content after code fences (potential hallucinations) is stripped."""
+    from agentd.ptc import strip_content_after_fences
+
+    # Case 1: Single fence with hallucinated output after
+    content_with_hallucination = '''Let me check:
+
+```bash:execute
+ls -la
+```
+
+Here are the files:
+- file1.txt
+- file2.py
+- data/
+'''
+    stripped = strip_content_after_fences(content_with_hallucination)
+    assert "Here are the files" not in stripped, "Hallucinated output should be stripped"
+    assert "ls -la" in stripped, "Code fence content should be preserved"
+    assert "Let me check" in stripped, "Text before fence should be preserved"
+
+    # Case 2: Multiple fences WITH text between - only first fence kept
+    # Text between fences indicates potential dependency, so only execute first
+    content_with_text_between = '''First command:
+
+```bash:execute
+pwd
+```
+
+Second command:
+
+```bash:execute
+whoami
+```
+
+The current directory is /home/user and the user is root.
+'''
+    stripped = strip_content_after_fences(content_with_text_between)
+    assert "pwd" in stripped, "First fence preserved"
+    assert "whoami" not in stripped, "Second fence should be stripped (text between fences)"
+    assert "Second command:" not in stripped, "Text between fences stripped"
+    assert "current directory is" not in stripped, "Hallucination after stripped"
+
+    # Case 3: Multiple fences WITHOUT text between (back-to-back) - all fences kept
+    content_parallel = '''Running both:
+
+```bash:execute
+pwd
+```
+```bash:execute
+whoami
+```
+
+Output here (hallucinated)
+'''
+    stripped = strip_content_after_fences(content_parallel)
+    assert "pwd" in stripped, "First fence preserved"
+    assert "whoami" in stripped, "Second fence preserved (no text between = parallel safe)"
+    assert "Output here" not in stripped, "Hallucination after last fence stripped"
+
+    # Case 4: No fence - content unchanged
+    no_fence = "Just regular text with no code fences."
+    stripped = strip_content_after_fences(no_fence)
+    assert stripped == no_fence, "Content without fences should be unchanged"
+
+    # Case 5: Fence at the very end - nothing to strip
+    clean_content = '''Check this:
+
+```bash:execute
+echo hello
+```'''
+    stripped = strip_content_after_fences(clean_content)
+    assert stripped.strip() == clean_content.strip(), "Clean content should be unchanged"
+
+    print("✓ test_hallucination_after_fence passed")
+
+
+def test_xml_format_stripping():
+    """Test that XML invoke format is also handled by stripping."""
+    from agentd.ptc import strip_content_after_fences
+
+    # Single XML invoke with hallucination after
+    content_xml = '''Let me check:
+
+<function_calls>
+<invoke name="bash:execute">
+<parameter name="command">ls -la</parameter>
+</invoke>
+</function_calls>
+
+Here are the files:
+- file1.txt
+'''
+    stripped = strip_content_after_fences(content_xml)
+    assert "ls -la" in stripped, "XML invoke content should be preserved"
+    assert "Here are the files" not in stripped, "Hallucination after XML invoke should be stripped"
+
+    # Mixed format with text between
+    content_mixed = '''First:
+
+```bash:execute
+pwd
+```
+
+Now XML:
+
+<function_calls>
+<invoke name="bash:execute">
+<parameter name="command">whoami</parameter>
+</invoke>
+</function_calls>
+'''
+    stripped = strip_content_after_fences(content_mixed)
+    assert "pwd" in stripped, "First fence preserved"
+    assert "whoami" not in stripped, "Second XML invoke stripped (text between)"
+
+    print("✓ test_xml_format_stripping passed")
+
+
 def test_parse_empty_content():
     """Test parsing content with no fences."""
     content = "Just some regular text without any code fences."
@@ -324,10 +443,15 @@ if __name__ == "__main__":
     print("Running PTC tests...\n")
 
     # Unit tests
-    #test_parse_code_fences()
-    #test_parse_empty_content()
-    #test_parse_multiple_bash()
-    #test_local_tools_registered()
+    print("--- Unit Tests ---\n")
+    test_parse_code_fences()
+    test_parse_empty_content()
+    test_parse_multiple_bash()
+    test_parse_xml_function_calls()
+    test_parse_mixed_formats()
+    test_hallucination_after_fence()
+    test_xml_format_stripping()
+    test_local_tools_registered()
 
     print("\n--- Integration Tests ---\n")
 

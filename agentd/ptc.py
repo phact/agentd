@@ -35,6 +35,77 @@ logger = logging.getLogger(__name__)
 MAX_LOOPS = 20
 
 # =============================================================================
+# PTC Guidance (auto-injected into system prompt)
+# =============================================================================
+
+PTC_GUIDANCE = """You can execute code using fenced blocks:
+
+To run bash:
+```bash:execute
+<command>
+```
+
+To run Python:
+```python:execute
+from lib.tools import some_function
+result = some_function(arg="value")
+print(result)
+```
+
+To create a file:
+```filename.ext:create
+<contents>
+```
+
+You have a ./skills/ directory with available tools:
+- `skills/lib/tools.py` - shared module with all tool functions
+- `skills/<name>/SKILL.md` - documentation for each skill
+- `skills/<name>/scripts/` - example scripts
+
+When writing multiple code fences:
+- Back-to-back fences (no text between) execute in parallel
+- If you write text between fences, only the first fence executes - wait for its result before continuing
+- Never assume results of a command before seeing them
+
+For conditional actions, use logic within a single fence:
+- Bash: `grep -q "MARKER" file.txt && rm file.txt`
+- Python: `if "MARKER" in open("file.txt").read(): os.remove("file.txt")`
+"""
+
+
+def _inject_ptc_guidance(messages: list) -> list:
+    """Inject PTC guidance into system message or prepend one."""
+    messages = list(messages)  # copy
+    if messages and messages[0].get("role") == "system":
+        messages[0] = {
+            **messages[0],
+            "content": messages[0]["content"] + "\n\n" + PTC_GUIDANCE
+        }
+    else:
+        messages.insert(0, {"role": "system", "content": PTC_GUIDANCE})
+    return messages
+
+
+def _inject_ptc_guidance_responses(input_data: list | str) -> list:
+    """Inject PTC guidance for Responses API input format."""
+    if isinstance(input_data, str):
+        return [
+            {"role": "system", "content": PTC_GUIDANCE},
+            {"role": "user", "content": input_data}
+        ]
+
+    input_list = list(input_data)  # copy
+    if input_list and input_list[0].get("role") == "system":
+        input_list[0] = {
+            **input_list[0],
+            "content": input_list[0]["content"] + "\n\n" + PTC_GUIDANCE
+        }
+    else:
+        input_list.insert(0, {"role": "system", "content": PTC_GUIDANCE})
+    return input_list
+
+
+# =============================================================================
 # Code Fence Parser
 # =============================================================================
 
@@ -325,6 +396,52 @@ def remove_fence_from_buffer(buffer: str, fence: CodeFence) -> str:
     # Try XML format
     xml_pattern = r'<invoke\s+name="' + re.escape(fence.fence_type) + r':' + re.escape(fence.action) + r'"[^>]*>.*?</invoke>'
     return re.sub(xml_pattern, '', buffer, count=1, flags=re.DOTALL)
+
+
+def strip_content_after_fences(content: str) -> str:
+    """
+    Strip potentially hallucinated content after code fences.
+
+    Rules:
+    - If text exists between fences: keep only up to end of first fence
+    - If no text between fences: keep up to end of last fence
+    - Always strip text after the final fence
+
+    Handles both code fence (```type:action...```) and XML invoke formats.
+    """
+    # Patterns for both formats
+    code_fence_pattern = r'```\w+(?:\.\w+)?:\w+\n.*?```'
+    xml_pattern = r'<invoke\s+name="\w+(?:\.\w+)?:\w+"[^>]*>.*?</invoke>'
+
+    # Find all fence matches with their positions
+    fence_matches = []
+    for match in re.finditer(code_fence_pattern, content, re.DOTALL):
+        fence_matches.append((match.start(), match.end()))
+    for match in re.finditer(xml_pattern, content, re.DOTALL):
+        fence_matches.append((match.start(), match.end()))
+
+    if not fence_matches:
+        return content  # No fences, return unchanged
+
+    # Sort by start position
+    fence_matches.sort(key=lambda x: x[0])
+
+    # Check if there's non-whitespace text between any consecutive fences
+    has_text_between = False
+    for i in range(len(fence_matches) - 1):
+        end_of_current = fence_matches[i][1]
+        start_of_next = fence_matches[i + 1][0]
+        between_text = content[end_of_current:start_of_next]
+        if between_text.strip():
+            has_text_between = True
+            break
+
+    if has_text_between:
+        # Keep only up to end of first fence
+        return content[:fence_matches[0][1]]
+    else:
+        # Keep up to end of last fence
+        return content[:fence_matches[-1][1]]
 
 
 # =============================================================================
@@ -1086,8 +1203,8 @@ async def _handle_ptc_call(
     clean_kwargs = {k: v for k, v in kwargs.items()
                     if k not in ('mcp_servers', 'mcp_strict', 'ptc_enabled', 'cwd')}
 
-    # Work with a copy of messages
-    current_messages = list(messages)
+    # Inject PTC guidance and work with a copy of messages
+    current_messages = _inject_ptc_guidance(messages)
 
     loop_count = 0
     while loop_count < MAX_LOOPS:
@@ -1160,8 +1277,9 @@ async def _handle_ptc_call(
                 results.append((fence, msg))
                 logger.info(f"Created file: {fence.fence_type}")
 
-        # Append assistant message + execution results
-        current_messages.append({"role": "assistant", "content": content})
+        # Append assistant message (stripped of hallucinations) + execution results
+        stripped_content = strip_content_after_fences(content)
+        current_messages.append({"role": "assistant", "content": stripped_content})
         current_messages.append({"role": "user", "content": _format_results(results)})
 
     logger.warning(f"Reached max loops ({MAX_LOOPS})")
@@ -1193,7 +1311,8 @@ async def _handle_ptc_streaming(
                     if k not in ('mcp_servers', 'mcp_strict', 'ptc_enabled', 'cwd', 'stream')}
     clean_kwargs['stream'] = True
 
-    current_messages = list(messages)
+    # Inject PTC guidance
+    current_messages = _inject_ptc_guidance(messages)
     skills_dir = skills_dir_override or (cwd / 'skills')
 
     async def stream_with_execution():
@@ -1312,8 +1431,9 @@ async def _handle_ptc_streaming(
                 if not executed_fences:
                     return
 
-                # Continue conversation with results
-                current_messages.append({"role": "assistant", "content": buffer})
+                # Continue conversation with results (stripped of hallucinations)
+                stripped_buffer = strip_content_after_fences(buffer)
+                current_messages.append({"role": "assistant", "content": stripped_buffer})
                 current_messages.append({"role": "user", "content": _format_results(executed_fences)})
             # Exit stack closes here, properly cleaning up MCP servers
 
@@ -1391,11 +1511,8 @@ async def _handle_ptc_responses_call(
     clean_kwargs = {k: v for k, v in kwargs.items()
                     if k not in ('mcp_servers', 'mcp_strict', 'ptc_enabled', 'cwd')}
 
-    # Normalize input to list format
-    if isinstance(input_data, str):
-        current_input = [{"role": "user", "content": input_data}]
-    else:
-        current_input = list(input_data)
+    # Inject PTC guidance and normalize input
+    current_input = _inject_ptc_guidance_responses(input_data)
 
     loop_count = 0
     while loop_count < MAX_LOOPS:
@@ -1461,10 +1578,11 @@ async def _handle_ptc_responses_call(
                 msg = executor.create_file(fence.fence_type, fence.content, skills_dir)
                 results.append((fence, msg))
 
-        # Append to input for next iteration
+        # Append to input for next iteration (stripped of hallucinations)
         # Only append assistant message if content is non-empty to avoid Anthropic API errors
-        if content.strip():
-            current_input.append({"role": "assistant", "content": content})
+        stripped_content = strip_content_after_fences(content)
+        if stripped_content.strip():
+            current_input.append({"role": "assistant", "content": stripped_content})
         current_input.extend(_format_results_for_responses(results))
 
     logger.warning(f"[Responses] Reached max loops ({MAX_LOOPS})")
@@ -1498,11 +1616,8 @@ async def _handle_ptc_responses_streaming(
                     if k not in ('mcp_servers', 'mcp_strict', 'ptc_enabled', 'cwd', 'stream')}
     clean_kwargs['stream'] = True
 
-    # Normalize input
-    if isinstance(input_data, str):
-        current_input = [{"role": "user", "content": input_data}]
-    else:
-        current_input = list(input_data)
+    # Inject PTC guidance and normalize input
+    current_input = _inject_ptc_guidance_responses(input_data)
 
     async def stream_with_execution():
         """Generator that manages MCP lifecycle via AsyncExitStack."""
@@ -1652,10 +1767,11 @@ async def _handle_ptc_responses_streaming(
                 if not executed_fences:
                     return
 
-                # Continue with results
+                # Continue with results (stripped of hallucinations)
                 # Only append assistant message if buffer is non-empty to avoid Anthropic API errors
-                if buffer.strip():
-                    current_input.append({"role": "assistant", "content": buffer})
+                stripped_buffer = strip_content_after_fences(buffer)
+                if stripped_buffer.strip():
+                    current_input.append({"role": "assistant", "content": stripped_buffer})
                 current_input.extend(_format_results_for_responses(executed_fences))
             # Exit stack closes here, properly cleaning up MCP servers
 
