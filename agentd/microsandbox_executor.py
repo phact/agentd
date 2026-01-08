@@ -157,8 +157,9 @@ class MicrosandboxClient:
 class SnapshotManager:
     """Manages filesystem snapshots for time travel."""
 
-    def __init__(self, base_dir: Path):
+    def __init__(self, base_dir: Path, workspace_dir: Path | None = None):
         self.base_dir = base_dir
+        self._workspace_dir = workspace_dir  # Custom workspace path
         self.snapshots_dir = base_dir / "snapshots"
         self.snapshots_dir.mkdir(parents=True, exist_ok=True)
         self._snapshots: list[Snapshot] = []
@@ -167,6 +168,8 @@ class SnapshotManager:
     @property
     def workspace_dir(self) -> Path:
         """The live workspace directory mounted into sandbox."""
+        if self._workspace_dir:
+            return self._workspace_dir
         return self.base_dir / "workspace"
 
     def create_snapshot(self, label: str | None = None) -> Snapshot:
@@ -248,12 +251,17 @@ class MicrosandboxExecutor:
         timeout: int = 60,
         conversation_id: str | None = None,
         base_dir: Path | None = None,
+        workspace_dir: Path | None = None,
+        additional_volumes: list[tuple[str, str]] | None = None,
+        envs: dict[str, str] | None = None,
         auto_snapshot: bool = True
     ):
         self.client = MicrosandboxClient(server_url, api_key)
         self.config = config or SandboxConfig()
         self.timeout = timeout
         self.auto_snapshot = auto_snapshot
+        self.additional_volumes = additional_volumes or []
+        self.envs = envs or {}
 
         # Conversation-scoped identity
         self.conversation_id = conversation_id or uuid.uuid4().hex[:12]
@@ -262,7 +270,7 @@ class MicrosandboxExecutor:
 
         # Setup workspace and snapshots
         self.base_dir = base_dir or Path(tempfile.mkdtemp(prefix="agentd_msb_"))
-        self.snapshot_manager = SnapshotManager(self.base_dir)
+        self.snapshot_manager = SnapshotManager(self.base_dir, workspace_dir=workspace_dir)
         self.snapshot_manager.workspace_dir.mkdir(parents=True, exist_ok=True)
 
         # State
@@ -300,9 +308,12 @@ class MicrosandboxExecutor:
         workspace = str(self.snapshot_manager.workspace_dir.absolute())
         volumes = [f"{workspace}:{self.config.workdir}"]
 
-        envs = [
-            f"MCP_BRIDGE_URL={os.environ.get('MCP_BRIDGE_URL', 'http://localhost:8765')}"
-        ]
+        # Add additional volumes
+        for host_path, container_path in self.additional_volumes:
+            volumes.append(f"{host_path}:{container_path}")
+
+        # Build env list from self.envs
+        envs = [f"{k}={v}" for k, v in self.envs.items()]
 
         logger.info(f"Starting sandbox {self.sandbox_name} with workspace {workspace}")
 

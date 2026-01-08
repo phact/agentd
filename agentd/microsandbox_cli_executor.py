@@ -30,8 +30,9 @@ class Snapshot:
 class SnapshotManager:
     """Manages filesystem snapshots for time travel."""
 
-    def __init__(self, base_dir: Path):
+    def __init__(self, base_dir: Path, workspace_dir: Path | None = None):
         self.base_dir = base_dir
+        self._workspace_dir = workspace_dir  # Custom workspace path
         self.snapshots_dir = base_dir / "snapshots"
         self.snapshots_dir.mkdir(parents=True, exist_ok=True)
         self._snapshots: list[Snapshot] = []
@@ -40,6 +41,8 @@ class SnapshotManager:
     @property
     def workspace_dir(self) -> Path:
         """The live workspace directory mounted into sandbox."""
+        if self._workspace_dir:
+            return self._workspace_dir
         return self.base_dir / "workspace"
 
     def create_snapshot(self, label: str | None = None) -> Snapshot:
@@ -109,12 +112,19 @@ class MicrosandboxCLIExecutor:
         timeout: int = 60,
         conversation_id: str | None = None,
         base_dir: Path | None = None,
-        msb_path: str | None = None
+        workspace_dir: Path | None = None,
+        additional_volumes: list[tuple[str, str]] | None = None,
+        envs: dict[str, str] | None = None,
+        msb_path: str | None = None,
+        network_scope: str = "any"
     ):
         self.image = image
         self.memory = memory
         self.cpus = cpus
         self.timeout = timeout
+        self.network_scope = network_scope  # any, public, none
+        self.additional_volumes = additional_volumes or []
+        self.envs = envs or {}
 
         # Find msb binary
         self.msb_path = msb_path or self._find_msb()
@@ -129,7 +139,7 @@ class MicrosandboxCLIExecutor:
             import tempfile
             self.base_dir = Path(tempfile.mkdtemp(prefix="agentd_msb_"))
 
-        self.snapshot_manager = SnapshotManager(self.base_dir)
+        self.snapshot_manager = SnapshotManager(self.base_dir, workspace_dir=workspace_dir)
         self.snapshot_manager.workspace_dir.mkdir(parents=True, exist_ok=True)
 
         self._execution_count = 0
@@ -173,6 +183,7 @@ class MicrosandboxCLIExecutor:
             self.msb_path, "exe", self.image,
             "--memory", str(self.memory),
             "--cpus", str(self.cpus),
+            "--scope", self.network_scope,
         ]
 
         # Add volumes
@@ -268,13 +279,13 @@ class MicrosandboxCLIExecutor:
     def _get_volumes(self) -> list[tuple[str, str]]:
         """Get volume mappings for the sandbox."""
         workspace = str(self.snapshot_manager.workspace_dir.absolute())
-        return [(workspace, "/workspace")]
+        volumes = [(workspace, "/workspace")]
+        volumes.extend(self.additional_volumes)
+        return volumes
 
     def _get_envs(self) -> list[str]:
         """Get environment variables for the sandbox."""
-        return [
-            f"MCP_BRIDGE_URL={os.environ.get('MCP_BRIDGE_URL', 'http://localhost:8765')}"
-        ]
+        return [f"{k}={v}" for k, v in self.envs.items()]
 
     def execute_bash(self, command: str, cwd: Path) -> tuple[str, int]:
         """Run bash command in sandbox."""

@@ -641,12 +641,12 @@ import urllib.request
 
 _BRIDGE_URL = os.environ.get('MCP_BRIDGE_URL', 'http://localhost:{bridge_port}')
 
-def _call(name: str, **kwargs):
+def _call(tool_name: str, **kwargs):
     """Call a tool via the bridge."""
     # Filter out None values
     filtered = {{k: v for k, v in kwargs.items() if v is not None}}
     req = urllib.request.Request(
-        f"{{_BRIDGE_URL}}/call/{{name}}",
+        f"{{_BRIDGE_URL}}/call/{{tool_name}}",
         data=json.dumps(filtered).encode(),
         headers={{'Content-Type': 'application/json'}}
     )
@@ -803,10 +803,29 @@ def _setup_shared_lib(skills_dir: Path, all_tools: dict[str, dict], bridge_port:
     lib_dir = skills_dir / 'lib'
     lib_dir.mkdir(exist_ok=True)
 
+    tools_path = lib_dir / 'tools.py'
+    init_path = lib_dir / '__init__.py'
+
     # Generate lib/tools.py with ALL tools
     tools_py = generate_tools_module(all_tools, bridge_port)
-    (lib_dir / 'tools.py').write_text(tools_py)
-    (lib_dir / '__init__.py').write_text('from .tools import *\n')
+
+    # Only write if tool definitions changed (ignoring port number)
+    # The port is read from MCP_BRIDGE_URL env var at runtime anyway
+    # This prevents StatReload triggering on every session
+    import re
+    if tools_path.exists():
+        existing = tools_path.read_text()
+        # Normalize by removing the port number for comparison
+        existing_normalized = re.sub(r'localhost:\d+', 'localhost:PORT', existing)
+        new_normalized = re.sub(r'localhost:\d+', 'localhost:PORT', tools_py)
+        if existing_normalized == new_normalized:
+            # Only port changed - don't rewrite, env var will provide correct port
+            return
+
+    tools_path.write_text(tools_py)
+
+    if not init_path.exists():
+        init_path.write_text('from .tools import *\n')
 
 
 async def setup_skills_directory(
@@ -1047,14 +1066,15 @@ async def _handle_ptc_call(
     orig_fn_sync,
     orig_fn_async,
     server_cache: dict,
-    bridge_cache: dict | None = None
+    bridge_cache: dict | None = None,
+    skills_dir_override: Path | None = None
 ):
     """Handle PTC call with multi-provider support."""
     # Detect provider
     _, provider, api_key, _ = llm_utils.get_llm_provider(model)
 
     # Setup skills directory and get server lookup
-    skills_dir = cwd / 'skills'
+    skills_dir = skills_dir_override or (cwd / 'skills')
     server_lookup, bridge_port = await setup_skills_directory(
         skills_dir, mcp_servers, server_cache, bridge_cache=bridge_cache
     )
@@ -1161,7 +1181,8 @@ async def _handle_ptc_streaming(
     orig_fn_sync,
     orig_fn_async,
     server_cache: dict,
-    bridge_cache: dict | None = None
+    bridge_cache: dict | None = None,
+    skills_dir_override: Path | None = None
 ):
     """Handle streaming PTC call with sequential fence execution."""
     # Detect provider
@@ -1173,7 +1194,7 @@ async def _handle_ptc_streaming(
     clean_kwargs['stream'] = True
 
     current_messages = list(messages)
-    skills_dir = cwd / 'skills'
+    skills_dir = skills_dir_override or (cwd / 'skills')
 
     async def stream_with_execution():
         """Generator that manages MCP lifecycle via AsyncExitStack."""
@@ -1351,14 +1372,15 @@ async def _handle_ptc_responses_call(
     orig_fn_sync,
     orig_fn_async,
     server_cache: dict,
-    bridge_cache: dict | None = None
+    bridge_cache: dict | None = None,
+    skills_dir_override: Path | None = None
 ):
     """Handle PTC call for Responses API."""
     # Detect provider
     _, provider, api_key, _ = llm_utils.get_llm_provider(model)
 
     # Setup skills directory
-    skills_dir = cwd / 'skills'
+    skills_dir = skills_dir_override or (cwd / 'skills')
     server_lookup, bridge_port = await setup_skills_directory(
         skills_dir, mcp_servers, server_cache, bridge_cache=bridge_cache
     )
@@ -1440,7 +1462,9 @@ async def _handle_ptc_responses_call(
                 results.append((fence, msg))
 
         # Append to input for next iteration
-        current_input.append({"role": "assistant", "content": content})
+        # Only append assistant message if content is non-empty to avoid Anthropic API errors
+        if content.strip():
+            current_input.append({"role": "assistant", "content": content})
         current_input.extend(_format_results_for_responses(results))
 
     logger.warning(f"[Responses] Reached max loops ({MAX_LOOPS})")
@@ -1460,13 +1484,14 @@ async def _handle_ptc_responses_streaming(
     orig_fn_sync,
     orig_fn_async,
     server_cache: dict,
-    bridge_cache: dict | None = None
+    bridge_cache: dict | None = None,
+    skills_dir_override: Path | None = None
 ):
     """Handle streaming PTC call for Responses API."""
     # Detect provider
     _, provider, api_key, _ = llm_utils.get_llm_provider(model)
 
-    skills_dir = cwd / 'skills'
+    skills_dir = skills_dir_override or (cwd / 'skills')
 
     # Clean kwargs
     clean_kwargs = {k: v for k, v in kwargs.items()
@@ -1628,7 +1653,9 @@ async def _handle_ptc_responses_streaming(
                     return
 
                 # Continue with results
-                current_input.append({"role": "assistant", "content": buffer})
+                # Only append assistant message if buffer is non-empty to avoid Anthropic API errors
+                if buffer.strip():
+                    current_input.append({"role": "assistant", "content": buffer})
                 current_input.extend(_format_results_for_responses(executed_fences))
             # Exit stack closes here, properly cleaning up MCP servers
 
@@ -1646,7 +1673,8 @@ async def _handle_ptc_responses_streaming(
 def patch_openai_with_ptc(
     client,
     cwd: str | Path = ".",
-    executor: Executor | None = None
+    executor: Executor | None = None,
+    skills_dir: str | Path | None = None
 ):
     """
     Patch OpenAI client to use programmatic tool calling.
@@ -1663,6 +1691,7 @@ def patch_openai_with_ptc(
         client: OpenAI or AsyncOpenAI client
         cwd: Working directory for skill scripts (default: current directory)
         executor: Code execution backend (default: SubprocessExecutor)
+        skills_dir: Custom skills directory (default: cwd/skills)
 
     Returns:
         Patched client
@@ -1670,10 +1699,12 @@ def patch_openai_with_ptc(
     is_async = client.__class__.__name__ == 'AsyncOpenAI'
     executor = executor or SubprocessExecutor()
     cwd_path = Path(cwd).resolve()
+    skills_path = Path(skills_dir).resolve() if skills_dir else None
 
-    # Add per-client caches
+    # Add per-client caches and config
     client._mcp_server_cache = {}
     client._bridge_cache = {}
+    client._skills_dir = skills_path  # Custom skills dir (or None for default)
 
     # Store original methods
     orig_completions_sync = Completions.create
@@ -1689,18 +1720,19 @@ def patch_openai_with_ptc(
         client_obj = getattr(self, '_client', None) or getattr(self, 'client', None)
         server_cache = getattr(client_obj, '_mcp_server_cache', {}) if client_obj else {}
         bridge_cache = getattr(client_obj, '_bridge_cache', {}) if client_obj else {}
+        skills_override = getattr(client_obj, '_skills_dir', None) if client_obj else None
 
         if stream:
             # For sync streaming, wrap async generator directly (don't use _run_async)
             async_gen = _handle_ptc_streaming(
                 self, args, model, messages, mcp_servers, cwd_path, executor,
-                kwargs, False, orig_completions_sync, orig_completions_async, server_cache, bridge_cache
+                kwargs, False, orig_completions_sync, orig_completions_async, server_cache, bridge_cache, skills_override
             )
             return _sync_generator_wrapper(async_gen)
         else:
             return _run_async(_handle_ptc_call(
                 self, args, model, messages, mcp_servers, cwd_path, executor,
-                kwargs, False, orig_completions_sync, orig_completions_async, server_cache, bridge_cache
+                kwargs, False, orig_completions_sync, orig_completions_async, server_cache, bridge_cache, skills_override
             ))
 
     @wraps(orig_completions_async)
@@ -1713,16 +1745,17 @@ def patch_openai_with_ptc(
         client_obj = getattr(self, '_client', None) or getattr(self, 'client', None)
         server_cache = getattr(client_obj, '_mcp_server_cache', {}) if client_obj else {}
         bridge_cache = getattr(client_obj, '_bridge_cache', {}) if client_obj else {}
+        skills_override = getattr(client_obj, '_skills_dir', None) if client_obj else None
 
         if stream:
             return await _handle_ptc_streaming(
                 self, args, model, messages, mcp_servers, cwd_path, executor,
-                kwargs, True, orig_completions_sync, orig_completions_async, server_cache, bridge_cache
+                kwargs, True, orig_completions_sync, orig_completions_async, server_cache, bridge_cache, skills_override
             )
         else:
             return await _handle_ptc_call(
                 self, args, model, messages, mcp_servers, cwd_path, executor,
-                kwargs, True, orig_completions_sync, orig_completions_async, server_cache, bridge_cache
+                kwargs, True, orig_completions_sync, orig_completions_async, server_cache, bridge_cache, skills_override
             )
 
     # Store original Responses methods
@@ -1739,18 +1772,19 @@ def patch_openai_with_ptc(
         client_obj = getattr(self, '_client', None) or getattr(self, 'client', None)
         server_cache = getattr(client_obj, '_mcp_server_cache', {}) if client_obj else {}
         bridge_cache = getattr(client_obj, '_bridge_cache', {}) if client_obj else {}
+        skills_override = getattr(client_obj, '_skills_dir', None) if client_obj else None
 
         if stream:
             # For sync streaming, wrap async generator directly (don't use _run_async)
             async_gen = _handle_ptc_responses_streaming(
                 self, args, model, input, mcp_servers, cwd_path, executor,
-                kwargs, False, orig_responses_sync, orig_responses_async, server_cache, bridge_cache
+                kwargs, False, orig_responses_sync, orig_responses_async, server_cache, bridge_cache, skills_override
             )
             return _sync_generator_wrapper(async_gen)
         else:
             return _run_async(_handle_ptc_responses_call(
                 self, args, model, input, mcp_servers, cwd_path, executor,
-                kwargs, False, orig_responses_sync, orig_responses_async, server_cache, bridge_cache
+                kwargs, False, orig_responses_sync, orig_responses_async, server_cache, bridge_cache, skills_override
             ))
 
     @wraps(orig_responses_async)
@@ -1763,16 +1797,17 @@ def patch_openai_with_ptc(
         client_obj = getattr(self, '_client', None) or getattr(self, 'client', None)
         server_cache = getattr(client_obj, '_mcp_server_cache', {}) if client_obj else {}
         bridge_cache = getattr(client_obj, '_bridge_cache', {}) if client_obj else {}
+        skills_override = getattr(client_obj, '_skills_dir', None) if client_obj else None
 
         if stream:
             return await _handle_ptc_responses_streaming(
                 self, args, model, input, mcp_servers, cwd_path, executor,
-                kwargs, True, orig_responses_sync, orig_responses_async, server_cache, bridge_cache
+                kwargs, True, orig_responses_sync, orig_responses_async, server_cache, bridge_cache, skills_override
             )
         else:
             return await _handle_ptc_responses_call(
                 self, args, model, input, mcp_servers, cwd_path, executor,
-                kwargs, True, orig_responses_sync, orig_responses_async, server_cache, bridge_cache
+                kwargs, True, orig_responses_sync, orig_responses_async, server_cache, bridge_cache, skills_override
             )
 
     # Apply patches
