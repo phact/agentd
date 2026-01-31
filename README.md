@@ -214,6 +214,78 @@ executor.close()
 - **Snapshots:** Save and restore workspace state at any point
 - **Drop-in replacement:** Same interface as the default subprocess executor
 
+### Sandbox Runtime Executor
+
+Lightweight OS-level sandboxing using [Anthropic's sandbox-runtime](https://github.com/anthropic-experimental/sandbox-runtime). Uses `sandbox-exec` on macOS and `bubblewrap` on Linux - no containers or VMs required.
+
+**Install sandbox-runtime:**
+```bash
+npm install -g @anthropic-ai/sandbox-runtime
+```
+
+**Linux only:** If using AppArmor, you may need to allow unprivileged user namespaces:
+```bash
+sudo sysctl -w kernel.apparmor_restrict_unprivileged_userns=0
+```
+
+**Usage:**
+```python
+from agentd import patch_openai_with_ptc, create_sandbox_runtime_executor
+from openai import OpenAI
+
+executor = create_sandbox_runtime_executor(
+    conversation_id="my_session",
+    # Network restrictions (allow-list)
+    allowed_domains=["github.com", "pypi.org"],
+    # Filesystem restrictions
+    deny_read=["~/.ssh", "~/.aws", "~/.gnupg"],
+    # allow_write defaults to workspace only
+)
+
+# Verify sandbox works on this system
+ok, msg = executor.verify()
+if not ok:
+    print(f"Sandbox unavailable: {msg}")
+
+client = patch_openai_with_ptc(
+    OpenAI(),
+    cwd=str(executor.workspace_dir),
+    executor=executor,
+)
+
+stream = client.responses.create(
+    model="claude-sonnet-4-20250514",
+    input=[{"role": "user", "content": "Run some Python code"}],
+    stream=True
+)
+
+# ... handle events ...
+
+# Snapshots work the same as microsandbox
+executor.snapshot("checkpoint_1")
+executor.restore("checkpoint_1")
+
+executor.close()
+```
+
+**Features:**
+- **OS-level isolation:** Network and filesystem restrictions via OS primitives
+- **No containers:** Lighter weight than microVMs, faster startup
+- **Network allow-list:** Only specified domains are accessible
+- **Filesystem protection:** Block reads to sensitive paths, restrict writes
+- **Snapshots:** Same time-travel API as microsandbox executor
+- **MCP tools support:** Uses Unix sockets to bridge tool calls from sandbox to host
+
+**MCP Tools:** The sandbox runtime uses network namespace isolation, but MCP tools work via Unix sockets. The MCP bridge listens on a socket in the workspace directory, which is accessible from inside the sandbox.
+
+**Comparison:**
+
+| Executor | Isolation | Requirements | Best For |
+|----------|-----------|--------------|----------|
+| `SubprocessExecutor` | None | - | Development, trusted code |
+| `SandboxRuntimeExecutor` | OS-level | srt CLI | Lightweight isolation |
+| `MicrosandboxCLIExecutor` | MicroVM | msb CLI + KVM | Maximum isolation |
+
 ---
 
 ## Traditional Tool Calling
@@ -314,10 +386,15 @@ Assistant: I've saved 3 files to ./output/...
 ```python
 from agentd import patch_openai_with_mcp, patch_openai_with_ptc
 
-# PTC: bash + skills
+# PTC: bash + skills (no isolation)
 client = patch_openai_with_ptc(OpenAI(), cwd="./workspace")
 
-# PTC with microsandbox isolation
+# PTC with OS-level sandbox (lightweight)
+from agentd import create_sandbox_runtime_executor
+executor = create_sandbox_runtime_executor(conversation_id="my_session")
+client = patch_openai_with_ptc(OpenAI(), executor=executor)
+
+# PTC with microsandbox isolation (microVM)
 from agentd import create_microsandbox_cli_executor
 executor = create_microsandbox_cli_executor(conversation_id="my_session")
 client = patch_openai_with_ptc(OpenAI(), executor=executor)
@@ -329,9 +406,8 @@ client = patch_openai_with_mcp(OpenAI())
 ### Microsandbox Executor
 
 ```python
-from agentd import create_microsandbox_cli_executor, SandboxConfig
+from agentd import create_microsandbox_cli_executor
 
-# Simple usage
 executor = create_microsandbox_cli_executor(
     conversation_id="session_1",  # Sandbox name prefix
     image="python",               # microsandbox image
@@ -345,6 +421,34 @@ executor.restore(snapshot.id)             # Restore state
 snapshots = executor.list_snapshots()     # List all snapshots
 
 executor.close()  # Cleanup
+```
+
+### Sandbox Runtime Executor
+
+```python
+from agentd import create_sandbox_runtime_executor
+
+executor = create_sandbox_runtime_executor(
+    conversation_id="session_1",
+    timeout=60,
+    # Network (allow-list pattern)
+    allowed_domains=["github.com", "*.python.org"],
+    denied_domains=[],
+    allow_local_binding=False,
+    # Filesystem
+    deny_read=["~/.ssh", "~/.aws"],    # Block reading these paths
+    allow_write=None,                   # None = workspace only
+    deny_write=[".env"],                # Block within allowed zones
+)
+
+# Check if sandbox works on this system
+ok, msg = executor.verify()
+
+# Same snapshot API as microsandbox
+snapshot = executor.snapshot("label")
+executor.restore(snapshot.id)
+
+executor.close()
 ```
 
 ### Tool Decorator
@@ -369,7 +473,8 @@ def my_function(arg1: str, arg2: int = 10) -> str:
 See [`examples/`](./examples/):
 - `ptc_with_mcp.py` - PTC with MCP servers
 - `ptc_with_tools.py` - PTC with @tool decorator
-- `ptc_microsandbox.py` - PTC with microsandbox isolation
+- `ptc_microsandbox.py` - PTC with microsandbox isolation (microVM)
+- `ptc_sandbox_runtime.py` - PTC with sandbox-runtime isolation (OS-level)
 
 See [`config/`](./config/) for agent daemon configs.
 
@@ -393,15 +498,16 @@ See [`config/`](./config/) for agent daemon configs.
 └──────────────┼───────────────────────────────┼──────────────────┘
                │                               │
                ▼                               │
-┌──────────────────────────────┐               │
-│          Executors           │               │
-│  ┌────────┐  ┌────────────┐  │               │
-│  │Subprocess│ │Microsandbox│  │               │
-│  │(default)│  │  (microVM) │  │               │
-│  └────────┘  └────────────┘  │               │
-└──────────────┬───────────────┘               │
-               │                               │
-               ▼                               │
+┌──────────────────────────────────────────┐   │
+│              Executors                   │   │
+│  ┌──────────┐ ┌─────────┐ ┌───────────┐  │   │
+│  │Subprocess│ │ Sandbox │ │Microsandbox│  │   │
+│  │(default) │ │ Runtime │ │ (microVM) │  │   │
+│  │          │ │(OS-level)│ │           │  │   │
+│  └──────────┘ └─────────┘ └───────────┘  │   │
+└──────────────────┬───────────────────────┘   │
+                   │                           │
+                   ▼                           │
 ┌──────────────────────────────┐               │
 │         MCP Bridge           │               │
 │        (HTTP server)         │               │

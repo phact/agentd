@@ -754,17 +754,64 @@ def generate_tools_module(tools: dict[str, dict], bridge_port: int = 8765) -> st
     header = f'''"""Auto-generated tool bindings."""
 import os
 import json
+import socket
 import urllib.request
 
+# Unix socket path takes precedence over HTTP URL
+_BRIDGE_SOCKET = os.environ.get('MCP_BRIDGE_SOCKET')
 _BRIDGE_URL = os.environ.get('MCP_BRIDGE_URL', 'http://localhost:{bridge_port}')
 
+
+def _call_via_socket(socket_path: str, tool_name: str, data: bytes) -> dict:
+    """Call tool via Unix socket using raw HTTP."""
+    sock = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+    try:
+        sock.connect(socket_path)
+        # Send HTTP request
+        request = (
+            f"POST /call/{{tool_name}} HTTP/1.1\\r\\n"
+            f"Host: localhost\\r\\n"
+            f"Content-Type: application/json\\r\\n"
+            f"Content-Length: {{len(data)}}\\r\\n"
+            f"Connection: close\\r\\n"
+            f"\\r\\n"
+        ).encode() + data
+        sock.sendall(request)
+
+        # Read response
+        response = b""
+        while True:
+            chunk = sock.recv(4096)
+            if not chunk:
+                break
+            response += chunk
+
+        # Parse HTTP response
+        header_end = response.find(b"\\r\\n\\r\\n")
+        if header_end == -1:
+            return {{"error": "Invalid response"}}
+        body = response[header_end + 4:]
+        return json.loads(body)
+    except Exception as e:
+        return {{"error": str(e)}}
+    finally:
+        sock.close()
+
+
 def _call(tool_name: str, **kwargs):
-    """Call a tool via the bridge."""
+    """Call a tool via the bridge (Unix socket or HTTP)."""
     # Filter out None values
     filtered = {{k: v for k, v in kwargs.items() if v is not None}}
+    data = json.dumps(filtered).encode()
+
+    # Prefer Unix socket if available
+    if _BRIDGE_SOCKET and os.path.exists(_BRIDGE_SOCKET):
+        return _call_via_socket(_BRIDGE_SOCKET, tool_name, data)
+
+    # Fall back to HTTP
     req = urllib.request.Request(
         f"{{_BRIDGE_URL}}/call/{{tool_name}}",
-        data=json.dumps(filtered).encode(),
+        data=data,
         headers={{'Content-Type': 'application/json'}}
     )
     try:
@@ -950,9 +997,10 @@ async def setup_skills_directory(
     mcp_servers: list | None,
     server_cache: dict,
     bridge_port: int | None = None,
+    bridge_socket_path: str | Path | None = None,
     bridge_cache: dict | None = None,
     exit_stack: AsyncExitStack | None = None
-) -> tuple[dict[str, any], int]:
+) -> tuple[dict[str, any], int | str]:
     """
     Setup the skills directory with tool bindings and start MCP bridge.
 
@@ -970,12 +1018,14 @@ async def setup_skills_directory(
             scripts/
 
     Args:
+        bridge_socket_path: Path for Unix socket (preferred for sandboxed execution).
+                           If set, uses Unix socket instead of TCP port.
         exit_stack: If provided, MCP servers will be entered as async context
                    managers for proper cleanup. The caller is responsible for
                    closing the exit stack when done.
 
     Returns:
-        Tuple of (server_lookup dict, bridge_port)
+        Tuple of (server_lookup dict, bridge_port_or_socket_path)
     """
     from agentd.mcp_bridge import MCPBridge
 
@@ -989,15 +1039,15 @@ async def setup_skills_directory(
     # If MCP servers are present, use async mode so tool calls work properly
     if bridge_cache and 'bridge' in bridge_cache:
         bridge = bridge_cache['bridge']
-        actual_port = bridge.port
+        bridge_address = str(bridge.socket_path) if bridge.socket_path else bridge.port
     else:
-        bridge = MCPBridge(port=bridge_port or 0)
+        bridge = MCPBridge(port=bridge_port or 0, socket_path=bridge_socket_path)
         if mcp_servers:
             # Use async start - bridge runs in same event loop as MCP connections
-            actual_port = await bridge.start_async()
+            bridge_address = await bridge.start_async()
         else:
             # No MCP servers - use thread mode for local tools
-            actual_port = bridge.start_in_thread()
+            bridge_address = bridge.start_in_thread()
         if bridge_cache is not None:
             bridge_cache['bridge'] = bridge
 
@@ -1069,7 +1119,7 @@ async def setup_skills_directory(
 
     # 3) Create shared lib/ with ALL tools
     if all_tools:
-        _setup_shared_lib(skills_dir, all_tools, actual_port)
+        _setup_shared_lib(skills_dir, all_tools, bridge_address)
 
     # 4) Create each skill directory (without lib/)
     for skill_name, tools, description in skill_configs:
@@ -1078,8 +1128,29 @@ async def setup_skills_directory(
 
     logger.info(f"Setup {len(skill_configs)} skill(s) at {skills_dir}")
     logger.info(f"Shared lib/ contains {len(all_tools)} tools")
-    logger.info(f"MCP Bridge running on http://localhost:{actual_port}")
-    return server_lookup, actual_port
+    if bridge_socket_path:
+        logger.info(f"MCP Bridge running on unix://{bridge_address}")
+    else:
+        logger.info(f"MCP Bridge running on http://localhost:{bridge_address}")
+    return server_lookup, bridge_address
+
+
+def set_bridge_env(bridge_address: int | str) -> None:
+    """Set environment variables for MCP bridge connection.
+
+    Args:
+        bridge_address: Either a port number (int) for HTTP mode,
+                       or a socket path (str) for Unix socket mode.
+    """
+    if isinstance(bridge_address, str) and '/' in bridge_address:
+        # Unix socket path
+        os.environ['MCP_BRIDGE_SOCKET'] = bridge_address
+        # Also set URL as fallback
+        os.environ['MCP_BRIDGE_URL'] = f'http://localhost:0'
+    else:
+        # TCP port
+        os.environ.pop('MCP_BRIDGE_SOCKET', None)  # Clear socket if set
+        os.environ['MCP_BRIDGE_URL'] = f'http://localhost:{bridge_address}'
 
 
 # =============================================================================
@@ -1190,14 +1261,19 @@ async def _handle_ptc_call(
     # Detect provider
     _, provider, api_key, _ = llm_utils.get_llm_provider(model)
 
+    # Check if executor needs Unix socket for MCP bridge (e.g., sandboxed executors)
+    bridge_socket_path = getattr(executor, 'bridge_socket_path', None)
+
     # Setup skills directory and get server lookup
     skills_dir = skills_dir_override or (cwd / 'skills')
-    server_lookup, bridge_port = await setup_skills_directory(
-        skills_dir, mcp_servers, server_cache, bridge_cache=bridge_cache
+    server_lookup, bridge_address = await setup_skills_directory(
+        skills_dir, mcp_servers, server_cache,
+        bridge_socket_path=bridge_socket_path,
+        bridge_cache=bridge_cache
     )
 
-    # Set environment variable for subprocess executor
-    os.environ['MCP_BRIDGE_URL'] = f'http://localhost:{bridge_port}'
+    # Set environment variables for executor
+    set_bridge_env(bridge_address)
 
     # Clean kwargs - remove PTC-specific params
     clean_kwargs = {k: v for k, v in kwargs.items()
@@ -1306,6 +1382,9 @@ async def _handle_ptc_streaming(
     # Detect provider
     _, provider, api_key, _ = llm_utils.get_llm_provider(model)
 
+    # Check if executor needs Unix socket for MCP bridge
+    bridge_socket_path = getattr(executor, 'bridge_socket_path', None)
+
     # Clean kwargs
     clean_kwargs = {k: v for k, v in kwargs.items()
                     if k not in ('mcp_servers', 'mcp_strict', 'ptc_enabled', 'cwd', 'stream')}
@@ -1319,13 +1398,14 @@ async def _handle_ptc_streaming(
         """Generator that manages MCP lifecycle via AsyncExitStack."""
         async with AsyncExitStack() as exit_stack:
             # Setup skills directory with exit stack for proper MCP cleanup
-            server_lookup, bridge_port = await setup_skills_directory(
+            server_lookup, bridge_address = await setup_skills_directory(
                 skills_dir, mcp_servers, server_cache,
+                bridge_socket_path=bridge_socket_path,
                 bridge_cache=bridge_cache, exit_stack=exit_stack
             )
 
-            # Set environment variable for subprocess executor
-            os.environ['MCP_BRIDGE_URL'] = f'http://localhost:{bridge_port}'
+            # Set environment variables for executor
+            set_bridge_env(bridge_address)
 
             nonlocal current_messages
 
@@ -1499,13 +1579,19 @@ async def _handle_ptc_responses_call(
     # Detect provider
     _, provider, api_key, _ = llm_utils.get_llm_provider(model)
 
+    # Check if executor needs Unix socket for MCP bridge
+    bridge_socket_path = getattr(executor, 'bridge_socket_path', None)
+
     # Setup skills directory
     skills_dir = skills_dir_override or (cwd / 'skills')
-    server_lookup, bridge_port = await setup_skills_directory(
-        skills_dir, mcp_servers, server_cache, bridge_cache=bridge_cache
+    server_lookup, bridge_address = await setup_skills_directory(
+        skills_dir, mcp_servers, server_cache,
+        bridge_socket_path=bridge_socket_path,
+        bridge_cache=bridge_cache
     )
 
-    os.environ['MCP_BRIDGE_URL'] = f'http://localhost:{bridge_port}'
+    # Set environment variables for executor
+    set_bridge_env(bridge_address)
 
     # Clean kwargs
     clean_kwargs = {k: v for k, v in kwargs.items()
@@ -1609,6 +1695,9 @@ async def _handle_ptc_responses_streaming(
     # Detect provider
     _, provider, api_key, _ = llm_utils.get_llm_provider(model)
 
+    # Check if executor needs Unix socket for MCP bridge
+    bridge_socket_path = getattr(executor, 'bridge_socket_path', None)
+
     skills_dir = skills_dir_override or (cwd / 'skills')
 
     # Clean kwargs
@@ -1623,12 +1712,14 @@ async def _handle_ptc_responses_streaming(
         """Generator that manages MCP lifecycle via AsyncExitStack."""
         async with AsyncExitStack() as exit_stack:
             # Setup skills directory with exit stack for proper MCP cleanup
-            server_lookup, bridge_port = await setup_skills_directory(
+            server_lookup, bridge_address = await setup_skills_directory(
                 skills_dir, mcp_servers, server_cache,
+                bridge_socket_path=bridge_socket_path,
                 bridge_cache=bridge_cache, exit_stack=exit_stack
             )
 
-            os.environ['MCP_BRIDGE_URL'] = f'http://localhost:{bridge_port}'
+            # Set environment variables for executor
+            set_bridge_env(bridge_address)
 
             nonlocal current_input
 
