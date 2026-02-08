@@ -257,9 +257,14 @@ class SandboxRuntimeExecutor:
             if result.stderr:
                 # Filter out srt info messages
                 stderr_lines = []
+                srt_lines = []
                 for line in result.stderr.split('\n'):
                     if not any(x in line.lower() for x in ['sandbox', 'srt', 'violation']):
                         stderr_lines.append(line)
+                    else:
+                        srt_lines.append(line)
+                if srt_lines:
+                    logger.info("Filtered SRT messages: %s", '\n'.join(srt_lines))
                 stderr = '\n'.join(stderr_lines).strip()
                 if stderr:
                     output = f"{output}\n{stderr}" if output else stderr
