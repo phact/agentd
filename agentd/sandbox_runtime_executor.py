@@ -16,6 +16,7 @@ import shutil
 import subprocess
 import tempfile
 import uuid
+import warnings
 from dataclasses import dataclass, field
 from pathlib import Path
 
@@ -231,7 +232,7 @@ class SandboxRuntimeExecutor:
             cmd
         ]
 
-    def _run_command(self, cmd: list[str], cwd: Path | None = None) -> tuple[str, int]:
+    def _run_command(self, cmd: list[str], cwd: Path | None = None, filter_srt_stderr: bool = True) -> tuple[str, int]:
         """Run a command and return (output, exit_code)."""
         try:
             result = subprocess.run(
@@ -255,17 +256,20 @@ class SandboxRuntimeExecutor:
 
             output = result.stdout
             if result.stderr:
-                # Filter out srt info messages
-                stderr_lines = []
-                srt_lines = []
-                for line in result.stderr.split('\n'):
-                    if not any(x in line.lower() for x in ['sandbox', 'srt', 'violation']):
-                        stderr_lines.append(line)
-                    else:
-                        srt_lines.append(line)
-                if srt_lines:
-                    logger.info("Filtered SRT messages: %s", '\n'.join(srt_lines))
-                stderr = '\n'.join(stderr_lines).strip()
+                if filter_srt_stderr:
+                    # Filter out srt info messages
+                    stderr_lines = []
+                    srt_lines = []
+                    for line in result.stderr.split('\n'):
+                        if not any(x in line.lower() for x in ['sandbox', 'srt', 'violation']):
+                            stderr_lines.append(line)
+                        else:
+                            srt_lines.append(line)
+                    if srt_lines:
+                        logger.info("Filtered SRT messages: %s", '\n'.join(srt_lines))
+                    stderr = '\n'.join(stderr_lines).strip()
+                else:
+                    stderr = result.stderr.strip()
                 if stderr:
                     output = f"{output}\n{stderr}" if output else stderr
 
@@ -443,9 +447,12 @@ class SandboxRuntimeExecutor:
         Use this to check if srt/bubblewrap works on the current system
         before attempting to run untrusted code.
         """
-        output, exit_code = self.execute_bash("echo sandbox_ok", Path("."))
+        workspace = self.snapshot_manager.workspace_dir
+        cmd = self._build_command("bash -c 'echo sandbox_ok'")
+        output, exit_code = self._run_command(cmd, workspace, filter_srt_stderr=False)
         if exit_code == 0 and "sandbox_ok" in output:
             return True, "Sandbox is functional"
+        warnings.warn(f"Sandbox verification failed: {output}", stacklevel=2)
         return False, output
 
     # =========================================================================
