@@ -58,11 +58,6 @@ To create a file:
 <contents>
 ```
 
-You have a ./skills/ directory with available tools:
-- `skills/lib/tools.py` - shared module with all tool functions
-- `skills/<name>/SKILL.md` - documentation for each skill
-- `skills/<name>/scripts/` - example scripts
-
 When writing multiple code fences:
 - Back-to-back fences (no text between) execute in parallel
 - If you write text between fences, only the first fence executes - wait for its result before continuing
@@ -74,24 +69,68 @@ For conditional actions, use logic within a single fence:
 """
 
 
-def _inject_ptc_guidance(messages: list) -> list:
+def generate_tool_manifest(all_tools: dict[str, dict]) -> str:
+    """Generate a compact tool manifest for system prompt injection."""
+    if not all_tools:
+        return ""
+
+    lines = [
+        "\n## Available Tools",
+        "",
+        "Import: `from lib.tools import <name>`",
+        ""
+    ]
+    for name, schema in all_tools.items():
+        # Handle both flat and nested schemas
+        if 'function' in schema:
+            fn = schema['function']
+            params = fn.get('parameters', {}).get('properties', {})
+            required = fn.get('parameters', {}).get('required', [])
+            desc = fn.get('description', '')
+        else:
+            params = schema.get('parameters', {}).get('properties', {})
+            required = schema.get('parameters', {}).get('required', [])
+            desc = schema.get('description', '')
+
+        # Build compact signature
+        args = []
+        for param, info in params.items():
+            type_hint = _python_type(info.get('type', 'string'))
+            if param in required:
+                args.append(f"{param}: {type_hint}")
+            else:
+                args.append(f"{param}: {type_hint} = None")
+        sig = ", ".join(args)
+
+        # Truncate long descriptions to first line, max 80 chars
+        short_desc = (desc.split('\n')[0][:80] + '...') if desc and len(desc.split('\n')[0]) > 80 else (desc.split('\n')[0] if desc else '')
+        lines.append(f"- `{name}({sig})` - {short_desc}")
+
+    lines.append("")
+    lines.append("For detailed docs: `cat skills/<name>/SKILL.md`")
+    return "\n".join(lines)
+
+
+def _inject_ptc_guidance(messages: list, tool_manifest: str = "") -> list:
     """Inject PTC guidance into system message or prepend one."""
+    guidance = PTC_GUIDANCE + tool_manifest
     messages = list(messages)  # copy
     if messages and messages[0].get("role") == "system":
         messages[0] = {
             **messages[0],
-            "content": messages[0]["content"] + "\n\n" + PTC_GUIDANCE
+            "content": messages[0]["content"] + "\n\n" + guidance
         }
     else:
-        messages.insert(0, {"role": "system", "content": PTC_GUIDANCE})
+        messages.insert(0, {"role": "system", "content": guidance})
     return messages
 
 
-def _inject_ptc_guidance_responses(input_data: list | str) -> list:
+def _inject_ptc_guidance_responses(input_data: list | str, tool_manifest: str = "") -> list:
     """Inject PTC guidance for Responses API input format."""
+    guidance = PTC_GUIDANCE + tool_manifest
     if isinstance(input_data, str):
         return [
-            {"role": "system", "content": PTC_GUIDANCE},
+            {"role": "system", "content": guidance},
             {"role": "user", "content": input_data}
         ]
 
@@ -99,10 +138,10 @@ def _inject_ptc_guidance_responses(input_data: list | str) -> list:
     if input_list and input_list[0].get("role") == "system":
         input_list[0] = {
             **input_list[0],
-            "content": input_list[0]["content"] + "\n\n" + PTC_GUIDANCE
+            "content": input_list[0]["content"] + "\n\n" + guidance
         }
     else:
-        input_list.insert(0, {"role": "system", "content": PTC_GUIDANCE})
+        input_list.insert(0, {"role": "system", "content": guidance})
     return input_list
 
 
@@ -989,8 +1028,25 @@ def _setup_shared_lib(skills_dir: Path, all_tools: dict[str, dict], bridge_port:
 
     tools_path.write_text(tools_py)
 
-    if not init_path.exists():
-        init_path.write_text('from .tools import *\n')
+    # Always write __init__.py - adds skill script dirs to sys.path
+    init_content = '''"""Auto-generated skill library. Adds all skill directories to sys.path."""
+import sys as _sys
+import os as _os
+
+# Add skills root and skill script directories to sys.path so imports work
+# regardless of how the agent references them
+_skills_dir = _os.path.dirname(_os.path.dirname(_os.path.abspath(__file__)))
+for _p in [_skills_dir, _os.path.dirname(_os.path.abspath(__file__))]:
+    if _p not in _sys.path:
+        _sys.path.insert(0, _p)
+for _entry in _os.listdir(_skills_dir):
+    _scripts = _os.path.join(_skills_dir, _entry, 'scripts')
+    if _os.path.isdir(_scripts) and _scripts not in _sys.path:
+        _sys.path.insert(0, _scripts)
+
+from .tools import *
+'''
+    init_path.write_text(init_content)
 
 
 async def setup_skills_directory(
@@ -1001,7 +1057,7 @@ async def setup_skills_directory(
     bridge_socket_path: str | Path | None = None,
     bridge_cache: dict | None = None,
     exit_stack: AsyncExitStack | None = None
-) -> tuple[dict[str, any], int | str]:
+) -> tuple[dict[str, any], int | str, str]:
     """
     Setup the skills directory with tool bindings and start MCP bridge.
 
@@ -1026,7 +1082,7 @@ async def setup_skills_directory(
                    closing the exit stack when done.
 
     Returns:
-        Tuple of (server_lookup dict, bridge_port_or_socket_path)
+        Tuple of (server_lookup dict, bridge_port_or_socket_path, tool_manifest)
     """
     from agentd.mcp_bridge import MCPBridge
 
@@ -1127,13 +1183,16 @@ async def setup_skills_directory(
         skill_dir = skills_dir / skill_name
         _setup_skill_dir(skill_dir, skill_name, tools, description)
 
+    # 5) Generate tool manifest for system prompt injection
+    tool_manifest = generate_tool_manifest(all_tools)
+
     logger.info(f"Setup {len(skill_configs)} skill(s) at {skills_dir}")
     logger.info(f"Shared lib/ contains {len(all_tools)} tools")
     if bridge_socket_path:
         logger.info(f"MCP Bridge running on unix://{bridge_address}")
     else:
         logger.info(f"MCP Bridge running on http://localhost:{bridge_address}")
-    return server_lookup, bridge_address
+    return server_lookup, bridge_address, tool_manifest
 
 
 def set_bridge_env(bridge_address: int | str) -> None:
@@ -1267,7 +1326,7 @@ async def _handle_ptc_call(
 
     # Setup skills directory and get server lookup
     skills_dir = skills_dir_override or (cwd / 'skills')
-    server_lookup, bridge_address = await setup_skills_directory(
+    server_lookup, bridge_address, tool_manifest = await setup_skills_directory(
         skills_dir, mcp_servers, server_cache,
         bridge_socket_path=bridge_socket_path,
         bridge_cache=bridge_cache
@@ -1280,8 +1339,8 @@ async def _handle_ptc_call(
     clean_kwargs = {k: v for k, v in kwargs.items()
                     if k not in ('mcp_servers', 'mcp_strict', 'ptc_enabled', 'cwd')}
 
-    # Inject PTC guidance and work with a copy of messages
-    current_messages = _inject_ptc_guidance(messages)
+    # Inject PTC guidance with tool manifest
+    current_messages = _inject_ptc_guidance(messages, tool_manifest)
 
     loop_count = 0
     while loop_count < MAX_LOOPS:
@@ -1391,15 +1450,14 @@ async def _handle_ptc_streaming(
                     if k not in ('mcp_servers', 'mcp_strict', 'ptc_enabled', 'cwd', 'stream')}
     clean_kwargs['stream'] = True
 
-    # Inject PTC guidance
-    current_messages = _inject_ptc_guidance(messages)
     skills_dir = skills_dir_override or (cwd / 'skills')
+    current_messages = None
 
     async def stream_with_execution():
         """Generator that manages MCP lifecycle via AsyncExitStack."""
         async with AsyncExitStack() as exit_stack:
             # Setup skills directory with exit stack for proper MCP cleanup
-            server_lookup, bridge_address = await setup_skills_directory(
+            server_lookup, bridge_address, tool_manifest = await setup_skills_directory(
                 skills_dir, mcp_servers, server_cache,
                 bridge_socket_path=bridge_socket_path,
                 bridge_cache=bridge_cache, exit_stack=exit_stack
@@ -1409,6 +1467,8 @@ async def _handle_ptc_streaming(
             set_bridge_env(bridge_address)
 
             nonlocal current_messages
+            # Inject PTC guidance with tool manifest (after setup so manifest is available)
+            current_messages = _inject_ptc_guidance(messages, tool_manifest)
 
             loop_count = 0
             while loop_count < MAX_LOOPS:
@@ -1585,7 +1645,7 @@ async def _handle_ptc_responses_call(
 
     # Setup skills directory
     skills_dir = skills_dir_override or (cwd / 'skills')
-    server_lookup, bridge_address = await setup_skills_directory(
+    server_lookup, bridge_address, tool_manifest = await setup_skills_directory(
         skills_dir, mcp_servers, server_cache,
         bridge_socket_path=bridge_socket_path,
         bridge_cache=bridge_cache
@@ -1598,8 +1658,8 @@ async def _handle_ptc_responses_call(
     clean_kwargs = {k: v for k, v in kwargs.items()
                     if k not in ('mcp_servers', 'mcp_strict', 'ptc_enabled', 'cwd')}
 
-    # Inject PTC guidance and normalize input
-    current_input = _inject_ptc_guidance_responses(input_data)
+    # Inject PTC guidance with tool manifest
+    current_input = _inject_ptc_guidance_responses(input_data, tool_manifest)
 
     loop_count = 0
     while loop_count < MAX_LOOPS:
@@ -1706,14 +1766,13 @@ async def _handle_ptc_responses_streaming(
                     if k not in ('mcp_servers', 'mcp_strict', 'ptc_enabled', 'cwd', 'stream')}
     clean_kwargs['stream'] = True
 
-    # Inject PTC guidance and normalize input
-    current_input = _inject_ptc_guidance_responses(input_data)
+    current_input = None
 
     async def stream_with_execution():
         """Generator that manages MCP lifecycle via AsyncExitStack."""
         async with AsyncExitStack() as exit_stack:
             # Setup skills directory with exit stack for proper MCP cleanup
-            server_lookup, bridge_address = await setup_skills_directory(
+            server_lookup, bridge_address, tool_manifest = await setup_skills_directory(
                 skills_dir, mcp_servers, server_cache,
                 bridge_socket_path=bridge_socket_path,
                 bridge_cache=bridge_cache, exit_stack=exit_stack
@@ -1723,6 +1782,8 @@ async def _handle_ptc_responses_streaming(
             set_bridge_env(bridge_address)
 
             nonlocal current_input
+            # Inject PTC guidance with tool manifest (after setup so manifest is available)
+            current_input = _inject_ptc_guidance_responses(input_data, tool_manifest)
 
             loop_count = 0
             seq_num = 0  # Track sequence numbers for events
