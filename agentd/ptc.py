@@ -1010,25 +1010,8 @@ def _setup_shared_lib(skills_dir: Path, all_tools: dict[str, dict], bridge_port:
     tools_path = lib_dir / 'tools.py'
     init_path = lib_dir / '__init__.py'
 
-    # Generate lib/tools.py with ALL tools
-    tools_py = generate_tools_module(all_tools, bridge_port)
-
-    # Only write if tool definitions changed (ignoring port number)
-    # The port is read from MCP_BRIDGE_URL env var at runtime anyway
-    # This prevents StatReload triggering on every session
-    import re
-    if tools_path.exists():
-        existing = tools_path.read_text()
-        # Normalize by removing the port number for comparison
-        existing_normalized = re.sub(r'localhost:\d+', 'localhost:PORT', existing)
-        new_normalized = re.sub(r'localhost:\d+', 'localhost:PORT', tools_py)
-        if existing_normalized == new_normalized:
-            # Only port changed - don't rewrite, env var will provide correct port
-            return
-
-    tools_path.write_text(tools_py)
-
     # Always write __init__.py - adds skill script dirs to sys.path
+    # Must happen before the early-return below so it's never skipped
     init_content = '''"""Auto-generated skill library. Adds all skill directories to sys.path."""
 import sys as _sys
 import os as _os
@@ -1046,7 +1029,26 @@ for _entry in _os.listdir(_skills_dir):
 
 from .tools import *
 '''
-    init_path.write_text(init_content)
+    if not init_path.exists() or init_path.read_text() != init_content:
+        init_path.write_text(init_content)
+
+    # Generate lib/tools.py with ALL tools
+    tools_py = generate_tools_module(all_tools, bridge_port)
+
+    # Only write if tool definitions changed (ignoring port number)
+    # The port is read from MCP_BRIDGE_URL env var at runtime anyway
+    # This prevents StatReload triggering on every session
+    import re
+    if tools_path.exists():
+        existing = tools_path.read_text()
+        # Normalize by removing the port number for comparison
+        existing_normalized = re.sub(r'localhost:\d+', 'localhost:PORT', existing)
+        new_normalized = re.sub(r'localhost:\d+', 'localhost:PORT', tools_py)
+        if existing_normalized == new_normalized:
+            # Only port changed - don't rewrite, env var will provide correct port
+            return
+
+    tools_path.write_text(tools_py)
 
 
 async def setup_skills_directory(
