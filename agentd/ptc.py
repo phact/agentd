@@ -69,45 +69,89 @@ For conditional actions, use logic within a single fence:
 """
 
 
-def generate_tool_manifest(all_tools: dict[str, dict]) -> str:
-    """Generate a compact tool manifest for system prompt injection."""
-    if not all_tools:
+def _parse_skill_frontmatter(skill_md_path: Path) -> dict | None:
+    """Parse YAML frontmatter from a SKILL.md file."""
+    try:
+        text = skill_md_path.read_text()
+        if not text.startswith('---'):
+            return None
+        end = text.find('---', 3)
+        if end == -1:
+            return None
+        import yaml
+        return yaml.safe_load(text[3:end])
+    except Exception:
+        return None
+
+
+def generate_tool_manifest(all_tools: dict[str, dict], skills_dir: Path = None) -> str:
+    """Generate a compact tool manifest for system prompt injection.
+
+    Scans skills_dir for all skills (SKILL.md) and lists all tool functions.
+    """
+    lines = []
+
+    # Discover all skills from the skills directory (AgentSkills XML spec)
+    if skills_dir and skills_dir.exists():
+        skill_entries = []
+        for entry in sorted(skills_dir.iterdir()):
+            if not entry.is_dir() or entry.name == 'lib':
+                continue
+            skill_md = entry / 'SKILL.md'
+            if not skill_md.exists():
+                continue
+            meta = _parse_skill_frontmatter(skill_md)
+            name = meta.get('name', entry.name) if meta else entry.name
+            desc = meta.get('description', '') if meta else ''
+            location = str(skill_md.resolve())
+            skill_entries.append((name, desc, location))
+
+        if skill_entries:
+            from html import escape
+            lines.append("")
+            lines.append("<available_skills>")
+            for name, desc, location in skill_entries:
+                lines.append(f"  <skill>")
+                lines.append(f"    <name>{escape(name)}</name>")
+                lines.append(f"    <description>{escape(desc)}</description>")
+                lines.append(f"    <location>{escape(location)}</location>")
+                lines.append(f"  </skill>")
+            lines.append("</available_skills>")
+
+    # List all tool functions (from MCP servers and @tool)
+    if all_tools:
+        lines.append("")
+        lines.append("## Available Tools")
+        lines.append("")
+        lines.append("Import: `from lib.tools import <name>`")
+        lines.append("")
+        for name, schema in all_tools.items():
+            if 'function' in schema:
+                fn = schema['function']
+                params = fn.get('parameters', {}).get('properties', {})
+                required = fn.get('parameters', {}).get('required', [])
+                desc = fn.get('description', '')
+            else:
+                params = schema.get('parameters', {}).get('properties', {})
+                required = schema.get('parameters', {}).get('required', [])
+                desc = schema.get('description', '')
+
+            args = []
+            for param, info in params.items():
+                type_hint = _python_type(info.get('type', 'string'))
+                if param in required:
+                    args.append(f"{param}: {type_hint}")
+                else:
+                    args.append(f"{param}: {type_hint} = None")
+            sig = ", ".join(args)
+
+            first_line = desc.split('\n')[0] if desc else ''
+            short_desc = (first_line[:80] + '...') if len(first_line) > 80 else first_line
+            lines.append(f"- `{name}({sig})` - {short_desc}")
+
+    if not lines:
         return ""
 
-    lines = [
-        "\n## Available Tools",
-        "",
-        "Import: `from lib.tools import <name>`",
-        ""
-    ]
-    for name, schema in all_tools.items():
-        # Handle both flat and nested schemas
-        if 'function' in schema:
-            fn = schema['function']
-            params = fn.get('parameters', {}).get('properties', {})
-            required = fn.get('parameters', {}).get('required', [])
-            desc = fn.get('description', '')
-        else:
-            params = schema.get('parameters', {}).get('properties', {})
-            required = schema.get('parameters', {}).get('required', [])
-            desc = schema.get('description', '')
-
-        # Build compact signature
-        args = []
-        for param, info in params.items():
-            type_hint = _python_type(info.get('type', 'string'))
-            if param in required:
-                args.append(f"{param}: {type_hint}")
-            else:
-                args.append(f"{param}: {type_hint} = None")
-        sig = ", ".join(args)
-
-        # Truncate long descriptions to first line, max 80 chars
-        short_desc = (desc.split('\n')[0][:80] + '...') if desc and len(desc.split('\n')[0]) > 80 else (desc.split('\n')[0] if desc else '')
-        lines.append(f"- `{name}({sig})` - {short_desc}")
-
-    lines.append("")
-    lines.append("For detailed docs: `cat skills/<name>/SKILL.md`")
     return "\n".join(lines)
 
 
@@ -1185,8 +1229,12 @@ async def setup_skills_directory(
         skill_dir = skills_dir / skill_name
         _setup_skill_dir(skill_dir, skill_name, tools, description)
 
-    # 5) Generate tool manifest for system prompt injection
-    tool_manifest = generate_tool_manifest(all_tools)
+    # 5) Always create local/scripts/ as a workspace for agent-created scripts
+    local_scripts = skills_dir / 'local' / 'scripts'
+    local_scripts.mkdir(parents=True, exist_ok=True)
+
+    # 6) Generate tool manifest for system prompt injection
+    tool_manifest = generate_tool_manifest(all_tools, skills_dir)
 
     logger.info(f"Setup {len(skill_configs)} skill(s) at {skills_dir}")
     logger.info(f"Shared lib/ contains {len(all_tools)} tools")
