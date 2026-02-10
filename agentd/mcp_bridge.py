@@ -194,7 +194,16 @@ class MCPBridge:
                     # Running in same async context - await directly
                     result = await server.call_tool(tool_name, args)
 
-                content = result.dict().get('content', result.dict())
+                # Unwrap MCP content blocks → return raw text/value
+                content = result.dict().get('content', [])
+                texts = [c.get('text', '') for c in content
+                         if isinstance(c, dict) and c.get('type') == 'text']
+                if texts:
+                    text = '\n'.join(texts) if len(texts) > 1 else texts[0]
+                    try:
+                        return web.json_response(json.loads(text))
+                    except (json.JSONDecodeError, TypeError):
+                        return web.json_response(text)
                 return web.json_response(content)
             except Exception as e:
                 logger.error(f"MCP tool call failed: {e}")
@@ -210,7 +219,7 @@ class MCPBridge:
                 result = func(**args)
                 if asyncio.iscoroutine(result):
                     result = await result
-                return web.json_response({"result": result})
+                return web.json_response(result)
             except Exception as e:
                 logger.error(f"Local tool call failed: {e}")
                 return web.json_response(
