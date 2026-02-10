@@ -982,6 +982,8 @@ def patch_openai_with_mcp(client):
 
     @wraps(orig_embeddings_sync)
     def patched_embeddings_sync(self, *args, model=None, input=None, **kwargs):
+        if isinstance(input, str):
+            input = [input]
         _, provider, api_key, _ = llm_utils.get_llm_provider(model)
         if provider == 'openai':
             return orig_embeddings_sync(self, *args, model=model, input=input, **kwargs)
@@ -989,6 +991,8 @@ def patch_openai_with_mcp(client):
 
     @wraps(orig_embeddings_async)
     async def patched_embeddings_async(self, *args, model=None, input=None, **kwargs):
+        if isinstance(input, str):
+            input = [input]
         _, provider, api_key, _ = llm_utils.get_llm_provider(model)
         if provider == 'openai':
             return await orig_embeddings_async(self, *args, model=model, input=input, **kwargs)
