@@ -24,6 +24,7 @@ from typing import Protocol, runtime_checkable
 
 from openai.resources.chat.completions import Completions, AsyncCompletions
 from openai.resources.responses import Responses, AsyncResponses
+from openai.resources.embeddings import Embeddings, AsyncEmbeddings
 
 import litellm
 import litellm.utils as llm_utils
@@ -2017,13 +2018,33 @@ def patch_openai_with_ptc(
                 kwargs, True, orig_responses_sync, orig_responses_async, server_cache, bridge_cache, skills_override
             )
 
+    # Store original Embeddings methods
+    orig_embeddings_sync = Embeddings.create
+    orig_embeddings_async = AsyncEmbeddings.create
+
+    @wraps(orig_embeddings_sync)
+    def patched_embeddings_sync(self, *args, model=None, input=None, **kwargs):
+        _, provider, api_key, _ = llm_utils.get_llm_provider(model)
+        if provider == 'openai':
+            return orig_embeddings_sync(self, *args, model=model, input=input, **kwargs)
+        return litellm.embedding(model=model, input=input, api_key=api_key, **kwargs)
+
+    @wraps(orig_embeddings_async)
+    async def patched_embeddings_async(self, *args, model=None, input=None, **kwargs):
+        _, provider, api_key, _ = llm_utils.get_llm_provider(model)
+        if provider == 'openai':
+            return await orig_embeddings_async(self, *args, model=model, input=input, **kwargs)
+        return await litellm.aembedding(model=model, input=input, api_key=api_key, **kwargs)
+
     # Apply patches
     if is_async:
         client.chat.completions.create = types.MethodType(patched_completions_async, client.chat.completions)
         client.responses.create = types.MethodType(patched_responses_async, client.responses)
+        client.embeddings.create = types.MethodType(patched_embeddings_async, client.embeddings)
     else:
         client.chat.completions.create = types.MethodType(patched_completions_sync, client.chat.completions)
         client.responses.create = types.MethodType(patched_responses_sync, client.responses)
+        client.embeddings.create = types.MethodType(patched_embeddings_sync, client.embeddings)
 
     # Add cleanup method to client
     def cleanup_ptc():
