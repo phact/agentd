@@ -148,8 +148,7 @@ def generate_tool_manifest(all_tools: dict[str, dict], skills_dir: Path = None) 
             sig = ", ".join(args)
 
             first_line = desc.split('\n')[0] if desc else ''
-            short_desc = (first_line[:80] + '...') if len(first_line) > 80 else first_line
-            lines.append(f"- `{name}({sig})` - {short_desc}")
+            lines.append(f"- `{name}({sig})` - {first_line}")
 
     if not lines:
         return ""
