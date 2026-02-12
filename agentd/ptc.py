@@ -147,8 +147,7 @@ def generate_tool_manifest(all_tools: dict[str, dict], skills_dir: Path = None) 
                     args.append(f"{param}: {type_hint} = None")
             sig = ", ".join(args)
 
-            first_line = desc.split('\n')[0] if desc else ''
-            lines.append(f"- `{name}({sig})` - {first_line}")
+            lines.append(f"- `{name}({sig})` - {desc}")
 
     if not lines:
         return ""
