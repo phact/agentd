@@ -15,6 +15,7 @@ import logging
 import os
 import re
 import subprocess
+import time
 import types
 from contextlib import AsyncExitStack
 from dataclasses import dataclass
@@ -29,6 +30,7 @@ from openai.resources.embeddings import Embeddings, AsyncEmbeddings
 import litellm
 import litellm.utils as llm_utils
 
+from agentd.conversation_logger import create_log
 from agentd.tool_decorator import SCHEMA_REGISTRY, FUNCTION_REGISTRY
 
 logger = logging.getLogger(__name__)
@@ -1392,6 +1394,11 @@ async def _handle_ptc_call(
     # Inject PTC guidance with tool manifest
     current_messages = _inject_ptc_guidance(messages, tool_manifest)
 
+    clog = create_log("ptc", model)
+    if clog:
+        for msg in current_messages:
+            clog.message(msg.get("role", ""), msg.get("content", ""))
+
     loop_count = 0
     while loop_count < MAX_LOOPS:
         loop_count += 1
@@ -1430,9 +1437,11 @@ async def _handle_ptc_call(
                 )
 
         content = _extract_content(response, provider)
+        if clog: clog.message("assistant", content)
         fences = parse_code_fences(content)
 
         if not fences:
+            if clog: clog.end(loop_count)
             return response  # No code fences = done
 
         logger.info(f"Found {len(fences)} code fences to execute")
@@ -1442,7 +1451,10 @@ async def _handle_ptc_call(
         # Use async execution if MCP servers are present (keeps loop running for callbacks)
         results = []
         for fence in fences:
+            fence_name = f"{fence.fence_type}:{fence.action}"
             if fence.action == 'execute':
+                if clog: clog.tool_call("code_fence", fence_name, fence.content)
+                t0 = time.time()
                 if fence.fence_type == 'bash':
                     # Bash runs in user's cwd
                     if mcp_servers:
@@ -1455,19 +1467,28 @@ async def _handle_ptc_call(
                         output, code = await executor.execute_python_async(fence.content, cwd, pythonpath=skills_dir)
                     else:
                         output, code = executor.execute_python(fence.content, cwd, pythonpath=skills_dir)
+                dur = int((time.time() - t0) * 1000)
+                if clog: clog.tool_result("code_fence", fence_name, output, duration_ms=dur)
                 results.append((fence, output))
                 logger.info(f"Executed {fence.fence_type}: exit_code={code}")
             elif fence.action == 'create':
+                if clog: clog.tool_call("code_fence", fence_name, fence.content)
+                t0 = time.time()
                 # Files created in skills_dir
                 msg = executor.create_file(fence.fence_type, fence.content, skills_dir)
+                dur = int((time.time() - t0) * 1000)
+                if clog: clog.tool_result("code_fence", fence_name, msg, duration_ms=dur)
                 results.append((fence, msg))
                 logger.info(f"Created file: {fence.fence_type}")
 
         # Append assistant message (stripped of hallucinations) + execution results
         stripped_content = strip_content_after_fences(content)
         current_messages.append({"role": "assistant", "content": stripped_content})
-        current_messages.append({"role": "user", "content": _format_results(results)})
+        results_text = _format_results(results)
+        current_messages.append({"role": "user", "content": results_text})
+        if clog: clog.message("user", results_text)
 
+    if clog: clog.end(loop_count)
     logger.warning(f"Reached max loops ({MAX_LOOPS})")
     return response
 
@@ -1519,6 +1540,11 @@ async def _handle_ptc_streaming(
             nonlocal current_messages
             # Inject PTC guidance with tool manifest (after setup so manifest is available)
             current_messages = _inject_ptc_guidance(messages, tool_manifest)
+
+            clog = create_log("ptc_stream", model)
+            if clog:
+                for msg in current_messages:
+                    clog.message(msg.get("role", ""), msg.get("content", ""))
 
             loop_count = 0
             while loop_count < MAX_LOOPS:
@@ -1573,6 +1599,9 @@ async def _handle_ptc_streaming(
 
                             # Execute fence immediately
                             # Use async execution if MCP servers are present
+                            fence_name = f"{fence.fence_type}:{fence.action}"
+                            if clog: clog.tool_call("code_fence", fence_name, fence.content)
+                            t0 = time.time()
                             if fence.action == 'execute':
                                 if fence.fence_type == 'bash':
                                     if mcp_servers:
@@ -1586,6 +1615,8 @@ async def _handle_ptc_streaming(
                                         output, code = executor.execute_python(fence.content, cwd, pythonpath=skills_dir)
                             else:
                                 output = executor.create_file(fence.fence_type, fence.content, skills_dir)
+                            dur = int((time.time() - t0) * 1000)
+                            if clog: clog.tool_result("code_fence", fence_name, output, duration_ms=dur)
 
                             executed_fences.append((fence, output))
                             buffer = remove_fence_from_buffer(buffer, fence)
@@ -1601,6 +1632,9 @@ async def _handle_ptc_streaming(
                                 break
 
                             # Use async execution if MCP servers are present
+                            fence_name = f"{fence.fence_type}:{fence.action}"
+                            if clog: clog.tool_call("code_fence", fence_name, fence.content)
+                            t0 = time.time()
                             if fence.action == 'execute':
                                 if fence.fence_type == 'bash':
                                     if mcp_servers:
@@ -1614,18 +1648,27 @@ async def _handle_ptc_streaming(
                                         output, code = executor.execute_python(fence.content, cwd, pythonpath=skills_dir)
                             else:
                                 output = executor.create_file(fence.fence_type, fence.content, skills_dir)
+                            dur = int((time.time() - t0) * 1000)
+                            if clog: clog.tool_result("code_fence", fence_name, output, duration_ms=dur)
 
                             executed_fences.append((fence, output))
                             buffer = remove_fence_from_buffer(buffer, fence)
 
                 # If no fences were executed, we're done
                 if not executed_fences:
+                    if clog:
+                        clog.message("assistant", buffer)
+                        clog.end(loop_count)
                     return
 
                 # Continue conversation with results (stripped of hallucinations)
                 stripped_buffer = strip_content_after_fences(buffer)
+                if clog: clog.message("assistant", stripped_buffer)
                 current_messages.append({"role": "assistant", "content": stripped_buffer})
-                current_messages.append({"role": "user", "content": _format_results(executed_fences)})
+                results_text = _format_results(executed_fences)
+                current_messages.append({"role": "user", "content": results_text})
+                if clog: clog.message("user", results_text)
+            if clog: clog.end(loop_count)
             # Exit stack closes here, properly cleaning up MCP servers
 
     # Always return async generator - caller handles sync/async bridging
@@ -1711,6 +1754,11 @@ async def _handle_ptc_responses_call(
     # Inject PTC guidance with tool manifest
     current_input = _inject_ptc_guidance_responses(input_data, tool_manifest)
 
+    clog = create_log("ptc_responses", model)
+    if clog:
+        for msg in current_input:
+            clog.message(msg.get("role", ""), msg.get("content", ""))
+
     loop_count = 0
     while loop_count < MAX_LOOPS:
         loop_count += 1
@@ -1748,9 +1796,11 @@ async def _handle_ptc_responses_call(
                 )
 
         content = _extract_responses_content(response, provider)
+        if clog: clog.message("assistant", content)
         fences = parse_code_fences(content)
 
         if not fences:
+            if clog: clog.end(loop_count)
             return response
 
         logger.info(f"[Responses] Found {len(fences)} code fences to execute")
@@ -1759,7 +1809,10 @@ async def _handle_ptc_responses_call(
         # Use async execution if MCP servers are present (keeps loop running for callbacks)
         results = []
         for fence in fences:
+            fence_name = f"{fence.fence_type}:{fence.action}"
             if fence.action == 'execute':
+                if clog: clog.tool_call("code_fence", fence_name, fence.content)
+                t0 = time.time()
                 if fence.fence_type == 'bash':
                     if mcp_servers:
                         output, code = await executor.execute_bash_async(fence.content, cwd)
@@ -1770,9 +1823,15 @@ async def _handle_ptc_responses_call(
                         output, code = await executor.execute_python_async(fence.content, cwd, pythonpath=skills_dir)
                     else:
                         output, code = executor.execute_python(fence.content, cwd, pythonpath=skills_dir)
+                dur = int((time.time() - t0) * 1000)
+                if clog: clog.tool_result("code_fence", fence_name, output, duration_ms=dur)
                 results.append((fence, output))
             elif fence.action == 'create':
+                if clog: clog.tool_call("code_fence", fence_name, fence.content)
+                t0 = time.time()
                 msg = executor.create_file(fence.fence_type, fence.content, skills_dir)
+                dur = int((time.time() - t0) * 1000)
+                if clog: clog.tool_result("code_fence", fence_name, msg, duration_ms=dur)
                 results.append((fence, msg))
 
         # Append to input for next iteration (stripped of hallucinations)
@@ -1780,8 +1839,13 @@ async def _handle_ptc_responses_call(
         stripped_content = strip_content_after_fences(content)
         if stripped_content.strip():
             current_input.append({"role": "assistant", "content": stripped_content})
-        current_input.extend(_format_results_for_responses(results))
+        results_items = _format_results_for_responses(results)
+        current_input.extend(results_items)
+        if clog:
+            for item in results_items:
+                clog.message(item.get("role", ""), item.get("content", ""))
 
+    if clog: clog.end(loop_count)
     logger.warning(f"[Responses] Reached max loops ({MAX_LOOPS})")
     return response
 
@@ -1834,6 +1898,11 @@ async def _handle_ptc_responses_streaming(
             nonlocal current_input
             # Inject PTC guidance with tool manifest (after setup so manifest is available)
             current_input = _inject_ptc_guidance_responses(input_data, tool_manifest)
+
+            clog = create_log("ptc_responses_stream", model)
+            if clog:
+                for msg in current_input:
+                    clog.message(msg.get("role", ""), msg.get("content", ""))
 
             loop_count = 0
             seq_num = 0  # Track sequence numbers for events
@@ -1894,6 +1963,9 @@ async def _handle_ptc_responses_streaming(
 
                                 # Execute fence
                                 # Use async execution if MCP servers are present (keeps loop running for callbacks)
+                                fence_name = f"{fence.fence_type}:{fence.action}"
+                                if clog: clog.tool_call("code_fence", fence_name, fence.content)
+                                t0 = time.time()
                                 if fence.action == 'execute':
                                     if fence.fence_type == 'bash':
                                         if mcp_servers:
@@ -1909,6 +1981,8 @@ async def _handle_ptc_responses_streaming(
                                 else:
                                     output = executor.create_file(fence.fence_type, fence.content, skills_dir)
                                     status = "completed"
+                                dur = int((time.time() - t0) * 1000)
+                                if clog: clog.tool_result("code_fence", fence_name, output, duration_ms=dur)
 
                                 # Emit OpenAI-compatible code interpreter event
                                 seq_num += 1
@@ -1937,6 +2011,9 @@ async def _handle_ptc_responses_streaming(
                                 if not fence:
                                     break
 
+                                fence_name = f"{fence.fence_type}:{fence.action}"
+                                if clog: clog.tool_call("code_fence", fence_name, fence.content)
+                                t0 = time.time()
                                 if fence.action == 'execute':
                                     if fence.fence_type == 'bash':
                                         if mcp_servers:
@@ -1952,6 +2029,8 @@ async def _handle_ptc_responses_streaming(
                                 else:
                                     output = executor.create_file(fence.fence_type, fence.content, skills_dir)
                                     status = "completed"
+                                dur = int((time.time() - t0) * 1000)
+                                if clog: clog.tool_result("code_fence", fence_name, output, duration_ms=dur)
 
                                 # Emit OpenAI-compatible code interpreter event
                                 seq_num += 1
@@ -1968,14 +2047,23 @@ async def _handle_ptc_responses_streaming(
 
                 # If no fences executed, we're done
                 if not executed_fences:
+                    if clog:
+                        clog.message("assistant", buffer)
+                        clog.end(loop_count)
                     return
 
                 # Continue with results (stripped of hallucinations)
                 # Only append assistant message if buffer is non-empty to avoid Anthropic API errors
                 stripped_buffer = strip_content_after_fences(buffer)
+                if clog: clog.message("assistant", stripped_buffer)
                 if stripped_buffer.strip():
                     current_input.append({"role": "assistant", "content": stripped_buffer})
-                current_input.extend(_format_results_for_responses(executed_fences))
+                results_items = _format_results_for_responses(executed_fences)
+                current_input.extend(results_items)
+                if clog:
+                    for item in results_items:
+                        clog.message(item.get("role", ""), item.get("content", ""))
+            if clog: clog.end(loop_count)
             # Exit stack closes here, properly cleaning up MCP servers
 
     if async_mode:

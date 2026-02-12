@@ -1,3 +1,4 @@
+from agentd.conversation_logger import ConversationLog
 from agentd.patch import patch_openai_with_mcp
 from agentd.ptc import patch_openai_with_ptc, display_events, TextDelta, CodeExecution, TurnEnd
 from agentd.tool_decorator import tool
@@ -23,6 +24,7 @@ __all__ = [
     'CodeExecution',
     'TurnEnd',
     'tool',
+    'ConversationLog',
     # API-based executor (blocked by https://github.com/microsandbox/microsandbox/issues/314)
     'MicrosandboxExecutor',
     'create_microsandbox_executor',

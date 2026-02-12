@@ -20,6 +20,9 @@ from agents.mcp.util import MCPUtil
 import litellm.utils as llm_utils
 import litellm
 
+import time as _time
+
+from agentd.conversation_logger import create_log
 from agentd.tool_decorator import SCHEMA_REGISTRY, FUNCTION_REGISTRY
 
 logger = logging.getLogger(__name__)
@@ -204,6 +207,11 @@ def patch_openai_with_mcp(client):
                     return stream_result
                 # If None returned, continue with non-streaming logic below
 
+            clog = create_log("mcp_responses", model)
+            if clog:
+                for msg in input_history:
+                    clog.message(msg.get("role", ""), msg.get("content", str(msg)))
+
             # 1) Initial call: let model emit any function_call messages
             if provider == 'openai':
                 if async_mode:
@@ -240,13 +248,23 @@ def patch_openai_with_mcp(client):
                         **clean_kwargs
                     )
 
+            # Log assistant response
+            if clog:
+                for item in getattr(resp, 'output', []):
+                    if getattr(item, 'type', None) == 'message':
+                        for c in getattr(item, 'content', []):
+                            if getattr(c, 'type', None) == 'output_text':
+                                clog.message("assistant", getattr(c, 'text', ''))
+
             # Extract all function calls
             calls = [o for o in getattr(resp, 'output', []) if getattr(o, 'type', None) == 'function_call']
             if not calls:
+                if clog: clog.end(1)
                 return resp
 
             # If streaming was requested, synthesize tool call events to show what tools are being executed
             if is_streaming:
+                if clog: clog.end(1)
                 # Execute tools first (avoiding event loop conflicts)
                 tasks = [
                     _execute_tool(call.name,
@@ -465,6 +483,11 @@ def patch_openai_with_mcp(client):
                     return create_streaming_with_tool_events()
 
             # Execute all tool calls in parallel
+            if clog:
+                for call in calls:
+                    fn_args = json.loads(call.arguments) if isinstance(call.arguments, str) else call.arguments
+                    clog.tool_call("function_call", call.name, fn_args)
+            t0_tools = _time.time()
             tasks = [
                 _execute_tool(call.name,
                               json.loads(call.arguments) if isinstance(call.arguments, str) else call.arguments,
@@ -472,6 +495,10 @@ def patch_openai_with_mcp(client):
                 for call in calls
             ]
             results = await asyncio.gather(*tasks)
+            dur_tools = int((_time.time() - t0_tools) * 1000)
+            if clog:
+                for call, result in zip(calls, results):
+                    clog.tool_result("function_call", call.name, result, duration_ms=dur_tools)
 
             # Build follow-up input preserving full history
             follow_input = input_history
@@ -525,10 +552,21 @@ def patch_openai_with_mcp(client):
                         api_key=api_key,
                         **follow_kwargs
                     )
+            if clog:
+                for item in getattr(follow, 'output', []):
+                    if getattr(item, 'type', None) == 'message':
+                        for c in getattr(item, 'content', []):
+                            if getattr(c, 'type', None) == 'output_text':
+                                clog.message("assistant", getattr(c, 'text', ''))
+                clog.end(2)
             return follow
 
         # === CHAT COMPLETIONS: multi-call tool loop ===
         current_messages = payload
+        clog = create_log("mcp", model)
+        if clog:
+            for msg in current_messages:
+                clog.message(msg.get("role", ""), msg.get("content", ""))
         loop_count = 0
         while True:
             loop_count += 1
@@ -543,6 +581,13 @@ def patch_openai_with_mcp(client):
             else:
                 resp = await litellm.acompletion(**call_args) if async_mode else litellm.completion(**call_args)
 
+            # Log assistant content
+            if clog:
+                if provider == 'openai':
+                    clog.message("assistant", resp.choices[0].message.content or "")
+                else:
+                    clog.message("assistant", resp['choices'][0]['message']['content'] or "")
+
             tool_calls = (
                 getattr(resp.choices[0].message, 'tool_calls', []) if provider == 'openai'
                 else getattr(resp['choices'][0]['message'], 'tool_calls', [])
@@ -550,6 +595,7 @@ def patch_openai_with_mcp(client):
             if not tool_calls or loop_count >= MAX_TOOL_LOOPS:
                 if loop_count >= MAX_TOOL_LOOPS:
                     logger.warning(f"Reached max tool loops ({MAX_TOOL_LOOPS})")
+                if clog: clog.end(loop_count)
                 return resp
 
             tasks = []
@@ -561,10 +607,18 @@ def patch_openai_with_mcp(client):
                     name, raw = call['function']['name'], call['function']['arguments']
                 parsed = json.loads(raw) if isinstance(raw, str) else raw
                 if name in explicit_names and name not in server_lookup and name not in SCHEMA_REGISTRY:
+                    if clog: clog.end(loop_count)
                     return resp
+                if clog: clog.tool_call("function_call", name, parsed)
                 tasks.append(_process_tool_call(call, name, parsed, server_lookup, provider, False))
 
+            t0_tools = _time.time()
             parts = await asyncio.gather(*tasks)
+            dur_tools = int((_time.time() - t0_tools) * 1000)
+            if clog:
+                for part in parts:
+                    if len(part) >= 2 and isinstance(part[1], dict) and part[1].get('role') == 'tool':
+                        clog.tool_result("function_call", part[1].get('name', ''), part[1].get('content', ''), duration_ms=dur_tools)
             for part in parts:
                 current_messages.extend(part)
             clean_kwargs.pop('tools', None)
@@ -579,6 +633,11 @@ def patch_openai_with_mcp(client):
         """Handle streaming responses with automatic tool call execution."""
         
         async def stream_with_tool_handling():
+            clog = create_log("mcp_responses_stream", model)
+            if clog:
+                for msg in input_history:
+                    clog.message(msg.get("role", ""), msg.get("content", str(msg)))
+
             # 1) Initial streaming call
             if provider == 'openai':
                 if async_mode:
@@ -635,6 +694,14 @@ def patch_openai_with_mcp(client):
                             ]
                             
                             if tool_calls:
+                                # Log assistant text from response
+                                if clog:
+                                    for item in response_obj.output:
+                                        if getattr(item, 'type', None) == 'message':
+                                            for c in getattr(item, 'content', []):
+                                                if getattr(c, 'type', None) == 'output_text':
+                                                    clog.message("assistant", getattr(c, 'text', ''))
+
                                 # Execute all function calls in parallel
                                 tasks = []
                                 for call in tool_calls:
@@ -642,10 +709,16 @@ def patch_openai_with_mcp(client):
                                     fn_args = getattr(call, 'arguments', '{}')
                                     if isinstance(fn_args, str):
                                         fn_args = json.loads(fn_args)
+                                    if clog: clog.tool_call("function_call", fn_name, fn_args)
                                     tasks.append(_execute_tool(fn_name, fn_args, server_lookup))
-                                
+
+                                t0_tools = _time.time()
                                 results = await asyncio.gather(*tasks)
-                                
+                                dur_tools = int((_time.time() - t0_tools) * 1000)
+                                if clog:
+                                    for call, result in zip(tool_calls, results):
+                                        clog.tool_result("function_call", getattr(call, 'name', ''), result, duration_ms=dur_tools)
+
                                 # Check if we should emit tool call streaming events
                                 should_stream_tools = include and isinstance(include, list) and "tool_call.results" in include
                                 print(f"[ASYNC] Should stream tool results: {should_stream_tools}")
@@ -761,11 +834,14 @@ def patch_openai_with_mcp(client):
                                 # Stream the follow-up response
                                 async for follow_event in follow_stream:
                                     yield follow_event
+                                if clog: clog.end(2)
                             else:
                                 # No function calls, just yield the final event
+                                if clog: clog.end(1)
                                 yield event
                         else:
                             # No function calls, just yield the final event
+                            if clog: clog.end(1)
                             yield event
                     else:
                         # Pass through all other events
@@ -788,6 +864,14 @@ def patch_openai_with_mcp(client):
                             ]
                             
                             if tool_calls:
+                                # Log assistant text from response
+                                if clog:
+                                    for item in response_obj.output:
+                                        if getattr(item, 'type', None) == 'message':
+                                            for c in getattr(item, 'content', []):
+                                                if getattr(c, 'type', None) == 'output_text':
+                                                    clog.message("assistant", getattr(c, 'text', ''))
+
                                 # Execute all function calls in parallel
                                 tasks = []
                                 for call in tool_calls:
@@ -795,10 +879,16 @@ def patch_openai_with_mcp(client):
                                     fn_args = getattr(call, 'arguments', '{}')
                                     if isinstance(fn_args, str):
                                         fn_args = json.loads(fn_args)
+                                    if clog: clog.tool_call("function_call", fn_name, fn_args)
                                     tasks.append(_execute_tool(fn_name, fn_args, server_lookup))
-                                
+
+                                t0_tools = _time.time()
                                 results = await asyncio.gather(*tasks)
-                                
+                                dur_tools = int((_time.time() - t0_tools) * 1000)
+                                if clog:
+                                    for call, result in zip(tool_calls, results):
+                                        clog.tool_result("function_call", getattr(call, 'name', ''), result, duration_ms=dur_tools)
+
                                 # Check if we should emit tool call streaming events
                                 should_stream_tools = include and isinstance(include, list) and "tool_call.results" in include
                                 print(f"[SYNC] Should stream tool results: {should_stream_tools}")
@@ -905,16 +995,19 @@ def patch_openai_with_mcp(client):
                                 # Stream the follow-up response
                                 for follow_event in follow_stream:
                                     yield follow_event
+                                if clog: clog.end(2)
                             else:
                                 # No function calls, just yield the final event
+                                if clog: clog.end(1)
                                 yield event
                         else:
                             # No function calls, just yield the final event
+                            if clog: clog.end(1)
                             yield event
                     else:
                         # Pass through all other events
                         yield event
-        
+
         if async_mode:
             return stream_with_tool_handling()
         else:
