@@ -236,8 +236,8 @@ class TurnEnd:
 class _StreamBuffer:
     """Internal buffer for processing stream into display events."""
 
-    FENCE_START = re.compile(r'```\w+(?:\.\w+)?:\w+\n')
-    FENCE_FULL = re.compile(r'```\w+(?:\.\w+)?:\w+\n.*?```', re.DOTALL)
+    FENCE_START = re.compile(r'```[\w./_-]+:\w+\n')
+    FENCE_FULL = re.compile(r'```[\w./_-]+:\w+\n.*?```', re.DOTALL)
 
     def __init__(self):
         self.buffer = ""
@@ -429,7 +429,7 @@ def parse_code_fences(content: str) -> list[CodeFence]:
     fences = []
 
     # Pattern 1: ```type:action\ncontent```
-    fence_pattern = r'```(\w+(?:\.\w+)?):(\w+)\n(.*?)```'
+    fence_pattern = r'```([\w./_-]+):(\w+)\n(.*?)```'
     fence_matches = re.findall(fence_pattern, content, re.DOTALL)
 
     for fence_type, action, fence_content in fence_matches:
@@ -452,7 +452,7 @@ def extract_complete_fence(buffer: str) -> CodeFence | None:
     Returns None if no complete fence found.
     """
     # Try code fence format first
-    fence_pattern = r'```(\w+(?:\.\w+)?):(\w+)\n(.*?)```'
+    fence_pattern = r'```([\w./_-]+):(\w+)\n(.*?)```'
     match = re.search(fence_pattern, buffer, re.DOTALL)
     if match:
         return CodeFence(

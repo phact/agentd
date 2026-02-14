@@ -19,7 +19,7 @@ def tool(func: Callable) -> Callable:
     type_hints = get_type_hints(func)
     doc = func.__doc__ or ""
     first_line, *rest = doc.strip().split("\n", 1)
-    description = first_line.strip()
+    description = doc.strip()
 
     properties = {}
     required_fields = []
