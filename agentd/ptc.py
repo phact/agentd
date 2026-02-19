@@ -48,28 +48,12 @@ To run bash:
 <command>
 ```
 
-To run Python with skills/tools available:
-```bash:execute
-skills exec << 'PYEOF'
-from lib.tools import some_function
-result = some_function(arg="value")
-print(result)
-PYEOF
-```
-
-Or inline Python (imports work the same way):
+To run Python:
 ```python:execute
 from lib.tools import some_function
 result = some_function(arg="value")
 print(result)
 ```
-
-Skills CLI commands (use from bash:execute):
-- `skills list` - list available skills
-- `skills frontmatter <skill>` - read skill metadata
-- `skills read <skill>` - read full skill docs
-- `skills run <skill> <script>` - run a skill script
-- `skills exec` - run stdin Python with auto-imports
 
 To create a file:
 ```filename.ext:create
@@ -84,6 +68,12 @@ When writing multiple code fences:
 For conditional actions, use logic within a single fence:
 - Bash: `grep -q "MARKER" file.txt && rm file.txt`
 - Python: `if "MARKER" in open("file.txt").read(): os.remove("file.txt")`
+
+Skills CLI (use from bash:execute):
+- `skills list` - list available skills
+- `skills frontmatter <skill>` - read skill metadata
+- `skills read <skill>` - read full skill docs
+- `skills run <skill> <script>` - run a skill script
 """
 
 
