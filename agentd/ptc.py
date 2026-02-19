@@ -443,10 +443,12 @@ class _StreamBuffer:
             return unprinted
         return None
 
-    def reset(self):
-        """Reset for new turn."""
+    def reset(self) -> str | None:
+        """Flush remaining content and reset for new turn."""
+        remaining = self.flush()
         self.buffer = ""
         self.pos = 0
+        return remaining
 
 
 def display_events(stream) -> Generator[TextDelta | CodeExecution | TurnEnd, None, None]:
@@ -493,7 +495,9 @@ def display_events(stream) -> Generator[TextDelta | CodeExecution | TurnEnd, Non
                 )
 
         elif event_type == 'response.created':
-            buf.reset()
+            remaining = buf.reset()
+            if remaining:
+                yield TextDelta(text=remaining)
 
         elif event_type == 'response.completed':
             remaining = buf.flush()
