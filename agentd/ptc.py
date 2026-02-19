@@ -48,12 +48,28 @@ To run bash:
 <command>
 ```
 
-To run Python:
+To run Python with skills/tools available:
+```bash:execute
+skills exec << 'PYEOF'
+from lib.tools import some_function
+result = some_function(arg="value")
+print(result)
+PYEOF
+```
+
+Or inline Python (imports work the same way):
 ```python:execute
 from lib.tools import some_function
 result = some_function(arg="value")
 print(result)
 ```
+
+Skills CLI commands (use from bash:execute):
+- `skills list` - list available skills
+- `skills frontmatter <skill>` - read skill metadata
+- `skills read <skill>` - read full skill docs
+- `skills run <skill> <script>` - run a skill script
+- `skills exec` - run stdin Python with auto-imports
 
 To create a file:
 ```filename.ext:create
@@ -69,6 +85,142 @@ For conditional actions, use logic within a single fence:
 - Bash: `grep -q "MARKER" file.txt && rm file.txt`
 - Python: `if "MARKER" in open("file.txt").read(): os.remove("file.txt")`
 """
+
+
+_SKILLS_CLI_PY = '''\
+#!/usr/bin/env python3
+# /// script
+# requires-python = ">=3.10"
+# ///
+"""Skills CLI - Run skill scripts with auto-configured imports.
+
+Usage:
+  skills list
+  skills frontmatter <skill>
+  skills read <skill>
+  skills run <skill> <script> [args...]
+  skills exec          # reads Python from stdin
+"""
+import os
+import subprocess
+import sys
+import tempfile
+from pathlib import Path
+
+SKILLS_DIR = Path(__file__).parent
+
+
+def _pythonpath() -> str:
+    """Build PYTHONPATH with skills root and all skill script dirs."""
+    paths = [str(SKILLS_DIR)]
+    for entry in sorted(SKILLS_DIR.iterdir()):
+        if entry.is_dir() and not entry.name.startswith("."):
+            scripts = entry / "scripts"
+            if scripts.is_dir():
+                paths.append(str(scripts))
+    existing = os.environ.get("PYTHONPATH", "")
+    return ":".join(paths) + (f":{existing}" if existing else "")
+
+
+def cmd_list(_args):
+    for entry in sorted(SKILLS_DIR.iterdir()):
+        if entry.is_dir() and not entry.name.startswith(".") and (entry / "SKILL.md").exists():
+            print(entry.name)
+
+
+def cmd_frontmatter(args):
+    if not args:
+        sys.exit("Usage: skills frontmatter <skill-name>")
+    skill_md = SKILLS_DIR / args[0] / "SKILL.md"
+    if not skill_md.exists():
+        sys.exit(f"Not found: {skill_md}")
+    text = skill_md.read_text()
+    if text.startswith("---"):
+        end = text.find("---", 3)
+        if end != -1:
+            print(text[: end + 3])
+            return
+    sys.exit("No frontmatter found")
+
+
+def cmd_read(args):
+    if not args:
+        sys.exit("Usage: skills read <skill-name>")
+    skill_md = SKILLS_DIR / args[0] / "SKILL.md"
+    if not skill_md.exists():
+        sys.exit(f"Not found: {skill_md}")
+    print(skill_md.read_text())
+
+
+def cmd_run(args):
+    if len(args) < 2:
+        sys.exit("Usage: skills run <skill-name> <script> [args...]")
+    script = SKILLS_DIR / args[0] / "scripts" / args[1]
+    if not script.exists():
+        script = SKILLS_DIR / args[0] / args[1]
+    if not script.exists():
+        sys.exit(f"Script not found: {SKILLS_DIR / args[0] / 'scripts' / args[1]}")
+    env = {**os.environ, "PYTHONPATH": _pythonpath()}
+    result = subprocess.run([sys.executable, str(script)] + list(args[2:]), env=env)
+    sys.exit(result.returncode)
+
+
+def cmd_exec(_args):
+    """Execute Python from stdin with auto-configured imports."""
+    code = sys.stdin.read()
+    with tempfile.NamedTemporaryFile(mode="w", suffix=".py", delete=False) as f:
+        f.write(code)
+        tmp = f.name
+    try:
+        env = {**os.environ, "PYTHONPATH": _pythonpath()}
+        result = subprocess.run([sys.executable, tmp], env=env)
+        sys.exit(result.returncode)
+    finally:
+        Path(tmp).unlink(missing_ok=True)
+
+
+COMMANDS = {
+    "list": cmd_list,
+    "frontmatter": cmd_frontmatter,
+    "read": cmd_read,
+    "run": cmd_run,
+    "exec": cmd_exec,
+}
+
+
+def main():
+    if len(sys.argv) < 2 or sys.argv[1] not in COMMANDS:
+        print(f"Usage: skills <{'|'.join(COMMANDS)}> [args...]")
+        sys.exit(1)
+    COMMANDS[sys.argv[1]](sys.argv[2:])
+
+
+if __name__ == "__main__":
+    main()
+'''
+
+_SKILLS_EXEC = '''\
+#!/bin/sh
+exec python3 "$(dirname "$0")/cli.py" "$@"
+'''
+
+_SKILLS_PYPROJECT_TOML = '''\
+[project]
+name = "skills"
+version = "0.1.0"
+requires-python = ">=3.10"
+dependencies = []
+
+[project.scripts]
+skills = "cli:main"
+
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[tool.hatch.build]
+include = ["cli.py"]
+'''
 
 
 def _parse_skill_frontmatter(skill_md_path: Path) -> dict | None:
@@ -577,6 +729,7 @@ class SubprocessExecutor:
             'MCP_BRIDGE_URL': os.environ.get('MCP_BRIDGE_URL', 'http://localhost:8765'),
             'PS1': '',  # Empty prompt
             'PS2': '',
+            'PATH': f"{cwd / 'skills'}:{os.environ.get('PATH', '')}",
         }
         self._shell = subprocess.Popen(
             ['bash', '--norc', '--noprofile'],
@@ -756,11 +909,17 @@ class SubprocessExecutor:
     async def execute_bash_async(self, command: str, cwd: Path) -> tuple[str, int]:
         """Run bash command asynchronously (keeps event loop running for MCP calls)."""
         try:
+            env = {
+                **os.environ,
+                'MCP_BRIDGE_URL': os.environ.get('MCP_BRIDGE_URL', 'http://localhost:8765'),
+                'PATH': f"{cwd / 'skills'}:{os.environ.get('PATH', '')}",
+            }
             proc = await asyncio.create_subprocess_shell(
                 command,
                 cwd=cwd,
                 stdout=asyncio.subprocess.PIPE,
-                stderr=asyncio.subprocess.PIPE
+                stderr=asyncio.subprocess.PIPE,
+                env=env,
             )
 
             try:
@@ -1095,6 +1254,24 @@ from .tools import *
     tools_path.write_text(tools_py)
 
 
+def _setup_skills_cli(skills_dir: Path):
+    """Write cli.py, skills executable, and pyproject.toml to the skills directory."""
+    import stat
+
+    cli_path = skills_dir / 'cli.py'
+    if not cli_path.exists() or cli_path.read_text() != _SKILLS_CLI_PY:
+        cli_path.write_text(_SKILLS_CLI_PY)
+
+    exec_path = skills_dir / 'skills'
+    if not exec_path.exists() or exec_path.read_text() != _SKILLS_EXEC:
+        exec_path.write_text(_SKILLS_EXEC)
+        exec_path.chmod(exec_path.stat().st_mode | stat.S_IXUSR | stat.S_IXGRP | stat.S_IXOTH)
+
+    toml_path = skills_dir / 'pyproject.toml'
+    if not toml_path.exists() or toml_path.read_text() != _SKILLS_PYPROJECT_TOML:
+        toml_path.write_text(_SKILLS_PYPROJECT_TOML)
+
+
 async def setup_skills_directory(
     skills_dir: Path,
     mcp_servers: list | None,
@@ -1232,6 +1409,9 @@ async def setup_skills_directory(
     # 5) Always create local/scripts/ as a workspace for agent-created scripts
     local_scripts = skills_dir / 'local' / 'scripts'
     local_scripts.mkdir(parents=True, exist_ok=True)
+
+    # 5b) Write CLI helper (cli.py + pyproject.toml)
+    _setup_skills_cli(skills_dir)
 
     # 6) Generate tool manifest for system prompt injection
     tool_manifest = generate_tool_manifest(all_tools, skills_dir)

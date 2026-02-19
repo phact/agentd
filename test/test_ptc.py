@@ -435,6 +435,75 @@ Always use this format to run commands."""
         print("✓ test_ptc_simple passed")
 
 
+def test_skills_cli_created():
+    """Test that skills/skills and skills/cli.py are created by setup_skills_directory."""
+    import asyncio
+    from agentd.ptc import setup_skills_directory
+
+    with tempfile.TemporaryDirectory() as tmpdir:
+        skills_dir = Path(tmpdir) / "skills"
+
+        async def run():
+            return await setup_skills_directory(skills_dir, mcp_servers=None, server_cache={})
+
+        asyncio.run(run())
+
+        assert (skills_dir / "cli.py").exists(), "skills/cli.py should be created"
+        assert (skills_dir / "skills").exists(), "skills/skills executable should be created"
+        assert (skills_dir / "pyproject.toml").exists(), "skills/pyproject.toml should be created"
+
+        import stat
+        mode = (skills_dir / "skills").stat().st_mode
+        assert mode & stat.S_IXUSR, "skills/skills should be executable"
+
+        print("✓ test_skills_cli_created passed")
+
+
+def test_skills_cli_e2e():
+    """Test that an agent can use `skills list`, `skills frontmatter`, and `skills exec`."""
+    with tempfile.TemporaryDirectory() as tmpdir:
+        client = patch_openai_with_ptc(OpenAI(), cwd=tmpdir)
+
+        response = client.chat.completions.create(
+            model="anthropic/claude-haiku-4-5",
+            messages=[
+                {
+                    "role": "system",
+                    "content": """You have a `skills` CLI available on PATH. Use it in bash fences.
+
+Commands:
+- `skills list` - list available skills
+- `skills frontmatter <name>` - read a skill's YAML metadata
+- `skills exec` - run Python from stdin with auto-configured imports
+
+Example:
+```bash:execute
+skills exec << 'PYEOF'
+from lib.tools import greet
+print(greet(name="world"))
+PYEOF
+```"""
+                },
+                {
+                    "role": "user",
+                    "content": "List available skills, then use `skills exec` to call greet(name='Alice') and add_numbers(a=3, b=4). Show me the results."
+                }
+            ],
+        )
+
+        content = response.choices[0].message.content
+        assert content, "Response should have content"
+
+        # The agent should have called greet and add_numbers
+        assert "Alice" in content or "Hello" in content, \
+            f"Response should show greet result, got:\n{content}"
+        assert "7" in content, \
+            f"Response should show 3+4=7 from add_numbers, got:\n{content}"
+
+        print(f"\nResponse:\n{content}")
+        print("✓ test_skills_cli_e2e passed")
+
+
 # =============================================================================
 # Run Tests
 # =============================================================================
@@ -455,10 +524,13 @@ if __name__ == "__main__":
 
     print("\n--- Integration Tests ---\n")
 
+    test_skills_cli_created()
+
     # Integration tests (require API key)
     if os.environ.get('OPENAI_API_KEY'):
         test_ptc_simple()
         test_ptc_with_filesystem()
+        test_skills_cli_e2e()
     else:
         print("Skipping integration tests (OPENAI_API_KEY not set)")
 
