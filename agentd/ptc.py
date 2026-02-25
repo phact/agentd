@@ -36,6 +36,7 @@ from agentd.tool_decorator import SCHEMA_REGISTRY, FUNCTION_REGISTRY
 logger = logging.getLogger(__name__)
 
 MAX_LOOPS = 20
+MAX_OUTPUT_TOKENS = 20_000  # outputs larger than this are truncated
 
 # =============================================================================
 # PTC Guidance (auto-injected into system prompt)
@@ -1514,12 +1515,25 @@ def _extract_content(response, provider: str) -> str:
         return response['choices'][0]['message']['content'] or ""
 
 
+def _truncate_output(output: str, max_tokens: int = MAX_OUTPUT_TOKENS) -> str:
+    """Truncate output if it exceeds max_tokens (estimated at 4 chars/token)."""
+    max_chars = max_tokens * 4
+    if len(output) <= max_chars:
+        return output
+    actual_tokens = len(output) // 4
+    return (
+        f"[OUTPUT TRUNCATED: ~{actual_tokens:,} estimated tokens exceeded the {max_tokens:,} token limit. "
+        "Redirect large output to a file instead (e.g. command > output.txt).]"
+    )
+
+
 def _format_results(results: list[tuple[CodeFence, str]]) -> str:
     """Format execution results for injection back into conversation."""
     formatted = []
     for fence, output in results:
         if fence.action == 'execute':
-            formatted.append(f"```\n$ {fence.content if fence.fence_type == 'bash' else f'python {fence.fence_type}'}\n{output}\n```")
+            safe_output = _truncate_output(output)
+            formatted.append(f"```\n$ {fence.content if fence.fence_type == 'bash' else f'python {fence.fence_type}'}\n{safe_output}\n```")
         else:
             formatted.append(f"Created file: {fence.fence_type}")
     return "Execution results:\n" + "\n\n".join(formatted)
@@ -1878,7 +1892,8 @@ def _format_results_for_responses(results: list[tuple[CodeFence, str]]) -> list[
     formatted = []
     for fence, output in results:
         if fence.action == 'execute':
-            text = f"```\n$ {fence.content if fence.fence_type == 'bash' else f'python {fence.fence_type}'}\n{output}\n```"
+            safe_output = _truncate_output(output)
+            text = f"```\n$ {fence.content if fence.fence_type == 'bash' else f'python {fence.fence_type}'}\n{safe_output}\n```"
         else:
             text = f"Created file: {fence.fence_type}"
         formatted.append(text)
