@@ -1848,9 +1848,11 @@ async def _handle_ptc_streaming(
                     return
 
                 # Continue conversation with results (stripped of hallucinations)
+                # Only append assistant message if non-empty to avoid Anthropic API errors
                 stripped_buffer = strip_content_after_fences(buffer)
                 if clog: clog.message("assistant", stripped_buffer)
-                current_messages.append({"role": "assistant", "content": stripped_buffer})
+                if stripped_buffer.strip():
+                    current_messages.append({"role": "assistant", "content": stripped_buffer})
                 results_text = _format_results(executed_fences)
                 current_messages.append({"role": "user", "content": results_text})
                 if clog: clog.message("user", results_text)
