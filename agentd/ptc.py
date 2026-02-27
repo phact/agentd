@@ -249,17 +249,27 @@ def generate_tool_manifest(all_tools: dict[str, dict], skills_dir: Path = None) 
             name = meta.get('name', entry.name) if meta else entry.name
             desc = meta.get('description', '') if meta else ''
             location = str(skill_md.resolve())
-            skill_entries.append((name, desc, location))
+            # Discover scripts in scripts/ directory
+            scripts_dir = entry / 'scripts'
+            scripts = []
+            if scripts_dir.is_dir():
+                scripts = sorted(
+                    f.name for f in scripts_dir.iterdir()
+                    if f.is_file() and f.suffix in ('.py', '.sh') and not f.name.startswith('_')
+                )
+            skill_entries.append((name, desc, location, scripts))
 
         if skill_entries:
             from html import escape
             lines.append("")
             lines.append("<available_skills>")
-            for name, desc, location in skill_entries:
+            for name, desc, location, scripts in skill_entries:
                 lines.append(f"  <skill>")
                 lines.append(f"    <name>{escape(name)}</name>")
                 lines.append(f"    <description>{escape(desc)}</description>")
                 lines.append(f"    <location>{escape(location)}</location>")
+                if scripts:
+                    lines.append(f"    <scripts>{', '.join(escape(s) for s in scripts)}</scripts>")
                 lines.append(f"  </skill>")
             lines.append("</available_skills>")
 
