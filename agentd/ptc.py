@@ -1413,6 +1413,12 @@ async def setup_skills_directory(
 
     # 5c) Set skills dir in env so executors can find the CLI
     os.environ['PTC_SKILLS_DIR'] = str(skills_dir)
+    # Also prepend to PATH so all executors (including SandboxRuntimeExecutor
+    # which inherits os.environ without custom env) can find the `skills` CLI
+    skills_dir_str = str(skills_dir)
+    current_path = os.environ.get('PATH', '')
+    if skills_dir_str not in current_path.split(os.pathsep):
+        os.environ['PATH'] = f"{skills_dir_str}{os.pathsep}{current_path}"
 
     # 6) Generate tool manifest for system prompt injection
     tool_manifest = generate_tool_manifest(all_tools, skills_dir)
