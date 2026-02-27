@@ -719,12 +719,13 @@ class SubprocessExecutor:
                 self._shell.kill()
 
         # Start new shell with minimal prompt to reduce noise
+        skills_dir = os.environ.get('PTC_SKILLS_DIR', str(cwd / 'skills'))
         env = {
             **os.environ,
             'MCP_BRIDGE_URL': os.environ.get('MCP_BRIDGE_URL', 'http://localhost:8765'),
             'PS1': '',  # Empty prompt
             'PS2': '',
-            'PATH': f"{cwd / 'skills'}:{os.environ.get('PATH', '')}",
+            'PATH': f"{skills_dir}:{os.environ.get('PATH', '')}",
         }
         self._shell = subprocess.Popen(
             ['bash', '--norc', '--noprofile'],
@@ -904,10 +905,11 @@ class SubprocessExecutor:
     async def execute_bash_async(self, command: str, cwd: Path) -> tuple[str, int]:
         """Run bash command asynchronously (keeps event loop running for MCP calls)."""
         try:
+            skills_dir = os.environ.get('PTC_SKILLS_DIR', str(cwd / 'skills'))
             env = {
                 **os.environ,
                 'MCP_BRIDGE_URL': os.environ.get('MCP_BRIDGE_URL', 'http://localhost:8765'),
-                'PATH': f"{cwd / 'skills'}:{os.environ.get('PATH', '')}",
+                'PATH': f"{skills_dir}:{os.environ.get('PATH', '')}",
             }
             proc = await asyncio.create_subprocess_shell(
                 command,
@@ -1260,7 +1262,8 @@ def _setup_skills_cli(skills_dir: Path):
     exec_path = skills_dir / 'skills'
     if not exec_path.exists() or exec_path.read_text() != _SKILLS_EXEC:
         exec_path.write_text(_SKILLS_EXEC)
-        exec_path.chmod(exec_path.stat().st_mode | stat.S_IXUSR | stat.S_IXGRP | stat.S_IXOTH)
+    # Always ensure execute permission (may be lost via file sync, copy, etc.)
+    exec_path.chmod(exec_path.stat().st_mode | stat.S_IXUSR | stat.S_IXGRP | stat.S_IXOTH)
 
     toml_path = skills_dir / 'pyproject.toml'
     if not toml_path.exists() or toml_path.read_text() != _SKILLS_PYPROJECT_TOML:
@@ -1407,6 +1410,9 @@ async def setup_skills_directory(
 
     # 5b) Write CLI helper (cli.py + pyproject.toml)
     _setup_skills_cli(skills_dir)
+
+    # 5c) Set skills dir in env so executors can find the CLI
+    os.environ['PTC_SKILLS_DIR'] = str(skills_dir)
 
     # 6) Generate tool manifest for system prompt injection
     tool_manifest = generate_tool_manifest(all_tools, skills_dir)
