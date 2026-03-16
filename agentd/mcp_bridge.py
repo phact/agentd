@@ -48,6 +48,7 @@ class MCPBridge:
         self._site: web.TCPSite | web.UnixSite | None = None
         self._thread: threading.Thread | None = None
         self._loop: asyncio.AbstractEventLoop | None = None  # Bridge's own loop
+        self._stop_event: asyncio.Event | None = None  # Signals run_server to exit cleanly
         self._main_loop: asyncio.AbstractEventLoop | None = main_loop  # MCP connection loop
         self._started = threading.Event()
 
@@ -121,11 +122,11 @@ class MCPBridge:
             asyncio.set_event_loop(self._loop)
 
             async def setup_and_run():
+                self._stop_event = asyncio.Event()
                 await self.start()
                 self._started.set()
-                # Keep running until stopped
-                while True:
-                    await asyncio.sleep(1)
+                # Keep running until stop_thread() sets the event
+                await self._stop_event.wait()
 
             self._loop.run_until_complete(setup_and_run())
 
@@ -152,8 +153,8 @@ class MCPBridge:
 
     def stop_thread(self):
         """Stop the bridge server running in background thread."""
-        if self._loop:
-            self._loop.call_soon_threadsafe(self._loop.stop)
+        if self._loop and self._stop_event:
+            self._loop.call_soon_threadsafe(self._stop_event.set)
 
     def register_server(self, tool_name: str, server):
         """Register an MCP server for a tool."""
