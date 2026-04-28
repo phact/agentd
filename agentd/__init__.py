@@ -1,6 +1,6 @@
 from agentd.conversation_logger import ConversationLog
 from agentd.patch import patch_openai_with_mcp
-from agentd.ptc import patch_openai_with_ptc, display_events, TextDelta, CodeExecution, TurnEnd
+from agentd.ptc import patch_openai_with_ptc, display_events, display_events_async, TextDelta, CodeExecution, TurnEnd
 from agentd.tool_decorator import tool
 from agentd.microsandbox_executor import (
     MicrosandboxExecutor,
@@ -20,6 +20,7 @@ __all__ = [
     'patch_openai_with_mcp',
     'patch_openai_with_ptc',
     'display_events',
+    'display_events_async',
     'TextDelta',
     'CodeExecution',
     'TurnEnd',
