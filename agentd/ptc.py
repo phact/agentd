@@ -1905,16 +1905,16 @@ async def _handle_ptc_streaming(
                             if clog: clog.tool_call("code_fence", fence_name, fence.content)
                             t0 = time.time()
                             if fence.action == 'execute':
+                                # Always use async executor in async mode so
+                                # tool execution doesn't park the event loop.
+                                # The mcp_servers gate that previously chose
+                                # sync was a footgun — long fences (ffmpeg,
+                                # network calls, etc.) blocked all other
+                                # asyncio work.
                                 if fence.fence_type == 'bash':
-                                    if mcp_servers:
-                                        output, code = await executor.execute_bash_async(fence.content, cwd)
-                                    else:
-                                        output, code = executor.execute_bash(fence.content, cwd)
+                                    output, code = await executor.execute_bash_async(fence.content, cwd)
                                 else:
-                                    if mcp_servers:
-                                        output, code = await executor.execute_python_async(fence.content, cwd, pythonpath=skills_dir)
-                                    else:
-                                        output, code = executor.execute_python(fence.content, cwd, pythonpath=skills_dir)
+                                    output, code = await executor.execute_python_async(fence.content, cwd, pythonpath=skills_dir)
                                 status = "completed" if code == 0 else "failed"
                             else:
                                 output = executor.create_file(fence.fence_type, fence.content, skills_dir)
