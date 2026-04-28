@@ -495,6 +495,69 @@ class _StreamBuffer:
         return remaining
 
 
+def _process_stream_event(event, buf: '_StreamBuffer') -> list:
+    """Translate one raw stream event into a list of display events.
+
+    Shared body for both the sync (display_events) and async
+    (display_events_async) consumers.
+    """
+    out: list = []
+    event_type = getattr(event, 'type', None)
+
+    if event_type == 'response.output_text.delta':
+        delta = getattr(event, 'delta', '')
+        safe_text = buf.add(delta)
+        if safe_text:
+            out.append(TextDelta(text=safe_text))
+
+    elif event_type == 'response.output_item.done':
+        item = getattr(event, 'item', None)
+        if item and getattr(item, 'type', None) == 'code_interpreter_call':
+            buf.skip_fence()
+            output = ""
+            if item.outputs:
+                for o in item.outputs:
+                    if hasattr(o, 'logs') and o.logs:
+                        output += o.logs
+            out.append(CodeExecution(
+                code=item.code,  # includes fence_type\n prefix
+                output=output,
+                status=item.status,
+            ))
+
+    elif event_type == 'response.created':
+        remaining = buf.reset()
+        if remaining:
+            out.append(TextDelta(text=remaining))
+
+    elif event_type == 'response.completed':
+        remaining = buf.flush()
+        if remaining:
+            out.append(TextDelta(text=remaining))
+        out.append(TurnEnd())
+
+    elif hasattr(event, 'choices') and event.choices:
+        # Chat-completion chunk (from _handle_ptc_streaming). The
+        # responses-API translation in litellm has a known bug that drops
+        # the leading content of the first text delta, so consumers can
+        # opt into the chat-completion API and we adapt its chunk shape
+        # here. End-of-stream is signaled by finish_reason being set.
+        choice = event.choices[0]
+        delta = getattr(choice, 'delta', None)
+        content = getattr(delta, 'content', None) if delta else None
+        if content:
+            safe_text = buf.add(content)
+            if safe_text:
+                out.append(TextDelta(text=safe_text))
+        if getattr(choice, 'finish_reason', None):
+            remaining = buf.flush()
+            if remaining:
+                out.append(TextDelta(text=remaining))
+            out.append(TurnEnd())
+
+    return out
+
+
 def display_events(stream) -> Generator[TextDelta | CodeExecution | TurnEnd, None, None]:
     """
     Wrap a PTC stream to yield clean display events.
@@ -513,60 +576,27 @@ def display_events(stream) -> Generator[TextDelta | CodeExecution | TurnEnd, Non
                 print()
     """
     buf = _StreamBuffer()
-
     for event in stream:
-        event_type = getattr(event, 'type', None)
+        for out in _process_stream_event(event, buf):
+            yield out
 
-        if event_type == 'response.output_text.delta':
-            delta = getattr(event, 'delta', '')
-            safe_text = buf.add(delta)
-            if safe_text:
-                yield TextDelta(text=safe_text)
 
-        elif event_type == 'response.output_item.done':
-            item = getattr(event, 'item', None)
-            if item and getattr(item, 'type', None) == 'code_interpreter_call':
-                buf.skip_fence()
-                output = ""
-                if item.outputs:
-                    for out in item.outputs:
-                        if hasattr(out, 'logs') and out.logs:
-                            output += out.logs
-                yield CodeExecution(
-                    code=item.code,  # includes fence_type\n prefix
-                    output=output,
-                    status=item.status
-                )
+async def display_events_async(stream):
+    """
+    Async counterpart to ``display_events``. Use with AsyncOpenAI so tool
+    execution (which can take seconds-to-minutes) doesn't park the asyncio
+    event loop.
 
-        elif event_type == 'response.created':
-            remaining = buf.reset()
-            if remaining:
-                yield TextDelta(text=remaining)
-
-        elif event_type == 'response.completed':
-            remaining = buf.flush()
-            if remaining:
-                yield TextDelta(text=remaining)
-            yield TurnEnd()
-
-        elif hasattr(event, 'choices') and event.choices:
-            # Chat-completion chunk (from _handle_ptc_streaming). The
-            # responses-API translation in litellm has a known bug that drops
-            # the leading content of the first text delta, so consumers can
-            # opt into the chat-completion API and we adapt its chunk shape
-            # here. End-of-stream is signaled by finish_reason being set.
-            choice = event.choices[0]
-            delta = getattr(choice, 'delta', None)
-            content = getattr(delta, 'content', None) if delta else None
-            if content:
-                safe_text = buf.add(content)
-                if safe_text:
-                    yield TextDelta(text=safe_text)
-            if getattr(choice, 'finish_reason', None):
-                remaining = buf.flush()
-                if remaining:
-                    yield TextDelta(text=remaining)
-                yield TurnEnd()
+    Usage:
+        client = AsyncOpenAI()  # patched via patch_openai_with_ptc
+        stream = await client.chat.completions.create(model=..., messages=..., stream=True)
+        async for event in display_events_async(stream):
+            ...
+    """
+    buf = _StreamBuffer()
+    async for event in stream:
+        for out in _process_stream_event(event, buf):
+            yield out
 
 
 def _make_execution_event(
