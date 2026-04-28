@@ -2277,6 +2277,7 @@ async def _handle_bash_tool_streaming(
 
                 # Execute tool calls
                 tool_results = []
+                seq_num = 0
                 for tc in tool_calls_list:
                     fn_name = tc["function"]["name"]
                     if fn_name != "bash":
@@ -2302,6 +2303,18 @@ async def _handle_bash_tool_streaming(
                     safe_output = _truncate_output(output)
                     if clog: clog.tool_result("bash_tool", "bash", safe_output, duration_ms=dur)
                     logger.info(f"[BashTool stream] bash exit_code={exit_code}")
+
+                    # Surface execution as a display event so consumers can
+                    # render tool cards the same way as PTC fence mode.
+                    seq_num += 1
+                    yield _make_execution_event(
+                        fence_type="bash",
+                        code=command,
+                        output=safe_output,
+                        sequence_number=seq_num,
+                        status="completed" if exit_code == 0 else "failed",
+                    )
+
                     tool_results.append({
                         "role": "tool", "tool_call_id": tc["id"],
                         "content": safe_output or "(no output)"
