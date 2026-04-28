@@ -78,6 +78,35 @@ Skills CLI (use from bash:execute):
 """
 
 
+BASH_TOOL_SCHEMA = {
+    "type": "function",
+    "function": {
+        "name": "bash",
+        "description": (
+            "Execute a bash command in the working directory. "
+            "Use `python -c` or skill scripts to call MCP tools via lib.tools."
+        ),
+        "parameters": {
+            "type": "object",
+            "properties": {
+                "command": {"type": "string", "description": "Bash command to run"}
+            },
+            "required": ["command"],
+        },
+    },
+}
+
+BASH_TOOL_GUIDANCE = """You have access to a bash tool for executing commands in the working directory.
+
+Skills are available in the ./skills/ directory:
+- Run `skills list` to see available skills
+- Run `skills read <skill>` to read skill documentation
+- In Python scripts, import tools with: `from lib.tools import <function_name>`
+
+Parallel tool calls are supported - you can call bash multiple times in one response when the commands are independent.
+"""
+
+
 _SKILLS_CLI_PY = '''\
 #!/usr/bin/env python3
 # /// script
@@ -342,6 +371,20 @@ def _inject_ptc_guidance_responses(input_data: list | str, tool_manifest: str = 
     return input_list
 
 
+def _inject_bash_tool_guidance(messages: list, tool_manifest: str = "") -> list:
+    """Inject bash tool guidance into system message or prepend one."""
+    guidance = BASH_TOOL_GUIDANCE + tool_manifest
+    messages = list(messages)  # copy
+    if messages and messages[0].get("role") == "system":
+        messages[0] = {
+            **messages[0],
+            "content": messages[0]["content"] + "\n\n" + guidance
+        }
+    else:
+        messages.insert(0, {"role": "system", "content": guidance})
+    return messages
+
+
 # =============================================================================
 # Code Fence Parser
 # =============================================================================
@@ -505,6 +548,25 @@ def display_events(stream) -> Generator[TextDelta | CodeExecution | TurnEnd, Non
             if remaining:
                 yield TextDelta(text=remaining)
             yield TurnEnd()
+
+        elif hasattr(event, 'choices') and event.choices:
+            # Chat-completion chunk (from _handle_ptc_streaming). The
+            # responses-API translation in litellm has a known bug that drops
+            # the leading content of the first text delta, so consumers can
+            # opt into the chat-completion API and we adapt its chunk shape
+            # here. End-of-stream is signaled by finish_reason being set.
+            choice = event.choices[0]
+            delta = getattr(choice, 'delta', None)
+            content = getattr(delta, 'content', None) if delta else None
+            if content:
+                safe_text = buf.add(content)
+                if safe_text:
+                    yield TextDelta(text=safe_text)
+            if getattr(choice, 'finish_reason', None):
+                remaining = buf.flush()
+                if remaining:
+                    yield TextDelta(text=remaining)
+                yield TurnEnd()
 
 
 def _make_execution_event(
@@ -1755,6 +1817,7 @@ async def _handle_ptc_streaming(
                     clog.message(msg.get("role", ""), msg.get("content", ""))
 
             loop_count = 0
+            seq_num = 0
             while loop_count < MAX_LOOPS:
                 loop_count += 1
                 buffer = ""
@@ -1798,6 +1861,7 @@ async def _handle_ptc_streaming(
                         delta = chunk.choices[0].delta.content or ""
                         buffer += delta
                         yield chunk
+                        seq_num += 1
 
                         # Check for complete fences
                         while True:
@@ -1821,10 +1885,21 @@ async def _handle_ptc_streaming(
                                         output, code = await executor.execute_python_async(fence.content, cwd, pythonpath=skills_dir)
                                     else:
                                         output, code = executor.execute_python(fence.content, cwd, pythonpath=skills_dir)
+                                status = "completed" if code == 0 else "failed"
                             else:
                                 output = executor.create_file(fence.fence_type, fence.content, skills_dir)
+                                status = "completed"
                             dur = int((time.time() - t0) * 1000)
                             if clog: clog.tool_result("code_fence", fence_name, output, duration_ms=dur)
+
+                            seq_num += 1
+                            yield _make_execution_event(
+                                fence_type=fence.fence_type,
+                                code=fence.content,
+                                output=output,
+                                sequence_number=seq_num,
+                                status=status,
+                            )
 
                             executed_fences.append((fence, output))
                             buffer = remove_fence_from_buffer(buffer, fence)
@@ -1833,6 +1908,7 @@ async def _handle_ptc_streaming(
                         delta = chunk.choices[0].delta.content or ""
                         buffer += delta
                         yield chunk
+                        seq_num += 1
 
                         while True:
                             fence = extract_complete_fence(buffer)
@@ -1854,10 +1930,21 @@ async def _handle_ptc_streaming(
                                         output, code = await executor.execute_python_async(fence.content, cwd, pythonpath=skills_dir)
                                     else:
                                         output, code = executor.execute_python(fence.content, cwd, pythonpath=skills_dir)
+                                status = "completed" if code == 0 else "failed"
                             else:
                                 output = executor.create_file(fence.fence_type, fence.content, skills_dir)
+                                status = "completed"
                             dur = int((time.time() - t0) * 1000)
                             if clog: clog.tool_result("code_fence", fence_name, output, duration_ms=dur)
+
+                            seq_num += 1
+                            yield _make_execution_event(
+                                fence_type=fence.fence_type,
+                                code=fence.content,
+                                output=output,
+                                sequence_number=seq_num,
+                                status=status,
+                            )
 
                             executed_fences.append((fence, output))
                             buffer = remove_fence_from_buffer(buffer, fence)
@@ -1883,6 +1970,320 @@ async def _handle_ptc_streaming(
 
     # Always return async generator - caller handles sync/async bridging
     # via _sync_generator_wrapper for sync calls
+    return stream_with_execution()
+
+
+# =============================================================================
+# Bash Tool Mode Handlers
+# =============================================================================
+
+async def _handle_bash_tool_call(
+    self,
+    args,
+    model: str,
+    messages: list,
+    mcp_servers: list | None,
+    cwd: Path,
+    executor: Executor,
+    kwargs: dict,
+    async_mode: bool,
+    orig_fn_sync,
+    orig_fn_async,
+    server_cache: dict,
+    bridge_cache: dict | None = None,
+    skills_dir_override: Path | None = None
+):
+    """Handle bash tool mode call using native tool_calls interface."""
+    _, provider, api_key, _ = llm_utils.get_llm_provider(model)
+    bridge_socket_path = getattr(executor, 'bridge_socket_path', None)
+
+    skills_dir = skills_dir_override or (cwd / 'skills')
+    server_lookup, bridge_address, tool_manifest = await setup_skills_directory(
+        skills_dir, mcp_servers, server_cache,
+        bridge_socket_path=bridge_socket_path,
+        bridge_cache=bridge_cache
+    )
+    set_bridge_env(bridge_address)
+
+    # Clean kwargs - remove PTC-specific params
+    clean_kwargs = {k: v for k, v in kwargs.items()
+                    if k not in ('mcp_servers', 'mcp_strict', 'ptc_enabled', 'cwd', 'bash_tool')}
+
+    # Merge BASH_TOOL_SCHEMA with any user-provided tools
+    user_tools = clean_kwargs.pop('tools', None) or []
+    tools = [BASH_TOOL_SCHEMA] + [t for t in user_tools if t.get('function', {}).get('name') != 'bash']
+
+    current_messages = _inject_bash_tool_guidance(messages, tool_manifest)
+
+    clog = create_log("bash_tool", model)
+    if clog:
+        for msg in current_messages:
+            clog.message(msg.get("role", ""), msg.get("content", ""))
+
+    loop_count = 0
+    response = None
+    while loop_count < MAX_LOOPS:
+        loop_count += 1
+
+        if provider == 'openai':
+            if async_mode:
+                response = await orig_fn_async(
+                    self, *args, model=model, messages=current_messages, tools=tools, **clean_kwargs
+                )
+            else:
+                response = orig_fn_sync(
+                    self, *args, model=model, messages=current_messages, tools=tools, **clean_kwargs
+                )
+        else:
+            if async_mode:
+                response = await litellm.acompletion(
+                    model=model, messages=current_messages, tools=tools, api_key=api_key, **clean_kwargs
+                )
+            else:
+                response = litellm.completion(
+                    model=model, messages=current_messages, tools=tools, api_key=api_key, **clean_kwargs
+                )
+
+        choice = response.choices[0]
+        tool_calls = getattr(choice.message, 'tool_calls', None) or []
+
+        if not tool_calls:
+            content = choice.message.content or ""
+            if clog:
+                clog.message("assistant", content)
+                clog.end(loop_count)
+            return response
+
+        logger.info(f"[BashTool] {len(tool_calls)} tool call(s)")
+        if clog: clog.message("assistant", f"[{len(tool_calls)} bash tool call(s)]")
+
+        # Append assistant message with tool_calls
+        assistant_msg = {
+            "role": "assistant",
+            "content": choice.message.content,
+            "tool_calls": [
+                {"id": tc.id, "type": "function",
+                 "function": {"name": tc.function.name, "arguments": tc.function.arguments}}
+                for tc in tool_calls
+            ]
+        }
+        current_messages.append(assistant_msg)
+
+        # Execute tool calls (concurrent in async, sequential in sync)
+        async def _exec_one(tc):
+            if tc.function.name != 'bash':
+                return tc.id, f"Error: unknown tool '{tc.function.name}'"
+            try:
+                args_dict = json.loads(tc.function.arguments)
+            except json.JSONDecodeError as e:
+                return tc.id, f"Error: invalid arguments JSON: {e}"
+            command = args_dict.get('command', '')
+            if clog: clog.tool_call("bash_tool", "bash", command)
+            t0 = time.time()
+            output, exit_code = await executor.execute_bash_async(command, cwd)
+            dur = int((time.time() - t0) * 1000)
+            safe_output = _truncate_output(output)
+            if clog: clog.tool_result("bash_tool", "bash", safe_output, duration_ms=dur)
+            logger.info(f"[BashTool] bash exit_code={exit_code}")
+            return tc.id, safe_output or "(no output)"
+
+        if async_mode:
+            results = await asyncio.gather(*[_exec_one(tc) for tc in tool_calls])
+        else:
+            results = []
+            for tc in tool_calls:
+                if tc.function.name != 'bash':
+                    results.append((tc.id, f"Error: unknown tool '{tc.function.name}'"))
+                    continue
+                try:
+                    args_dict = json.loads(tc.function.arguments)
+                except json.JSONDecodeError as e:
+                    results.append((tc.id, f"Error: invalid arguments JSON: {e}"))
+                    continue
+                command = args_dict.get('command', '')
+                if clog: clog.tool_call("bash_tool", "bash", command)
+                t0 = time.time()
+                output, exit_code = executor.execute_bash(command, cwd)
+                dur = int((time.time() - t0) * 1000)
+                safe_output = _truncate_output(output)
+                if clog: clog.tool_result("bash_tool", "bash", safe_output, duration_ms=dur)
+                logger.info(f"[BashTool] bash exit_code={exit_code}")
+                results.append((tc.id, safe_output or "(no output)"))
+
+        tool_results = [
+            {"role": "tool", "tool_call_id": call_id, "content": content}
+            for call_id, content in results
+        ]
+        current_messages.extend(tool_results)
+        if clog:
+            for tr in tool_results:
+                clog.message("tool", tr.get("content", ""))
+
+    if clog: clog.end(loop_count)
+    logger.warning(f"[BashTool] Reached max loops ({MAX_LOOPS})")
+    return response
+
+
+async def _handle_bash_tool_streaming(
+    self,
+    args,
+    model: str,
+    messages: list,
+    mcp_servers: list | None,
+    cwd: Path,
+    executor: Executor,
+    kwargs: dict,
+    async_mode: bool,
+    orig_fn_sync,
+    orig_fn_async,
+    server_cache: dict,
+    bridge_cache: dict | None = None,
+    skills_dir_override: Path | None = None
+):
+    """Handle streaming bash tool mode call."""
+    _, provider, api_key, _ = llm_utils.get_llm_provider(model)
+    bridge_socket_path = getattr(executor, 'bridge_socket_path', None)
+
+    skills_dir = skills_dir_override or (cwd / 'skills')
+
+    clean_kwargs = {k: v for k, v in kwargs.items()
+                    if k not in ('mcp_servers', 'mcp_strict', 'ptc_enabled', 'cwd', 'bash_tool', 'stream')}
+    clean_kwargs['stream'] = True
+
+    user_tools = clean_kwargs.pop('tools', None) or []
+    tools = [BASH_TOOL_SCHEMA] + [t for t in user_tools if t.get('function', {}).get('name') != 'bash']
+
+    async def stream_with_execution():
+        async with AsyncExitStack() as exit_stack:
+            server_lookup, bridge_address, tool_manifest = await setup_skills_directory(
+                skills_dir, mcp_servers, server_cache,
+                bridge_socket_path=bridge_socket_path,
+                bridge_cache=bridge_cache, exit_stack=exit_stack
+            )
+            set_bridge_env(bridge_address)
+
+            current_messages = _inject_bash_tool_guidance(messages, tool_manifest)
+
+            clog = create_log("bash_tool_stream", model)
+            if clog:
+                for msg in current_messages:
+                    clog.message(msg.get("role", ""), msg.get("content", ""))
+
+            loop_count = 0
+            while loop_count < MAX_LOOPS:
+                loop_count += 1
+
+                if provider == 'openai':
+                    if async_mode:
+                        stream = await orig_fn_async(
+                            self, *args, model=model, messages=current_messages, tools=tools, **clean_kwargs
+                        )
+                    else:
+                        stream = orig_fn_sync(
+                            self, *args, model=model, messages=current_messages, tools=tools, **clean_kwargs
+                        )
+                else:
+                    if async_mode:
+                        stream = await litellm.acompletion(
+                            model=model, messages=current_messages, tools=tools, api_key=api_key, **clean_kwargs
+                        )
+                    else:
+                        stream = litellm.completion(
+                            model=model, messages=current_messages, tools=tools, api_key=api_key, **clean_kwargs
+                        )
+
+                # Accumulate tool calls from stream
+                accumulated_content = ""
+                accumulated_tool_calls: dict[int, dict] = {}
+
+                async def _process_stream(s):
+                    nonlocal accumulated_content
+                    async for chunk in s:
+                        yield chunk
+                        choice = chunk.choices[0] if chunk.choices else None
+                        if not choice:
+                            continue
+                        delta = choice.delta
+                        if delta.content:
+                            accumulated_content += delta.content
+                        if getattr(delta, 'tool_calls', None):
+                            for tc_delta in delta.tool_calls:
+                                idx = tc_delta.index
+                                if idx not in accumulated_tool_calls:
+                                    accumulated_tool_calls[idx] = {
+                                        "id": "", "type": "function",
+                                        "function": {"name": "", "arguments": ""}
+                                    }
+                                if tc_delta.id:
+                                    accumulated_tool_calls[idx]["id"] = tc_delta.id
+                                if tc_delta.function:
+                                    if tc_delta.function.name:
+                                        accumulated_tool_calls[idx]["function"]["name"] += tc_delta.function.name
+                                    if tc_delta.function.arguments:
+                                        accumulated_tool_calls[idx]["function"]["arguments"] += tc_delta.function.arguments
+
+                if async_mode:
+                    async for chunk in _process_stream(stream):
+                        yield chunk
+                else:
+                    async for chunk in _process_stream(stream):
+                        yield chunk
+
+                if not accumulated_tool_calls:
+                    if clog:
+                        clog.message("assistant", accumulated_content)
+                        clog.end(loop_count)
+                    return
+
+                tool_calls_list = [accumulated_tool_calls[i] for i in sorted(accumulated_tool_calls)]
+                logger.info(f"[BashTool stream] {len(tool_calls_list)} tool call(s)")
+
+                # Append assistant message
+                current_messages.append({
+                    "role": "assistant",
+                    "content": accumulated_content or None,
+                    "tool_calls": tool_calls_list
+                })
+
+                # Execute tool calls
+                tool_results = []
+                for tc in tool_calls_list:
+                    fn_name = tc["function"]["name"]
+                    if fn_name != "bash":
+                        tool_results.append({
+                            "role": "tool",
+                            "tool_call_id": tc["id"],
+                            "content": f"Error: unknown tool '{fn_name}'"
+                        })
+                        continue
+                    try:
+                        args_dict = json.loads(tc["function"]["arguments"])
+                    except json.JSONDecodeError as e:
+                        tool_results.append({
+                            "role": "tool", "tool_call_id": tc["id"],
+                            "content": f"Error: invalid arguments: {e}"
+                        })
+                        continue
+                    command = args_dict.get("command", "")
+                    if clog: clog.tool_call("bash_tool", "bash", command)
+                    t0 = time.time()
+                    output, exit_code = await executor.execute_bash_async(command, cwd)
+                    dur = int((time.time() - t0) * 1000)
+                    safe_output = _truncate_output(output)
+                    if clog: clog.tool_result("bash_tool", "bash", safe_output, duration_ms=dur)
+                    logger.info(f"[BashTool stream] bash exit_code={exit_code}")
+                    tool_results.append({
+                        "role": "tool", "tool_call_id": tc["id"],
+                        "content": safe_output or "(no output)"
+                    })
+
+                current_messages.extend(tool_results)
+                if clog:
+                    for tr in tool_results:
+                        clog.message("tool", tr.get("content", ""))
+
+            if clog: clog.end(loop_count)
+
     return stream_with_execution()
 
 
@@ -2292,7 +2693,8 @@ def patch_openai_with_ptc(
     client,
     cwd: str | Path = ".",
     executor: Executor | None = None,
-    skills_dir: str | Path | None = None
+    skills_dir: str | Path | None = None,
+    bash_tool: bool = False
 ):
     """
     Patch OpenAI client to use programmatic tool calling.
@@ -2323,6 +2725,7 @@ def patch_openai_with_ptc(
     client._mcp_server_cache = {}
     client._bridge_cache = {}
     client._skills_dir = skills_path  # Custom skills dir (or None for default)
+    client._bash_tool = bash_tool
 
     # Store original methods
     orig_completions_sync = Completions.create
@@ -2331,7 +2734,7 @@ def patch_openai_with_ptc(
     @wraps(orig_completions_sync)
     def patched_completions_sync(self, *args, model=None, messages=None,
                                   mcp_servers=None, mcp_strict=False,
-                                  ptc_enabled=True, stream=False, **kwargs):
+                                  ptc_enabled=True, bash_tool=False, stream=False, **kwargs):
         if not ptc_enabled:
             return orig_completions_sync(self, *args, model=model, messages=messages, stream=stream, **kwargs)
 
@@ -2339,6 +2742,20 @@ def patch_openai_with_ptc(
         server_cache = getattr(client_obj, '_mcp_server_cache', {}) if client_obj else {}
         bridge_cache = getattr(client_obj, '_bridge_cache', {}) if client_obj else {}
         skills_override = getattr(client_obj, '_skills_dir', None) if client_obj else None
+        use_bash_tool = bash_tool or getattr(client_obj, '_bash_tool', False)
+
+        if use_bash_tool:
+            if stream:
+                async_gen = _handle_bash_tool_streaming(
+                    self, args, model, messages, mcp_servers, cwd_path, executor,
+                    kwargs, False, orig_completions_sync, orig_completions_async, server_cache, bridge_cache, skills_override
+                )
+                return _sync_generator_wrapper(async_gen)
+            else:
+                return _run_async(_handle_bash_tool_call(
+                    self, args, model, messages, mcp_servers, cwd_path, executor,
+                    kwargs, False, orig_completions_sync, orig_completions_async, server_cache, bridge_cache, skills_override
+                ))
 
         if stream:
             # For sync streaming, wrap async generator directly (don't use _run_async)
@@ -2356,7 +2773,7 @@ def patch_openai_with_ptc(
     @wraps(orig_completions_async)
     async def patched_completions_async(self, *args, model=None, messages=None,
                                          mcp_servers=None, mcp_strict=False,
-                                         ptc_enabled=True, stream=False, **kwargs):
+                                         ptc_enabled=True, bash_tool=False, stream=False, **kwargs):
         if not ptc_enabled:
             return await orig_completions_async(self, *args, model=model, messages=messages, stream=stream, **kwargs)
 
@@ -2364,6 +2781,19 @@ def patch_openai_with_ptc(
         server_cache = getattr(client_obj, '_mcp_server_cache', {}) if client_obj else {}
         bridge_cache = getattr(client_obj, '_bridge_cache', {}) if client_obj else {}
         skills_override = getattr(client_obj, '_skills_dir', None) if client_obj else None
+        use_bash_tool = bash_tool or getattr(client_obj, '_bash_tool', False)
+
+        if use_bash_tool:
+            if stream:
+                return await _handle_bash_tool_streaming(
+                    self, args, model, messages, mcp_servers, cwd_path, executor,
+                    kwargs, True, orig_completions_sync, orig_completions_async, server_cache, bridge_cache, skills_override
+                )
+            else:
+                return await _handle_bash_tool_call(
+                    self, args, model, messages, mcp_servers, cwd_path, executor,
+                    kwargs, True, orig_completions_sync, orig_completions_async, server_cache, bridge_cache, skills_override
+                )
 
         if stream:
             return await _handle_ptc_streaming(

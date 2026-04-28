@@ -505,6 +505,66 @@ PYEOF
 
 
 # =============================================================================
+# Test Bash Tool Mode
+# =============================================================================
+
+def test_bash_tool_mode():
+    """Test bash tool mode (native tool_calls interface instead of code fences)."""
+    with tempfile.TemporaryDirectory() as tmpdir:
+        test_file = Path(tmpdir) / "hello.txt"
+        test_file.write_text("Hello from bash tool mode!")
+
+        # Patch with bash_tool=True at patch time
+        client = patch_openai_with_ptc(OpenAI(), cwd=tmpdir, bash_tool=True)
+
+        response = client.chat.completions.create(
+            model="gpt-4o-mini",
+            messages=[
+                {"role": "user", "content": f"List the files in {tmpdir} using a bash command."}
+            ],
+        )
+
+        # Skills directory should be set up identically to PTC mode
+        skills_dir = Path(tmpdir) / "skills"
+        assert skills_dir.exists(), "skills/ directory should be created"
+
+        lib_dir = skills_dir / "lib"
+        assert lib_dir.exists(), "skills/lib/ should exist"
+        assert (lib_dir / "tools.py").exists(), "skills/lib/tools.py should exist"
+        assert (lib_dir / "__init__.py").exists(), "skills/lib/__init__.py should exist"
+
+        # Response should contain file listing
+        content = response.choices[0].message.content
+        assert content, "Response should have content"
+        assert "hello.txt" in content, f"Response should mention hello.txt, got:\n{content}"
+
+        print(f"\nResponse:\n{content}")
+        print("✓ test_bash_tool_mode passed")
+
+
+def test_bash_tool_mode_call_time():
+    """Test bash_tool=True passed at call time (not patch time)."""
+    with tempfile.TemporaryDirectory() as tmpdir:
+        # Patch WITHOUT bash_tool
+        client = patch_openai_with_ptc(OpenAI(), cwd=tmpdir)
+
+        response = client.chat.completions.create(
+            model="gpt-4o-mini",
+            messages=[
+                {"role": "user", "content": f"What is 2 + 2? Just answer with the number."}
+            ],
+            bash_tool=True,
+        )
+
+        content = response.choices[0].message.content
+        assert content, "Response should have content"
+        assert "4" in content, f"Response should contain 4, got:\n{content}"
+
+        print(f"\nResponse:\n{content}")
+        print("✓ test_bash_tool_mode_call_time passed")
+
+
+# =============================================================================
 # Run Tests
 # =============================================================================
 
@@ -531,6 +591,8 @@ if __name__ == "__main__":
         test_ptc_simple()
         test_ptc_with_filesystem()
         test_skills_cli_e2e()
+        test_bash_tool_mode()
+        test_bash_tool_mode_call_time()
     else:
         print("Skipping integration tests (OPENAI_API_KEY not set)")
 
