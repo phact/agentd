@@ -15,6 +15,10 @@ from agentd.sandbox_runtime_executor import (
     SandboxRuntimeExecutor,
     create_sandbox_runtime_executor,
 )
+from agentd.docker_executor import (
+    DockerExecutor,
+    create_docker_executor,
+)
 
 __all__ = [
     'patch_openai_with_mcp',
@@ -36,4 +40,7 @@ __all__ = [
     # OS-level sandbox (lightweight, no containers)
     'SandboxRuntimeExecutor',
     'create_sandbox_runtime_executor',
+    # Container-based executor (fresh `docker run --rm` per call)
+    'DockerExecutor',
+    'create_docker_executor',
 ]
