@@ -1257,6 +1257,7 @@ def generate_skill_md(skill_name: str, description: str, tools: list[str]) -> st
     # Format skill name for frontmatter (lowercase, hyphens)
     formatted_name = skill_name.lower().replace('_', '-')
 
+    first = tools[0] if tools else 'function_name'
     return f'''---
 name: {formatted_name}
 description: {description}
@@ -1270,17 +1271,27 @@ description: {description}
 
 {tools_list}
 
-## Usage
+## How to invoke
 
-Import from the shared `lib.tools` module:
+Use the `skills` CLI — it's on PATH and handles imports for you. Do not
+write your own `python -c` invocations against these functions.
 
-```python
-from lib.tools import {tools[0] if tools else 'function_name'}
-result = {tools[0] if tools else 'function_name'}(...)
-print(result)
+Run a packaged example script:
+
+```bash
+skills run {formatted_name} {first}_example.py
 ```
 
-See the `scripts/` directory for usage examples.
+Or pipe ad-hoc Python (the CLI sets up imports so `lib.tools` resolves):
+
+```bash
+skills exec <<'PY'
+from lib.tools import {first}
+print({first}())
+PY
+```
+
+See the `scripts/` directory for the auto-generated examples.
 '''
 
 
@@ -1720,19 +1731,27 @@ async def _handle_ptc_call(
                     **clean_kwargs
                 )
         else:
-            # Use LiteLLM for non-OpenAI providers
+            # Use LiteLLM for non-OpenAI providers, with auto-fallback to
+            # claude-agent-sdk for Claude models when no API key is set but
+            # the local `claude` CLI is logged in. Pass cwd so the SDK route
+            # doesn't escape to the Python-process working directory.
+            from agentd.llm_dispatch import smart_acompletion, smart_completion
             if async_mode:
-                response = await litellm.acompletion(
+                response = await smart_acompletion(
                     model=model,
                     messages=current_messages,
                     api_key=api_key,
+                    cwd=cwd,
+                    executor=executor,
                     **clean_kwargs
                 )
             else:
-                response = litellm.completion(
+                response = smart_completion(
                     model=model,
                     messages=current_messages,
                     api_key=api_key,
+                    cwd=cwd,
+                    executor=executor,
                     **clean_kwargs
                 )
 
@@ -2065,12 +2084,13 @@ async def _handle_bash_tool_call(
                     self, *args, model=model, messages=current_messages, tools=tools, **clean_kwargs
                 )
         else:
+            from agentd.llm_dispatch import smart_acompletion, smart_completion
             if async_mode:
-                response = await litellm.acompletion(
+                response = await smart_acompletion(
                     model=model, messages=current_messages, tools=tools, api_key=api_key, **clean_kwargs
                 )
             else:
-                response = litellm.completion(
+                response = smart_completion(
                     model=model, messages=current_messages, tools=tools, api_key=api_key, **clean_kwargs
                 )
 
