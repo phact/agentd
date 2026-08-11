@@ -29,7 +29,8 @@ class MCPBridge:
         self,
         port: int = 0,
         socket_path: str | Path | None = None,
-        main_loop: asyncio.AbstractEventLoop | None = None
+        main_loop: asyncio.AbstractEventLoop | None = None,
+        host: str = '127.0.0.1'
     ):
         """
         Initialize the MCP bridge.
@@ -39,8 +40,12 @@ class MCPBridge:
             socket_path: Path for Unix socket. If set, uses Unix socket instead of TCP.
             main_loop: The event loop where MCP connections were established.
                        Tool calls will be dispatched to this loop.
+            host: Interface to bind in TCP mode. Defaults to loopback; the bridge
+                  has no auth, so only widen this (e.g. '0.0.0.0') if sandboxed
+                  code must reach it from another network namespace.
         """
         self.port = port
+        self.host = host
         self.socket_path = Path(socket_path) if socket_path else None
         self.servers: dict[str, Any] = {}  # tool_name -> server connection
         self.local_tools: dict[str, callable] = {}  # tool_name -> function
@@ -85,7 +90,7 @@ class MCPBridge:
             return str(self.socket_path)
         else:
             # TCP mode
-            self._site = web.TCPSite(self._runner, '0.0.0.0', self.port)
+            self._site = web.TCPSite(self._runner, self.host, self.port)
             await self._site.start()
 
             # Get the actual port if auto-assigned
