@@ -3,7 +3,9 @@
 LLM agent utilities featuring:
 
 1. **Programmatic Tool Calling (PTC)** - Bash-enabled agents with MCP tools exposed as AgentSkills
-2. **Patched Responses API + Agent Daemon** - Traditional tool_calls with MCP, plus YAML-configured reactive agents
+2. **Agent harnesses** - Run Claude Code or Codex through the same OpenAI-style API, and switch between them mid-conversation
+3. **Sandboxes** - All agent-written code and every harness run in a libkrun microVM or Docker container with **no network and no credentials**
+4. **Patched Responses API + Agent Daemon** - Traditional tool_calls with MCP, plus YAML-configured reactive agents
 
 ## Installation
 
@@ -13,13 +15,35 @@ pip install agentd
 uv add agentd
 ```
 
+Then set up a sandbox backend (once per machine, from a checkout of this repo):
+
+**libkrun (recommended: a real microVM per session; macOS on Apple Silicon, or Linux with KVM)**
+```bash
+# macOS: libkrun from its maintainer's Homebrew tap
+brew tap slp/krun
+brew trust --formula slp/krun/libkrun slp/krun/libkrunfw slp/krun/virglrenderer-krun
+brew install slp/krun/libkrun
+
+agentd/sandbox/build.sh                                               # build + sign the launcher
+python -m agentd.sandbox.rootfs build agentd/sandbox/images/agents agents   # base image
+```
+
+**Docker (a container per session)**
+```bash
+python -m agentd.sandbox.rootfs build agentd/sandbox/images/agents agents   # also tags agentd-sandbox-agents
+```
+
+The `agents` image contains Python, git, ripgrep, Claude Code and Codex, with an `agent` user at your uid. On macOS with Docker Desktop or Colima, workspaces must be inside a directory shared with the Docker VM (`$HOME` by default); agentd checks this and tells you if not.
+
+By default agentd uses libkrun if it is set up, otherwise Docker. Code never runs directly on the host.
+
 ---
 
 ## Programmatic Tool Calling (PTC)
 
 PTC gives you a **bash-enabled agent** that unifies **MCP tools with the AgentSkills spec**.
 
-Instead of JSON `tool_calls`, the LLM writes code in fenced blocks. MCP tools and `@tool` functions are auto-converted to Python bindings in a discoverable skills directory.
+Instead of JSON `tool_calls`, the LLM writes code in fenced blocks, which agentd runs in the sandbox. MCP tools and `@tool` functions are auto-converted to Python bindings in a discoverable skills directory.
 
 ```python
 from agentd import patch_openai_with_ptc, display_events, tool
@@ -34,7 +58,7 @@ def calculate(expression: str) -> str:
 client = patch_openai_with_ptc(OpenAI(), cwd="./workspace")
 
 stream = client.responses.create(
-    model="claude-sonnet-4-20250514",
+    model="claude-sonnet-5",
     input=[{"role": "user", "content": "List files, then calculate sqrt(144)"}],
     stream=True
 )
@@ -48,12 +72,11 @@ for event in display_events(stream):
 
 ### Key Features
 
-**Bash-enabled agent:** The LLM can run shell commands directly:
+**Bash-enabled agent:** The LLM can run shell commands. They run in one persistent shell in the sandbox, so `cd`, `export`, `pushd`/`popd` and shell functions carry over between blocks:
 ~~~markdown
 ```bash:execute
 ls -la
 git status
-curl https://api.example.com/data
 ```
 ~~~
 
@@ -86,40 +109,30 @@ PTC generates a skills directory combining MCP tools and local functions:
 
 ```
 skills/
+  skills                # CLI: `skills list`, `skills read <skill>`, `skills exec`
   lib/
-    tools.py              # Python bindings for ALL tools (MCP + @tool)
-  filesystem/             # From @modelcontextprotocol/server-filesystem
-    SKILL.md              # AgentSkills spec: YAML frontmatter + docs
+    tools.py            # Python bindings for ALL tools (MCP + @tool)
+  filesystem/           # From @modelcontextprotocol/server-filesystem
+    SKILL.md            # AgentSkills spec: YAML frontmatter + docs
     scripts/
       read_file_example.py
-  local/                  # From @tool decorated functions
+  local/                # From @tool decorated functions
     SKILL.md
     scripts/
       calculate_example.py
 ```
 
-The LLM discovers tools by exploring:
-```bash
-ls skills/                           # List available skills
-cat skills/filesystem/SKILL.md       # Read skill documentation
-```
-
-Then imports and uses them:
-```python
-from lib.tools import read_file, calculate
-```
+The `skills` CLI is on the sandbox's `PATH`; every harness discovers tools the same way.
 
 ### MCP Bridge
 
-An HTTP bridge runs locally to route tool calls:
+MCP servers and `@tool` functions run on the host, behind an HTTP bridge on a host Unix socket. Inside the sandbox, `/run/agentd/bridge.sock` is tunneled to it, so the generated bindings reach host tools without any network:
 
 ```python
 # Auto-generated in skills/lib/tools.py
 def read_file(path: str) -> dict:
-    return _call("read_file", path=path)  # POST to http://localhost:PORT/call/read_file
+    return _call("read_file", path=path)  # POST /call/read_file over $MCP_BRIDGE_SOCKET
 ```
-
-The bridge dispatches to MCP servers or local Python functions as appropriate.
 
 ### PTC with MCP Servers
 
@@ -135,7 +148,7 @@ mcp_server = MCPServerStdio(
 client = patch_openai_with_ptc(OpenAI(), cwd="./workspace")
 
 response = client.responses.create(
-    model="claude-sonnet-4-20250514",
+    model="claude-sonnet-5",
     input="Explore the available skills and use one",
     mcp_servers=[mcp_server],
     stream=True
@@ -159,138 +172,85 @@ for event in display_events(stream):
             print("\n---")
 ```
 
-### Microsandbox Executor
+---
 
-Run code in hardware-isolated microVMs instead of subprocesses for secure execution.
+## Agent Harnesses
 
-**Install microsandbox:**
-```bash
-# Linux (requires KVM) or macOS (Apple Silicon only)
-curl -sSL https://get.microsandbox.dev | sh
+`harness=` picks who runs the agent loop. `"ptc"` (default) is agentd's own loop above; `"claude-code"` and `"codex"` run the real CLI agent, with its own tools, **entirely inside the sandbox**.
 
-# Start the server
-msb server start --dev
-```
-
-**Usage:**
 ```python
-from agentd import patch_openai_with_ptc, create_microsandbox_cli_executor
+from agentd import patch_openai_with_ptc
 from openai import OpenAI
 
-# Create sandboxed executor
-executor = create_microsandbox_cli_executor(
-    conversation_id="my_session",
-    image="python",
-    memory=1024,
-    timeout=60,
-)
+client = patch_openai_with_ptc(OpenAI(), cwd="./workspace", harness="claude-code")
 
-client = patch_openai_with_ptc(
-    OpenAI(),
-    cwd=str(executor.snapshot_manager.workspace_dir),
-    executor=executor,
-)
+msgs = [{"role": "user", "content": "Add a test for utils.py and run it"}]
+r = client.chat.completions.create(model="claude-sonnet-5", messages=msgs)
 
-stream = client.responses.create(
-    model="claude-sonnet-4-20250514",
-    input=[{"role": "user", "content": "Run some Python code"}],
-    stream=True
-)
-
-# ... handle events ...
-
-# Create snapshot for time travel
-executor.snapshot("checkpoint_1")
-
-# Restore to previous state
-executor.restore("checkpoint_1")
-
-executor.close()
+# Same conversation, now Codex (per-call override)
+msgs += [{"role": "assistant", "content": r.choices[0].message.content},
+         {"role": "user", "content": "Review that test"}]
+r = client.chat.completions.create(model=None, messages=msgs, harness="codex")
 ```
 
-**Features:**
-- **Hardware isolation:** Code runs in microVMs, not just containers
-- **Persistent workspace:** Volume mounting preserves files across executions
-- **Snapshots:** Save and restore workspace state at any point
-- **Drop-in replacement:** Same interface as the default subprocess executor
+- **Conversations:** the `messages` you send are the history. If they match the previous exchange on the same harness, agentd resumes that harness's native session (with full tool context); otherwise, e.g. after switching harness, it starts a new session seeded with the history. Every harness shares the client's sandbox, so files and processes survive a switch.
+- **Responses API:** `client.responses.create(harness=..., input=..., instructions=...)` works too, including `previous_response_id` and `stream=True` (standard `response.*` events). The output is the assistant message; the harness's own tool activity is logged, not returned. Give harnesses tools via `mcp_servers=` (they appear as skills), not `tools=`.
+- **Models:** pass the harness's model (`claude-*` for Claude Code, OpenAI models for Codex), or `None` for its default. A model from the other vendor falls back to the default, so switching keeps working.
+- **Transcripts:** each harness's sessions are stored in `~/.agentd/transcripts/<harness>/<workspace>/`, mounted into the sandbox where the CLI expects them (the sandbox sees only this workspace's sessions). After every turn they're copied to the CLI's usual place, `~/.claude/projects/<workspace>/` and `~/.codex/sessions/`, so `claude --resume` / `codex resume` on the host find them. `KrunExecutor(transcripts_dir=..., sync_transcripts=False)` changes the store root or turns the copy off. agentd also writes its own JSONL log of every turn (`AGENTD_LOG_DIR`, default `./logs`).
+- **Resume by id:** every response carries `agentd.session_id`, the native session id. Pass it back as `session_id=` to resume that session, even from a new process or a fresh sandbox (if you continued it on the host, the newer copy is used). `previous_response_id` works across restarts too.
+- **Lifecycle:** one sandbox per client (executor), started on first use and stopped by `executor.close()`; conversations and harnesses share it. Sessions outlive it: their transcripts are on the host.
 
-### Sandbox Runtime Executor
+### Credentials
 
-Lightweight OS-level sandboxing using [Anthropic's sandbox-runtime](https://github.com/anthropic-experimental/sandbox-runtime). Uses `sandbox-exec` on macOS and `bubblewrap` on Linux - no containers or VMs required.
+Real credentials never enter the sandbox. Inside it, each harness talks to a sandbox-side endpoint and holds only a placeholder; agentd's host-side model proxy replaces it with the real credential and forwards to the provider:
 
-**Install sandbox-runtime:**
-```bash
-npm install -g @anthropic-ai/sandbox-runtime
-```
+| Harness | Credential (on the host) |
+|---|---|
+| Claude Code, PTC with `claude-*` | `ANTHROPIC_API_KEY`, else your Claude Code login (macOS Keychain / `~/.claude/.credentials.json`) |
+| Codex | `OPENAI_API_KEY`, else your Codex ChatGPT login (`~/.codex/auth.json`) |
 
-**Linux only:** If using AppArmor, you may need to allow unprivileged user namespaces:
-```bash
-sudo sysctl -w kernel.apparmor_restrict_unprivileged_userns=0
-```
+Subscription tokens are only read, never refreshed by agentd (refreshing would log out your own CLI); run the CLI on the host to refresh them. Codex's ChatGPT mode only talks to `https://chatgpt.com`, so inside the sandbox agentd serves that hostname over TLS with a certificate from a local agentd CA (`~/.agentd/ca`) that only sandboxes trust.
 
-**Usage:**
+---
+
+## Sandboxes
+
+| | `KrunExecutor` | `DockerExecutor` |
+|---|---|---|
+| Boundary | libkrun microVM (own kernel) | Docker container (shared kernel) |
+| Network | none (no NIC, no TSI) | `--network none` |
+| Channel to host | one host-dialed vsock connection | the host-held `docker run -i` stdio |
+| Base image | shared read-only + per-session in-memory overlay | image + container layer |
+| Startup | ~0.3s | ~0.2s |
+
+Both behave the same:
+
+- **One sandbox per client**, started on first use. The workspace (`cwd`) appears at the same path inside, as do the skills dir and transcript folders. Nothing else from the host is visible unless you add it with `mounts=`.
+- **No network.** The only way out is a few sandbox-side endpoints tunneled over the host's one connection: the MCP bridge and the model proxies. Each has a fixed host target.
+- **No host environment.** Code runs as the `agent` user with an explicit environment; your keys and env vars don't leak in.
+- Files written outside the workspace (e.g. `/tmp`) disappear when the session ends.
+
 ```python
-from agentd import patch_openai_with_ptc, create_sandbox_runtime_executor
-from openai import OpenAI
+from agentd import patch_openai_with_ptc, KrunExecutor, DockerExecutor
 
-executor = create_sandbox_runtime_executor(
-    conversation_id="my_session",
-    # Network restrictions (allow-list)
-    allowed_domains=["github.com", "pypi.org"],
-    # Filesystem restrictions
-    deny_read=["~/.ssh", "~/.aws", "~/.gnupg"],
-    # allow_write defaults to workspace only
-)
-
-# Verify sandbox works on this system
-ok, msg = executor.verify()
-if not ok:
-    print(f"Sandbox unavailable: {msg}")
-
-client = patch_openai_with_ptc(
-    OpenAI(),
-    cwd=str(executor.workspace_dir),
-    executor=executor,
-)
-
-stream = client.responses.create(
-    model="claude-sonnet-4-20250514",
-    input=[{"role": "user", "content": "Run some Python code"}],
-    stream=True
-)
-
-# ... handle events ...
-
-# Snapshots work the same as microsandbox
-executor.snapshot("checkpoint_1")
-executor.restore("checkpoint_1")
-
-executor.close()
+client = patch_openai_with_ptc(OpenAI(), cwd="./ws", executor=KrunExecutor())
+client = patch_openai_with_ptc(OpenAI(), cwd="./ws", executor=DockerExecutor(timeout=120))
 ```
 
-**Features:**
-- **OS-level isolation:** Network and filesystem restrictions via OS primitives
-- **No containers:** Lighter weight than microVMs, faster startup
-- **Network allow-list:** Only specified domains are accessible
-- **Filesystem protection:** Block reads to sensitive paths, restrict writes
-- **Snapshots:** Same time-travel API as microsandbox executor
-- **MCP tools support:** Uses Unix sockets to bridge tool calls from sandbox to host
+**Read-only mounts:** give the sandbox extra host directories it can read but never change:
 
-**MCP Tools:** The sandbox runtime uses network namespace isolation, but MCP tools work via Unix sockets. The MCP bridge listens on a socket in the workspace directory, which is accessible from inside the sandbox.
+```python
+KrunExecutor(mounts=["~/datasets", "/opt/models"])        # each at the same path inside
+DockerExecutor(mounts={"~/notes": "/home/agent/notes"})   # or {host_path: sandbox_path}
+```
 
-**Comparison:**
-
-| Executor | Isolation | Requirements | Best For |
-|----------|-----------|--------------|----------|
-| `SubprocessExecutor` | None | - | Development, trusted code |
-| `SandboxRuntimeExecutor` | OS-level | srt CLI | Lightweight isolation |
-| `MicrosandboxCLIExecutor` | MicroVM | msb CLI + KVM | Maximum isolation |
+Read-only is enforced outside the sandbox (libkrun's read-only virtiofs device; Docker `:ro` bind mounts), so even root inside can't write. Sources must be existing directories, and system paths (`/usr`, `/etc`, ...) can't be mounted over. With Docker on macOS, they must be inside a directory shared with the Docker VM.
 
 ---
 
 ## Traditional Tool Calling
 
-For cases where you want standard JSON `tool_calls` instead of code fences.
+For cases where you want standard JSON `tool_calls` instead of code fences. Tools are MCP calls made from the host; no agent-written code runs.
 
 ### Patched Responses API
 
@@ -326,13 +286,6 @@ print(response.choices[0].message.content)
 - Intercepts tool calls, executes via MCP, feeds results back
 - Loops until no more tool calls (max 20 iterations)
 - Supports streaming
-
-**Multi-provider support:**
-```python
-model="gpt-4o"                      # OpenAI
-model="claude-sonnet-4-20250514"    # Anthropic
-model="gemini/gemini-2.0-flash"     # Google
-```
 
 ### Agent Daemon
 
@@ -381,74 +334,31 @@ Assistant: I've saved 3 files to ./output/...
 
 ## API Reference
 
-### Patching Functions
-
 ```python
-from agentd import patch_openai_with_mcp, patch_openai_with_ptc
+from agentd import (
+    patch_openai_with_ptc, patch_openai_with_mcp,
+    KrunExecutor, DockerExecutor, default_executor, tool,
+)
 
-# PTC: bash + skills (no isolation)
-client = patch_openai_with_ptc(OpenAI(), cwd="./workspace")
+# PTC / harnesses (sandboxed). harness: "ptc" | "claude-code" | "codex"
+client = patch_openai_with_ptc(
+    OpenAI(),
+    cwd="./workspace",          # the sandbox workspace
+    executor=None,              # default_executor(): libkrun if set up, else Docker
+    skills_dir=None,            # default: cwd/skills
+    harness="ptc",              # overridable per call: create(..., harness="codex")
+)
 
-# PTC with OS-level sandbox (lightweight)
-from agentd import create_sandbox_runtime_executor
-executor = create_sandbox_runtime_executor(conversation_id="my_session")
-client = patch_openai_with_ptc(OpenAI(), executor=executor)
+KrunExecutor(rootfs=DEFAULT_ROOTFS,        # ~/.agentd/rootfs/agents ($AGENTD_ROOTFS)
+             timeout=60, cpus=2, mem_mib=2048,
+             mounts=None,                  # read-only: ["~/data"] or {"~/data": "/data"}
+             transcripts_dir=None, sync_transcripts=True)
+DockerExecutor(image="agentd-sandbox-agents", ...)   # same options
 
-# PTC with microsandbox isolation (microVM)
-from agentd import create_microsandbox_cli_executor
-executor = create_microsandbox_cli_executor(conversation_id="my_session")
-client = patch_openai_with_ptc(OpenAI(), executor=executor)
+# Harness calls also accept session_id= (resume a native session by id)
 
 # Traditional tool_calls
 client = patch_openai_with_mcp(OpenAI())
-```
-
-### Microsandbox Executor
-
-```python
-from agentd import create_microsandbox_cli_executor
-
-executor = create_microsandbox_cli_executor(
-    conversation_id="session_1",  # Sandbox name prefix
-    image="python",               # microsandbox image
-    memory=1024,                  # MB
-    timeout=60,                   # seconds
-)
-
-# Snapshot API
-snapshot = executor.snapshot("label")     # Save state
-executor.restore(snapshot.id)             # Restore state
-snapshots = executor.list_snapshots()     # List all snapshots
-
-executor.close()  # Cleanup
-```
-
-### Sandbox Runtime Executor
-
-```python
-from agentd import create_sandbox_runtime_executor
-
-executor = create_sandbox_runtime_executor(
-    conversation_id="session_1",
-    timeout=60,
-    # Network (allow-list pattern)
-    allowed_domains=["github.com", "*.python.org"],
-    denied_domains=[],
-    allow_local_binding=False,
-    # Filesystem
-    deny_read=["~/.ssh", "~/.aws"],    # Block reading these paths
-    allow_write=None,                   # None = workspace only
-    deny_write=[".env"],                # Block within allowed zones
-)
-
-# Check if sandbox works on this system
-ok, msg = executor.verify()
-
-# Same snapshot API as microsandbox
-snapshot = executor.snapshot("label")
-executor.restore(snapshot.id)
-
-executor.close()
 ```
 
 ### Tool Decorator
@@ -473,8 +383,7 @@ def my_function(arg1: str, arg2: int = 10) -> str:
 See [`examples/`](./examples/):
 - `ptc_with_mcp.py` - PTC with MCP servers
 - `ptc_with_tools.py` - PTC with @tool decorator
-- `ptc_microsandbox.py` - PTC with microsandbox isolation (microVM)
-- `ptc_sandbox_runtime.py` - PTC with sandbox-runtime isolation (OS-level)
+- `ptc_streaming.py` - streaming PTC output
 
 See [`config/`](./config/) for agent daemon configs.
 
@@ -483,42 +392,52 @@ See [`config/`](./config/) for agent daemon configs.
 ## Architecture
 
 ```
-┌─────────────────────────────┐     ┌─────────────────────────────┐
-│            PTC              │     │       Agent Daemon          │
-│     (bash, skills, MCP)     │     │    (YAML, subscriptions)    │
-└──────────────┬──────────────┘     └──────────────┬──────────────┘
-               │                                   │
-               ▼                                   ▼
-┌──────────────────────────────────────────────────────────────────┐
-│                       Patched OpenAI Client                      │
-│  ┌────────────────────────┐    ┌────────────────────────────┐   │
-│  │   patch_openai_ptc     │    │     patch_openai_mcp       │   │
-│  │   (fence parse/exec)   │    │     (tool_calls loop)      │   │
-│  └───────────┬────────────┘    └─────────────┬──────────────┘   │
-└──────────────┼───────────────────────────────┼──────────────────┘
-               │                               │
-               ▼                               │
-┌──────────────────────────────────────────┐   │
-│              Executors                   │   │
-│  ┌──────────┐ ┌─────────┐ ┌───────────┐  │   │
-│  │Subprocess│ │ Sandbox │ │Microsandbox│  │   │
-│  │(default) │ │ Runtime │ │ (microVM) │  │   │
-│  │          │ │(OS-level)│ │           │  │   │
-│  └──────────┘ └─────────┘ └───────────┘  │   │
-└──────────────────┬───────────────────────┘   │
-                   │                           │
-                   ▼                           │
-┌──────────────────────────────┐               │
-│         MCP Bridge           │               │
-│        (HTTP server)         │               │
-└──────────────┬───────────────┘               │
-               │                               │
-               └───────────────┬───────────────┘
-                               ▼
-               ┌───────────────────────────────┐
-               │          MCP Servers          │
-               └───────────────────────────────┘
+ patch_openai_with_ptc(client, executor=..., harness=...)
+   ├─ harness="ptc"          agentd's loop on the host; code fences run in the sandbox
+   │                         (model: LiteLLM with an API key, or `claude -p` with no
+   │                          tools inside the sandbox on a Claude subscription)
+   ├─ harness="claude-code"  `claude -p --output-format stream-json`, in the sandbox
+   └─ harness="codex"        `codex exec --json`, in the sandbox
+
+ HOST                                            SANDBOX (microVM or container, no network)
+ ┌──────────────────────────────┐   one host-   ┌────────────────────────────────────┐
+ │ SandboxSession               │   held, muxed │ sandboxd: exec, shell, endpoints   │
+ │  ├ model proxies (real creds)│◄── channel ──►│  anthropic 127.0.0.1:8080          │
+ │  │   → api.anthropic.com,    │               │  openai    127.0.0.1:8081          │
+ │  │     chatgpt.com, OpenAI   │               │  chatgpt.com:443 (TLS, agentd CA)  │
+ │  ├ MCP bridge (Unix socket)  │               │  /run/agentd/bridge.sock ← skills  │
+ │  │   → MCP servers, @tool    │               │                                    │
+ │  └ shared: workspace,        │               │ workspace & transcripts at their   │
+ │    transcripts               │               │ host paths; `agent` user           │
+ └──────────────────────────────┘               └────────────────────────────────────┘
 ```
+
+| Module | Role |
+|---|---|
+| `agentd/sandbox/` | `base` (channel, exec/shell, endpoints), `krun` / `docker` backends, `sandboxd` + `mux` (inside the sandbox), `session`, `executor`, `tls`, `rootfs`, `launcher.c` |
+| `agentd/model_proxy.py` | Host-side proxies that add credentials |
+| `agentd/harness/` | Claude Code and Codex drivers, `harness=` routing for chat and Responses |
+| `agentd/ptc.py` | PTC loop, skills generation, client patching |
+| `agentd/mcp_bridge.py` | MCP / `@tool` bridge on a Unix socket |
+
+---
+
+## Upgrading from 0.8
+
+0.9 runs everything in a sandbox and removes the old executors:
+
+| 0.8 | 0.9 |
+|---|---|
+| default: code runs on the host (`SubprocessExecutor`) | default: `KrunExecutor`, else `DockerExecutor`; error if neither is set up |
+| `SubprocessExecutor`, `SandboxRuntimeExecutor`, `MicrosandboxExecutor`, `MicrosandboxCLIExecutor`, `create_*_executor`, `SandboxConfig` | removed; use `KrunExecutor` or `DockerExecutor` |
+| `DockerExecutor`: new `docker run --rm` per command | `DockerExecutor`: one container per session, `--network none`, persistent shell |
+| snapshot / restore | removed |
+| `MCPBridge(port=..., host=...)`, `start_bridge(port)`, `MCP_BRIDGE_URL` | Unix socket only: `MCPBridge(socket_path)`, `start_bridge(socket_path)`, `MCP_BRIDGE_SOCKET` |
+| `setup_skills_directory(..., bridge_port=...)` | `bridge_socket_path=` required |
+| skills dir added to the host `PATH` | only on the sandbox's `PATH` |
+| Claude subscription fallback via `claude-agent-sdk` (tools redirected by a hook) | the `claude` CLI with every tool disabled, inside the sandbox |
+
+New dependencies: `aiohttp`, `cryptography`.
 
 ---
 

@@ -1,250 +1,151 @@
 """
-Tests for the MCP Bridge HTTP server.
+Tests for the MCP Bridge (HTTP over a Unix socket).
 """
 import asyncio
+import http.client
 import json
-import pytest
+import os
 import socket
 import tempfile
-import urllib.request
-import urllib.error
+from contextlib import contextmanager
 from pathlib import Path
 
 from agentd.mcp_bridge import MCPBridge
+
+
+class _UnixHTTPConnection(http.client.HTTPConnection):
+    def __init__(self, path: str):
+        super().__init__("localhost")
+        self._path = path
+
+    def connect(self):
+        self.sock = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+        self.sock.connect(self._path)
+
+
+def _http(sock_path, method: str, path: str, body=None):
+    """(status, json body) for one request to the bridge socket."""
+    conn = _UnixHTTPConnection(str(sock_path))
+    data = json.dumps(body).encode() if body is not None else None
+    conn.request(method, path, body=data, headers={"Content-Type": "application/json"})
+    resp = conn.getresponse()
+    return resp.status, json.loads(resp.read())
+
+
+@contextmanager
+def running_bridge(**tools):
+    with tempfile.TemporaryDirectory() as tmp:
+        bridge = MCPBridge(Path(tmp) / "bridge.sock")
+        for name, fn in tools.items():
+            bridge.register_local_tool(name, fn)
+        bridge.start_in_thread()
+        try:
+            yield bridge
+        finally:
+            bridge.stop_thread()
 
 
 class TestMCPBridgeBasics:
     """Test basic bridge functionality."""
 
     def test_bridge_starts_in_thread(self):
-        """Test bridge starts in background thread and returns port."""
-        bridge = MCPBridge(port=0)
-        port = bridge.start_in_thread()
-
-        assert port > 0, "Should return a valid port"
-        assert bridge.port == port, "Bridge should store the port"
-
-        # Health check should work
-        resp = urllib.request.urlopen(f"http://localhost:{port}/health")
-        data = json.loads(resp.read())
-        assert data["status"] == "ok"
-
-        bridge.stop_thread()
+        with running_bridge() as bridge:
+            assert bridge.socket_path.exists()
+            assert oct(bridge.socket_path.stat().st_mode & 0o777) == "0o600", "only agentd itself connects"
+            assert _http(bridge.socket_path, "GET", "/health") == (200, {"status": "ok"})
 
     def test_bridge_lists_tools(self):
-        """Test /tools endpoint lists registered tools."""
-        bridge = MCPBridge(port=0)
-        port = bridge.start_in_thread()
-
-        # Initially empty
-        resp = urllib.request.urlopen(f"http://localhost:{port}/tools")
-        data = json.loads(resp.read())
-        assert data["tools"] == []
-
-        bridge.stop_thread()
+        with running_bridge() as bridge:
+            assert _http(bridge.socket_path, "GET", "/tools") == (200, {"tools": []})
 
     def test_bridge_404_unknown_tool(self):
-        """Test calling unknown tool returns 404."""
-        bridge = MCPBridge(port=0)
-        port = bridge.start_in_thread()
-
-        req = urllib.request.Request(
-            f"http://localhost:{port}/call/nonexistent",
-            data=b"{}",
-            headers={"Content-Type": "application/json"}
-        )
-
-        try:
-            urllib.request.urlopen(req)
-            assert False, "Should have raised HTTPError"
-        except urllib.error.HTTPError as e:
-            assert e.code == 404
-            data = json.loads(e.read())
-            assert "not found" in data["error"].lower()
-
-        bridge.stop_thread()
+        with running_bridge() as bridge:
+            status, data = _http(bridge.socket_path, "POST", "/call/nonexistent", {})
+            assert status == 404 and "not found" in data["error"].lower()
 
 
 class TestMCPBridgeLocalTools:
     """Test local tool registration and calling."""
 
     def test_register_and_call_local_tool(self):
-        """Test registering and calling a local Python function."""
-        bridge = MCPBridge(port=0)
-
         def add(a: int, b: int) -> int:
             return a + b
 
-        bridge.register_local_tool("add", add)
-        port = bridge.start_in_thread()
-
-        # Check tool is listed
-        resp = urllib.request.urlopen(f"http://localhost:{port}/tools")
-        data = json.loads(resp.read())
-        assert "add" in data["tools"]
-
-        # Call the tool
-        req = urllib.request.Request(
-            f"http://localhost:{port}/call/add",
-            data=json.dumps({"a": 2, "b": 3}).encode(),
-            headers={"Content-Type": "application/json"}
-        )
-        resp = urllib.request.urlopen(req)
-        data = json.loads(resp.read())
-        assert data == 5
-
-        bridge.stop_thread()
+        with running_bridge(add=add) as bridge:
+            assert "add" in _http(bridge.socket_path, "GET", "/tools")[1]["tools"]
+            assert _http(bridge.socket_path, "POST", "/call/add", {"a": 2, "b": 3}) == (200, 5)
 
     def test_local_tool_with_string_args(self):
-        """Test local tool with string arguments."""
-        bridge = MCPBridge(port=0)
-
-        def greet(name: str) -> str:
-            return f"Hello, {name}!"
-
-        bridge.register_local_tool("greet", greet)
-        port = bridge.start_in_thread()
-
-        req = urllib.request.Request(
-            f"http://localhost:{port}/call/greet",
-            data=json.dumps({"name": "World"}).encode(),
-            headers={"Content-Type": "application/json"}
-        )
-        resp = urllib.request.urlopen(req)
-        data = json.loads(resp.read())
-        assert data == "Hello, World!"
-
-        bridge.stop_thread()
+        with running_bridge(greet=lambda name: f"Hello, {name}!") as bridge:
+            assert _http(bridge.socket_path, "POST", "/call/greet", {"name": "World"}) == (200, "Hello, World!")
 
     def test_local_tool_error_handling(self):
-        """Test local tool that raises an exception."""
-        bridge = MCPBridge(port=0)
-
         def fail():
             raise ValueError("intentional error")
 
-        bridge.register_local_tool("fail", fail)
-        port = bridge.start_in_thread()
-
-        req = urllib.request.Request(
-            f"http://localhost:{port}/call/fail",
-            data=b"{}",
-            headers={"Content-Type": "application/json"}
-        )
-
-        try:
-            urllib.request.urlopen(req)
-            assert False, "Should have raised HTTPError"
-        except urllib.error.HTTPError as e:
-            assert e.code == 500
-            data = json.loads(e.read())
-            assert "intentional error" in data["error"]
-
-        bridge.stop_thread()
+        with running_bridge(fail=fail) as bridge:
+            status, data = _http(bridge.socket_path, "POST", "/call/fail", {})
+            assert status == 500 and "intentional error" in data["error"]
 
     def test_multiple_local_tools(self):
-        """Test registering multiple local tools."""
-        bridge = MCPBridge(port=0)
-
-        bridge.register_local_tool("add", lambda a, b: a + b)
-        bridge.register_local_tool("mul", lambda a, b: a * b)
-        bridge.register_local_tool("upper", lambda s: s.upper())
-
-        port = bridge.start_in_thread()
-
-        # Check all tools listed
-        resp = urllib.request.urlopen(f"http://localhost:{port}/tools")
-        data = json.loads(resp.read())
-        assert set(data["tools"]) == {"add", "mul", "upper"}
-
-        # Call each
-        for name, args, expected in [
-            ("add", {"a": 1, "b": 2}, 3),
-            ("mul", {"a": 3, "b": 4}, 12),
-            ("upper", {"s": "hello"}, "HELLO"),
-        ]:
-            req = urllib.request.Request(
-                f"http://localhost:{port}/call/{name}",
-                data=json.dumps(args).encode(),
-                headers={"Content-Type": "application/json"}
-            )
-            resp = urllib.request.urlopen(req)
-            data = json.loads(resp.read())
-            assert data == expected, f"{name} should return {expected}"
-
-        bridge.stop_thread()
+        tools = {"add": lambda a, b: a + b, "mul": lambda a, b: a * b, "upper": lambda s: s.upper()}
+        with running_bridge(**tools) as bridge:
+            assert set(_http(bridge.socket_path, "GET", "/tools")[1]["tools"]) == {"add", "mul", "upper"}
+            for name, args, expected in [
+                ("add", {"a": 1, "b": 2}, 3),
+                ("mul", {"a": 3, "b": 4}, 12),
+                ("upper", {"s": "hello"}, "HELLO"),
+            ]:
+                assert _http(bridge.socket_path, "POST", f"/call/{name}", args) == (200, expected)
 
 
 class TestMCPBridgeAsync:
     """Test async bridge functionality."""
 
     def test_bridge_starts_async(self):
-        """Test bridge starts in async context."""
         async def run():
-            bridge = MCPBridge(port=0)
-            port = await bridge.start_async()
-
-            assert port > 0
-            assert bridge.port == port
-
-            # Verify server is listening by checking tools endpoint
-            # Use aiohttp for async HTTP (but we don't have it in test deps)
-            # Just verify the port was assigned
-            assert bridge._site is not None
-
-            await bridge.stop()
+            with tempfile.TemporaryDirectory() as tmp:
+                bridge = MCPBridge(Path(tmp) / "a.sock")
+                assert await bridge.start_async() == str(bridge.socket_path)
+                assert bridge._site is not None
+                await bridge.stop()
+                assert not bridge.socket_path.exists()
 
         asyncio.run(run())
 
     def test_async_local_tool_registration(self):
-        """Test registering async local tool."""
-        bridge = MCPBridge(port=0)
-
         async def async_add(a: int, b: int) -> int:
             await asyncio.sleep(0.01)
             return a + b
 
-        bridge.register_local_tool("async_add", async_add)
-
-        assert "async_add" in bridge.local_tools
-        assert bridge.local_tools["async_add"] is async_add
+        with running_bridge(async_add=async_add) as bridge:
+            assert bridge.local_tools["async_add"] is async_add
+            assert _http(bridge.socket_path, "POST", "/call/async_add", {"a": 4, "b": 5}) == (200, 9)
 
 
 class TestMCPBridgeFromGeneratedCode:
-    """Test calling bridge the way generated tools.py does."""
+    """Call the bridge through the real generated lib/tools.py."""
 
-    def test_call_pattern_matches_generated_code(self):
-        """Test the _call pattern used in generated lib/tools.py."""
-        bridge = MCPBridge(port=0)
+    def test_generated_tools_module_calls_bridge_over_socket(self, monkeypatch):
+        from agentd.ptc import generate_tools_module
 
-        def read_file(path: str) -> str:
-            return f"contents of {path}"
+        schema = {"description": "Read a file", "parameters": {"type": "object", "properties": {
+            "path": {"type": "string"}, "optional_arg": {"type": "string"}}, "required": ["path"]}}
+        with running_bridge(read_file=lambda path: f"contents of {path}") as bridge:
+            namespace: dict = {}
+            monkeypatch.setenv("MCP_BRIDGE_SOCKET", str(bridge.socket_path))
+            exec(generate_tools_module({"read_file": schema}), namespace)
+            assert namespace["read_file"](path="/etc/hosts") == "contents of /etc/hosts"
+            # None values are filtered out before calling.
+            assert namespace["_call"]("read_file", path="/tmp/test", optional_arg=None) == "contents of /tmp/test"
 
-        bridge.register_local_tool("read_file", read_file)
-        port = bridge.start_in_thread()
+    def test_generated_tools_module_without_bridge_reports_error(self, monkeypatch):
+        from agentd.ptc import generate_tools_module
 
-        # This mimics how generated tools.py calls the bridge
-        def _call(name: str, **kwargs):
-            filtered = {k: v for k, v in kwargs.items() if v is not None}
-            req = urllib.request.Request(
-                f"http://localhost:{port}/call/{name}",
-                data=json.dumps(filtered).encode(),
-                headers={"Content-Type": "application/json"}
-            )
-            try:
-                with urllib.request.urlopen(req) as resp:
-                    return json.loads(resp.read())
-            except urllib.error.HTTPError as e:
-                return {"error": f"HTTP {e.code}: {e.reason}"}
-
-        result = _call("read_file", path="/etc/hosts")
-        assert result == "contents of /etc/hosts"
-
-        # Test with None values filtered
-        result = _call("read_file", path="/tmp/test", optional_arg=None)
-        assert result == "contents of /tmp/test"
-
-        bridge.stop_thread()
+        monkeypatch.delenv("MCP_BRIDGE_SOCKET", raising=False)
+        namespace: dict = {}
+        exec(generate_tools_module({}), namespace)
+        assert "not available" in namespace["_call"]("anything")["error"]
 
 
 class TestMCPBridgeUnixSocket:
@@ -370,7 +271,6 @@ class TestMCPBridgeUnixSocket:
             bridge = MCPBridge(socket_path=socket_path)
 
             assert bridge.socket_path == socket_path
-            assert bridge.port == 0  # Port ignored in socket mode
 
     def test_socket_thread_mode_returns_path(self):
         """Test start_in_thread returns socket path."""

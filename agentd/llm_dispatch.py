@@ -1,26 +1,18 @@
 """Smart LLM-call dispatch.
 
 agentd's ``patch_openai_with_ptc`` historically routed every call through
-LiteLLM (any vendor as long as you supply the right API key). That works
-for most cases, but it doesn't take advantage of an *already-authenticated*
-Claude Code CLI session — the same one the user runs locally to use their
-Claude Pro / Max subscription. So Claude subscribers without an API key
-get errors instead of subscription-billed answers.
+LiteLLM (any vendor as long as you supply the right API key). That leaves
+Claude Pro / Max subscribers without an API key out, so ``smart_completion``
+/ ``smart_acompletion`` dispatch:
 
-This module wraps LiteLLM behind ``smart_completion`` / ``smart_acompletion``
-that transparently dispatch:
-
-  * ``model="gpt-*"`` (or any non-claude provider) →   LiteLLM.
-  * ``model="claude-*"`` + ``ANTHROPIC_API_KEY`` set → LiteLLM (existing path).
-  * ``model="claude-*"`` + no key but ``claude`` CLI logged in →
-    ``claude_agent_sdk.query(...)`` for subscription-billed access.
-    The streaming messages from the SDK are flattened into a single OpenAI
-    ``ChatCompletion``-shaped object so downstream code is unchanged.
-
-Streaming (``stream=True``) is **not** supported through the claude-sdk
-route in this v1 — it still goes through LiteLLM. If the model is claude-*
-and there's no API key, ``smart_completion(stream=True)`` raises with a
-clear message asking the user to set ``ANTHROPIC_API_KEY``.
+  * ``model="gpt-*"`` (or any non-claude provider) ->   LiteLLM.
+  * ``model="claude-*"`` + ``ANTHROPIC_API_KEY`` set -> LiteLLM.
+  * ``model="claude-*"`` + no key -> the ``claude`` CLI as a pure model
+    transport (``claude -p --output-format stream-json`` with every built-in
+    tool disabled), billed to the subscription. With a sandbox executor it
+    runs inside the sandbox, whose host proxy adds the credential; otherwise
+    it runs the host's logged-in CLI. Its text is returned as an OpenAI
+    ``ChatCompletion`` so downstream code is unchanged.
 """
 from __future__ import annotations
 
@@ -40,7 +32,7 @@ class _DualAccess(dict):
     LiteLLM returns dict-shaped responses that agentd accesses two ways:
     via attribute (`response.choices[0].message.content`) and via subscript
     (`response['choices'][0]['message']['content']`). Real LiteLLM
-    ``ModelResponse`` objects support both. Our hand-built claude-sdk
+    ``ModelResponse`` objects support both. Our hand-built claude CLI
     responses need to do the same.
     """
 
@@ -102,7 +94,13 @@ def _claude_cli_available() -> bool:
         return False
 
 
-def _should_route_to_claude_sdk(model: str | None, api_key: str | None) -> bool:
+def _in_sandbox(executor: Any) -> bool:
+    from agentd.sandbox.executor import SandboxExecutor
+
+    return isinstance(executor, SandboxExecutor)
+
+
+def _should_route_to_claude_cli(model: str | None, api_key: str | None, executor: Any = None) -> bool:
     if not _is_claude_model(model):
         return False
     # If the caller already has an Anthropic key, LiteLLM works and is faster.
@@ -110,15 +108,15 @@ def _should_route_to_claude_sdk(model: str | None, api_key: str | None) -> bool:
         return False
     if os.environ.get("ANTHROPIC_API_KEY") or os.environ.get("ANTHROPIC_AUTH_TOKEN"):
         return False
-    return _claude_cli_available()
+    return _in_sandbox(executor) or _claude_cli_available()
 
 
 def _flatten_messages_to_prompt(messages: list[dict[str, Any]]) -> tuple[str | None, str]:
     """Split an OpenAI chat-style messages list into (system_prompt, user_prompt).
 
-    The claude-agent-sdk takes a single prompt string + a separate system
-    prompt; multi-turn conversation history is encoded inline into the user
-    prompt with simple ``Role: text`` lines. For PTC-style usage this is
+    ``claude -p`` takes a single prompt (stdin) + a separate system prompt;
+    multi-turn conversation history is encoded inline into the user prompt
+    with simple ``Role: text`` lines. For PTC-style usage this is
     sufficient — the conversation tends to be one system + one user message.
     """
     system_parts: list[str] = []
@@ -161,7 +159,7 @@ def _make_openai_shaped_response(content: str, model: str) -> _DualAccess:
     )
     usage = _DualAccess(prompt_tokens=0, completion_tokens=0, total_tokens=0)
     return _DualAccess(
-        id="chatcmpl-claude-sdk",
+        id="chatcmpl-claude-cli",
         object="chat.completion",
         model=model,
         choices=[choice],
@@ -188,208 +186,91 @@ def _make_openai_shaped_chunk(
         finish_reason=finish_reason,
     )
     return _DualAccess(
-        id="chatcmpl-claude-sdk-stream",
+        id="chatcmpl-claude-cli-stream",
         object="chat.completion.chunk",
         model=model,
         choices=[choice],
     )
 
 
-def _build_claude_options(messages: list[dict[str, Any]], kwargs: dict[str, Any]):
-    """Translate OpenAI-style messages + extras into a ClaudeAgentOptions object.
+def _transport_argv(model: str, system_prompt: str | None, kwargs: dict[str, Any]) -> list[str]:
+    """``claude -p`` arguments for the PTC model transport.
 
-    When an ``executor`` is supplied, we attach a ``PreToolUse`` hook that
-    intercepts the SDK's native ``Bash`` calls and routes them through that
-    executor. Claude's bash commands run in agentd's configured sandbox
-    (Docker, sandbox-runtime, …) instead of escaping to the host. Write /
-    Edit / NotebookEdit are denied outright by default since PTC has no
-    transformation for them. Callers can override either list explicitly.
+    PTC parses code fences out of the text and runs them through its own
+    executor, so every built-in Claude Code tool is disabled (``--tools ""``),
+    no MCP servers load, and no user/project settings, CLAUDE.md or skills
+    leak into the prompt. ``claude_tools`` / ``setting_sources`` /
+    ``allowed_tools`` / ``disallowed_tools`` override explicitly.
     """
-    from claude_agent_sdk import ClaudeAgentOptions, HookMatcher
+    from agentd.harness.claude_cli import claude_argv
+
+    extra: list[str] = []
+    if "allowed_tools" in kwargs:
+        extra += ["--allowedTools", ",".join(kwargs["allowed_tools"])]
+    if "disallowed_tools" in kwargs:
+        extra += ["--disallowedTools", ",".join(kwargs["disallowed_tools"])]
+    bare = model.split("/", 1)[1] if model.startswith("anthropic/") else model
+    return claude_argv(
+        model=bare,
+        system_prompt=system_prompt,
+        tools=list(kwargs.get("claude_tools", [])),
+        setting_sources=list(kwargs.get("setting_sources", [])),
+        strict_mcp_config=True,
+        extra_args=extra,
+    )
+
+
+async def _claude_cli_events(model: str, messages: list[dict[str, Any]], **kwargs):
+    """Run one transport turn; yields HarnessEvents (text, ..., result)."""
+    from agentd.harness import claude_cli
 
     system_prompt, user_prompt = _flatten_messages_to_prompt(messages)
-    options_kwargs: dict[str, Any] = {}
-    if system_prompt:
-        options_kwargs["system_prompt"] = system_prompt
-    cwd = kwargs.get("cwd")
-    if cwd is not None:
-        options_kwargs["cwd"] = str(cwd)
-    # SDK isolation: when an OpenAI-surface call gets auto-routed through
-    # claude-agent-sdk, we don't want the user's local Claude Code config
-    # (~/.claude/settings.json, project-level CLAUDE.md, installed skills,
-    # …) to leak into the agent's prompt — they pollute the model's view of
-    # what tools/skills are available. Caller can opt back in by passing
-    # ``setting_sources`` or ``skills`` explicitly.
-    if "setting_sources" in kwargs:
-        options_kwargs["setting_sources"] = kwargs["setting_sources"]
+    argv = _transport_argv(model, system_prompt, kwargs)
+    executor, cwd = kwargs.get("executor"), kwargs.get("cwd")
+    if _in_sandbox(executor):
+        session = await executor.ensure_session(cwd or ".")
+        events = claude_cli.run_in_sandbox(executor, argv, user_prompt, cwd=str(session.workspace))
     else:
-        options_kwargs["setting_sources"] = []
-    if "skills" in kwargs:
-        options_kwargs["skills"] = kwargs["skills"]
-    else:
-        options_kwargs["skills"] = []
-
-    executor = kwargs.get("executor")
-    if executor is not None:
-        bash_hook = _make_bash_to_executor_hook(executor, cwd)
-        options_kwargs["hooks"] = {
-            "PreToolUse": [HookMatcher(matcher="Bash", hooks=[bash_hook])]
-        }
-        # Bash is allowed because the hook re-routes it through executor.
-        default_disallowed = ["Write", "Edit", "NotebookEdit"]
-    else:
-        # No executor wired in → block native Bash/Write/Edit entirely so
-        # PTC's text/code-fence pattern is the only execution path.
-        default_disallowed = ["Bash", "Write", "Edit", "NotebookEdit"]
-
-    if "disallowed_tools" in kwargs:
-        options_kwargs["disallowed_tools"] = list(kwargs["disallowed_tools"])
-    else:
-        options_kwargs["disallowed_tools"] = default_disallowed
-    if "allowed_tools" in kwargs:
-        options_kwargs["allowed_tools"] = list(kwargs["allowed_tools"])
-    return user_prompt, ClaudeAgentOptions(**options_kwargs)
+        events = claude_cli.run_on_host(argv, user_prompt, cwd=cwd)
+    async for event in events:
+        if event.kind == "result" and event.is_error:
+            raise RuntimeError(f"claude CLI transport failed: {event.text}")
+        yield event
 
 
-def _extract_text_pieces(message: Any) -> list[str]:
-    """Pull every TextBlock-shaped string out of a single SDK message."""
-    pieces: list[str] = []
-    content = getattr(message, "content", None)
-    if content is None:
-        txt = getattr(message, "text", None)
-        if txt:
-            pieces.append(txt)
-        return pieces
-    if isinstance(content, str):
-        if content:
-            pieces.append(content)
-        return pieces
-    if isinstance(content, list):
-        for block in content:
-            t = getattr(block, "text", None)
-            if t:
-                pieces.append(t)
-    return pieces
-
-
-async def _call_claude_sdk(model: str, messages: list[dict[str, Any]], **kwargs) -> _DualAccess:
-    """Run a single non-streaming Claude SDK turn, return an OpenAI-shaped response."""
-    try:
-        from claude_agent_sdk import query
-    except ImportError as e:  # pragma: no cover
-        raise RuntimeError(
-            "Routing to the Claude Agent SDK requires `claude-agent-sdk` to be "
-            "installed (pip install claude-agent-sdk)."
-        ) from e
-
-    user_prompt, options = _build_claude_options(messages, kwargs)
-    parts: list[str] = []
-    async for message in query(prompt=user_prompt, options=options):
-        parts.extend(_extract_text_pieces(message))
+async def _call_claude_cli(model: str, messages: list[dict[str, Any]], **kwargs) -> _DualAccess:
+    """Run a single non-streaming turn, return an OpenAI-shaped response."""
+    parts = [e.text async for e in _claude_cli_events(model, messages, **kwargs) if e.kind == "text"]
     content = "\n".join(parts).strip() or "(no response)"
     return _make_openai_shaped_response(content, model)
 
 
-async def _claude_sdk_stream_async(model: str, messages: list[dict[str, Any]], **kwargs):
-    """Async generator: yield OpenAI-shaped chunks from a claude-sdk query.
-
-    Iterates the SDK's stream in real time. Each TextBlock becomes a chunk
-    with ``delta.content`` set; on completion a final chunk with
-    ``finish_reason="stop"`` is emitted. Tool-use blocks are skipped — PTC
-    parses code fences out of the text content, not native tool calls.
-    """
-    try:
-        from claude_agent_sdk import query
-    except ImportError as e:  # pragma: no cover
-        raise RuntimeError(
-            "Routing to the Claude Agent SDK requires `claude-agent-sdk`."
-        ) from e
-
-    user_prompt, options = _build_claude_options(messages, kwargs)
+async def _claude_cli_stream_async(model: str, messages: list[dict[str, Any]], **kwargs):
+    """Async generator: yield OpenAI-shaped chunks, one per assistant text block."""
     first = True
-    async for message in query(prompt=user_prompt, options=options):
-        for piece in _extract_text_pieces(message):
-            yield _make_openai_shaped_chunk(piece, model, include_role=first)
+    async for event in _claude_cli_events(model, messages, **kwargs):
+        if event.kind == "text" and event.text:
+            yield _make_openai_shaped_chunk(event.text, model, include_role=first)
             first = False
     yield _make_openai_shaped_chunk(None, model, finish_reason="stop", include_role=first)
 
 
-def _claude_sdk_stream_sync(model: str, messages: list[dict[str, Any]], **kwargs):
-    """Sync generator wrapping the async stream.
-
-    The SDK is async-native; we buffer the async generator into a list and
-    yield it synchronously. Total wall-clock latency is the same as the
-    non-streaming path — chunks arrive at the end, not as they're produced
-    — but the iteration contract matches what ``litellm.completion(stream=True)``
-    would return, so callers don't need to change.
-
-    Use the async path (``smart_acompletion``) if you want true incremental
-    streaming through the claude-sdk route.
-    """
+def _claude_cli_stream_sync(model: str, messages: list[dict[str, Any]], **kwargs):
+    """Sync generator wrapping the async stream (buffered; use the async path
+    for incremental streaming)."""
     collected: list[_DualAccess] = []
 
     async def _collect() -> None:
-        async for chunk in _claude_sdk_stream_async(model, messages, **kwargs):
+        async for chunk in _claude_cli_stream_async(model, messages, **kwargs):
             collected.append(chunk)
 
     _run_async(_collect())
     yield from collected
 
 
-# Keys consumed by the claude-sdk path but not understood by LiteLLM. We strip
+# Keys consumed by the claude CLI path but not understood by LiteLLM. We strip
 # them before forwarding so LiteLLM doesn't surface "unexpected keyword" errors.
-_AGENTD_ONLY_KWARGS = ("cwd", "allowed_tools", "disallowed_tools", "executor")
-
-
-def _make_bash_to_executor_hook(executor: Any, cwd: Any):
-    """PreToolUse hook that re-runs Bash commands through ``executor``.
-
-    The SDK's native Bash tool would otherwise execute on the host without
-    any of agentd's sandbox configuration (no Docker isolation, no cwd
-    scope, etc.). Instead we:
-
-      1. Run the requested command through ``executor`` (which respects
-         whatever agentd config the user wired up).
-      2. Stash the captured output in a temp file on the host.
-      3. Mutate the SDK's tool input so its Bash call becomes
-         ``cat /tmp/agentd_xxx; exit <code>``. The SDK's Bash still runs,
-         but it just prints the executor's output and exits with its
-         exit code, so the model sees a normal tool result.
-
-    Outputs flow through ``stdout`` only — executors already merge stderr
-    into stdout, so the model sees the same combined stream it would have
-    seen from the executor directly.
-    """
-    import tempfile
-    from pathlib import Path as _Path
-    import shlex
-
-    cwd_path = _Path(cwd) if cwd else _Path(".")
-
-    async def _hook(input_data, tool_use_id, context):
-        if input_data.get("tool_name") != "Bash":
-            return {}
-        cmd = input_data.get("tool_input", {}).get("command", "")
-        if hasattr(executor, "execute_bash_async"):
-            output, code = await executor.execute_bash_async(cmd, cwd_path)
-        else:
-            output, code = executor.execute_bash(cmd, cwd_path)
-        # Stash the captured output where the SDK's Bash can read it back.
-        with tempfile.NamedTemporaryFile(
-            mode="w", prefix="agentd_", suffix=".txt", delete=False
-        ) as f:
-            f.write(output)
-            tmp_path = f.name
-        new_cmd = f"cat {shlex.quote(tmp_path)}; exit {int(code)}"
-        return {
-            "hookSpecificOutput": {
-                "hookEventName": "PreToolUse",
-                "permissionDecision": "allow",
-                "updatedInput": {"command": new_cmd},
-            }
-        }
-
-    return _hook
+_AGENTD_ONLY_KWARGS = ("cwd", "allowed_tools", "disallowed_tools", "executor", "claude_tools", "setting_sources")
 
 
 def _strip_for_litellm(kwargs: dict[str, Any]) -> dict[str, Any]:
@@ -397,27 +278,27 @@ def _strip_for_litellm(kwargs: dict[str, Any]) -> dict[str, Any]:
 
 
 def smart_completion(*, model: str, messages: list[dict[str, Any]], api_key: str | None = None, stream: bool = False, **kwargs) -> Any:
-    """Drop-in sync replacement for ``litellm.completion`` with claude-sdk fallback."""
+    """Drop-in sync replacement for ``litellm.completion`` with claude CLI fallback."""
     if stream:
-        if _should_route_to_claude_sdk(model, api_key):
-            return _claude_sdk_stream_sync(model, messages, **kwargs)
+        if _should_route_to_claude_cli(model, api_key, kwargs.get("executor")):
+            return _claude_cli_stream_sync(model, messages, **kwargs)
         return litellm.completion(model=model, messages=messages, api_key=api_key, stream=True, **_strip_for_litellm(kwargs))
 
-    if _should_route_to_claude_sdk(model, api_key):
-        return _run_async(_call_claude_sdk(model, messages, **kwargs))
+    if _should_route_to_claude_cli(model, api_key, kwargs.get("executor")):
+        return _run_async(_call_claude_cli(model, messages, **kwargs))
 
     return litellm.completion(model=model, messages=messages, api_key=api_key, **_strip_for_litellm(kwargs))
 
 
 async def smart_acompletion(*, model: str, messages: list[dict[str, Any]], api_key: str | None = None, stream: bool = False, **kwargs) -> Any:
-    """Drop-in async replacement for ``litellm.acompletion`` with claude-sdk fallback."""
+    """Drop-in async replacement for ``litellm.acompletion`` with claude CLI fallback."""
     if stream:
-        if _should_route_to_claude_sdk(model, api_key):
-            return _claude_sdk_stream_async(model, messages, **kwargs)
+        if _should_route_to_claude_cli(model, api_key, kwargs.get("executor")):
+            return _claude_cli_stream_async(model, messages, **kwargs)
         return await litellm.acompletion(model=model, messages=messages, api_key=api_key, stream=True, **_strip_for_litellm(kwargs))
 
-    if _should_route_to_claude_sdk(model, api_key):
-        return await _call_claude_sdk(model, messages, **kwargs)
+    if _should_route_to_claude_cli(model, api_key, kwargs.get("executor")):
+        return await _call_claude_cli(model, messages, **kwargs)
 
     return await litellm.acompletion(model=model, messages=messages, api_key=api_key, **_strip_for_litellm(kwargs))
 

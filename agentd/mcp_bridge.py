@@ -1,12 +1,11 @@
 # agentd/mcp_bridge.py
 """
-HTTP/Unix Socket Bridge for MCP tool calls.
+Unix-socket bridge for MCP tool calls.
 
-Provides a local server that proxies tool calls to MCP servers,
-allowing skill scripts to call MCP tools via HTTP or Unix socket requests.
-
-Unix socket mode is preferred for sandboxed execution where network
-namespaces may be isolated from the host.
+A small HTTP server on a host Unix socket that proxies tool calls to MCP
+servers (and local @tool functions), so skill scripts can call them. Sandboxed
+code reaches it through its sandbox's ``bridge`` endpoint, which agentd tunnels
+to this socket; nothing listens on the network.
 """
 
 import asyncio
@@ -23,47 +22,34 @@ logger = logging.getLogger(__name__)
 
 
 class MCPBridge:
-    """Local HTTP/Unix socket server that proxies MCP tool calls."""
+    """Unix-socket HTTP server that proxies MCP tool calls."""
 
     def __init__(
         self,
-        port: int = 0,
-        socket_path: str | Path | None = None,
+        socket_path: str | Path,
         main_loop: asyncio.AbstractEventLoop | None = None,
-        host: str = '127.0.0.1'
     ):
         """
         Initialize the MCP bridge.
 
         Args:
-            port: Port to listen on (0 = auto-assign). Ignored if socket_path is set.
-            socket_path: Path for Unix socket. If set, uses Unix socket instead of TCP.
+            socket_path: Path of the Unix socket to listen on.
             main_loop: The event loop where MCP connections were established.
                        Tool calls will be dispatched to this loop.
-            host: Interface to bind in TCP mode. Defaults to loopback; the bridge
-                  has no auth, so only widen this (e.g. '0.0.0.0') if sandboxed
-                  code must reach it from another network namespace.
         """
-        self.port = port
-        self.host = host
-        self.socket_path = Path(socket_path) if socket_path else None
+        self.socket_path = Path(socket_path)
         self.servers: dict[str, Any] = {}  # tool_name -> server connection
         self.local_tools: dict[str, callable] = {}  # tool_name -> function
         self._runner: web.AppRunner | None = None
-        self._site: web.TCPSite | web.UnixSite | None = None
+        self._site: web.UnixSite | None = None
         self._thread: threading.Thread | None = None
         self._loop: asyncio.AbstractEventLoop | None = None  # Bridge's own loop
         self._stop_event: asyncio.Event | None = None  # Signals run_server to exit cleanly
         self._main_loop: asyncio.AbstractEventLoop | None = main_loop  # MCP connection loop
         self._started = threading.Event()
 
-    async def start(self) -> int | str:
-        """
-        Start the bridge server.
-
-        Returns:
-            The port number (TCP mode) or socket path (Unix socket mode).
-        """
+    async def start(self) -> str:
+        """Start the bridge server; returns the socket path."""
         app = web.Application()
         app.router.add_post('/call/{tool_name}', self.handle_call)
         app.router.add_get('/tools', self.handle_list_tools)
@@ -72,47 +58,29 @@ class MCPBridge:
         self._runner = web.AppRunner(app)
         await self._runner.setup()
 
-        if self.socket_path:
-            # Unix socket mode
-            # Remove existing socket file if present
-            if self.socket_path.exists():
-                self.socket_path.unlink()
-            # Ensure parent directory exists
-            self.socket_path.parent.mkdir(parents=True, exist_ok=True)
+        if self.socket_path.exists():
+            self.socket_path.unlink()
+        self.socket_path.parent.mkdir(parents=True, exist_ok=True)
+        self._site = web.UnixSite(self._runner, str(self.socket_path))
+        await self._site.start()
+        # Only agentd itself connects (sandboxes reach it via their tunnel).
+        os.chmod(self.socket_path, 0o600)
 
-            self._site = web.UnixSite(self._runner, str(self.socket_path))
-            await self._site.start()
-
-            # Make socket world-accessible (for sandboxed processes)
-            os.chmod(self.socket_path, 0o777)
-
-            logger.info(f"MCP Bridge started on unix://{self.socket_path}")
-            return str(self.socket_path)
-        else:
-            # TCP mode
-            self._site = web.TCPSite(self._runner, self.host, self.port)
-            await self._site.start()
-
-            # Get the actual port if auto-assigned
-            actual_port = self._site._server.sockets[0].getsockname()[1]
-            self.port = actual_port
-
-            logger.info(f"MCP Bridge started on http://localhost:{actual_port}")
-            return actual_port
+        logger.info(f"MCP Bridge started on unix://{self.socket_path}")
+        return str(self.socket_path)
 
     async def stop(self):
         """Stop the bridge server."""
         if self._runner:
             await self._runner.cleanup()
-            # Clean up socket file if using Unix socket
-            if self.socket_path and self.socket_path.exists():
+            if self.socket_path.exists():
                 try:
                     self.socket_path.unlink()
                 except OSError:
                     pass
             logger.info("MCP Bridge stopped")
 
-    def start_in_thread(self) -> int | str:
+    def start_in_thread(self) -> str:
         """
         Start the bridge server in a background thread.
 
@@ -120,7 +88,7 @@ class MCPBridge:
         to the bridge from the main thread.
 
         Returns:
-            The port number (TCP mode) or socket path (Unix socket mode).
+            The socket path.
         """
         def run_server():
             self._loop = asyncio.new_event_loop()
@@ -140,9 +108,9 @@ class MCPBridge:
 
         # Wait for server to start
         self._started.wait(timeout=10)
-        return str(self.socket_path) if self.socket_path else self.port
+        return str(self.socket_path)
 
-    async def start_async(self) -> int | str:
+    async def start_async(self) -> str:
         """
         Start the bridge server in the current async context.
 
@@ -150,7 +118,7 @@ class MCPBridge:
         operations (like subprocess execution) are awaited.
 
         Returns:
-            The port number (TCP mode) or socket path (Unix socket mode).
+            The socket path.
         """
         result = await self.start()
         self._started.set()
@@ -253,11 +221,11 @@ class MCPBridge:
 _bridge: MCPBridge | None = None
 
 
-async def start_bridge(port: int = 0) -> MCPBridge:
+async def start_bridge(socket_path: str | Path) -> MCPBridge:
     """Start a global MCP bridge instance."""
     global _bridge
     if _bridge is None:
-        _bridge = MCPBridge(port=port)
+        _bridge = MCPBridge(socket_path)
         await _bridge.start()
     return _bridge
 

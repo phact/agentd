@@ -340,7 +340,7 @@ To execute code, use fenced blocks:
         # Check tools.py has MCP tool bindings
         tools_content = (lib_dir / "tools.py").read_text()
         assert "def _call(" in tools_content, "tools.py should have _call helper"
-        assert "MCP_BRIDGE_URL" in tools_content, "tools.py should reference MCP bridge"
+        assert "MCP_BRIDGE_SOCKET" in tools_content, "tools.py should reference the MCP bridge socket"
 
         # MCP server skill directory (filesystem)
         skill_dirs = [d for d in skills_dir.iterdir() if d.is_dir() and d.name != "lib"]
@@ -444,7 +444,8 @@ def test_skills_cli_created():
         skills_dir = Path(tmpdir) / "skills"
 
         async def run():
-            return await setup_skills_directory(skills_dir, mcp_servers=None, server_cache={})
+            return await setup_skills_directory(skills_dir, mcp_servers=None, server_cache={},
+                                                bridge_socket_path=Path(tmpdir) / "bridge.sock")
 
         asyncio.run(run())
 

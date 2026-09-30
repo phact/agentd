@@ -798,247 +798,6 @@ class Executor(Protocol):
         ...
 
 
-class SubprocessExecutor:
-    """Default executor using subprocess with persistent shell session."""
-
-    def __init__(self, timeout: int = 60):
-        self.timeout = timeout
-        self._shell: subprocess.Popen | None = None
-        self._shell_cwd: Path | None = None
-
-    def _get_shell(self, cwd: Path) -> subprocess.Popen:
-        """Get or create persistent shell for the given cwd."""
-        # If shell exists and cwd matches, reuse it
-        if self._shell and self._shell.poll() is None and self._shell_cwd == cwd:
-            return self._shell
-
-        # Close old shell if exists
-        if self._shell:
-            self._shell.terminate()
-            try:
-                self._shell.wait(timeout=2)
-            except subprocess.TimeoutExpired:
-                self._shell.kill()
-
-        # Start new shell with minimal prompt to reduce noise
-        skills_dir = os.environ.get('PTC_SKILLS_DIR', str(cwd / 'skills'))
-        env = {
-            **os.environ,
-            'MCP_BRIDGE_URL': os.environ.get('MCP_BRIDGE_URL', 'http://localhost:8765'),
-            'PS1': '',  # Empty prompt
-            'PS2': '',
-            'PATH': f"{skills_dir}:{os.environ.get('PATH', '')}",
-        }
-        self._shell = subprocess.Popen(
-            ['bash', '--norc', '--noprofile'],
-            stdin=subprocess.PIPE,
-            stdout=subprocess.PIPE,
-            stderr=subprocess.STDOUT,
-            cwd=cwd,
-            text=True,
-            bufsize=1,
-            env=env
-        )
-        self._shell_cwd = cwd
-        return self._shell
-
-    def execute_bash(self, command: str, cwd: Path) -> tuple[str, int]:
-        """Run bash command in persistent shell session."""
-        import uuid
-        import time
-        import fcntl
-
-        try:
-            shell = self._get_shell(cwd)
-
-            # Use unique marker to detect end of output
-            marker = f"__END_{uuid.uuid4().hex[:8]}__"
-
-            # Send command with marker and exit code capture
-            full_cmd = f'{command}\necho "{marker}$?"\n'
-            shell.stdin.write(full_cmd)
-            shell.stdin.flush()
-
-            # Set stdout to non-blocking
-            fd = shell.stdout.fileno()
-            fl = fcntl.fcntl(fd, fcntl.F_GETFL)
-            fcntl.fcntl(fd, fcntl.F_SETFL, fl | os.O_NONBLOCK)
-
-            # Read output until we see the marker
-            output = ""
-            exit_code = 0
-            deadline = time.time() + self.timeout
-
-            while time.time() < deadline:
-                try:
-                    chunk = shell.stdout.read(4096)
-                    if chunk:
-                        output += chunk
-                        if marker in output:
-                            break
-                except BlockingIOError:
-                    pass
-                time.sleep(0.05)
-            else:
-                return f"Command timed out after {self.timeout}s", 1
-
-            # Parse output - split on marker
-            if marker in output:
-                parts = output.split(marker)
-                output = parts[0].rstrip('\n')
-                try:
-                    exit_code = int(parts[1].strip().split('\n')[0])
-                except (ValueError, IndexError):
-                    exit_code = 0
-
-            return output, exit_code
-
-        except Exception as e:
-            return f"Error executing command: {e}", 1
-
-    def execute_python(self, code: str, cwd: Path, pythonpath: Path | None = None) -> tuple[str, int]:
-        """Run Python code by writing to temp file and executing."""
-        import tempfile
-        try:
-            # Write code to temp file in cwd
-            with tempfile.NamedTemporaryFile(
-                mode='w', suffix='.py', dir=cwd, delete=False
-            ) as f:
-                f.write(code)
-                temp_path = f.name
-
-            try:
-                env = {
-                    **os.environ,
-                    'MCP_BRIDGE_URL': os.environ.get('MCP_BRIDGE_URL', 'http://localhost:8765')
-                }
-                # Add pythonpath for imports (e.g. skills/_lib)
-                if pythonpath:
-                    existing = os.environ.get('PYTHONPATH', '')
-                    env['PYTHONPATH'] = f"{pythonpath}:{existing}" if existing else str(pythonpath)
-
-                result = subprocess.run(
-                    ['python', temp_path],
-                    cwd=cwd,
-                    capture_output=True,
-                    text=True,
-                    timeout=self.timeout,
-                    env=env
-                )
-                output = result.stdout
-                if result.stderr:
-                    output += f"\n{result.stderr}" if output else result.stderr
-                return output.strip(), result.returncode
-            finally:
-                # Clean up temp file
-                Path(temp_path).unlink(missing_ok=True)
-        except subprocess.TimeoutExpired:
-            return f"Python execution timed out after {self.timeout}s", 1
-        except Exception as e:
-            return f"Error executing Python: {e}", 1
-
-    def close(self):
-        """Close the persistent shell."""
-        if self._shell:
-            self._shell.terminate()
-            try:
-                self._shell.wait(timeout=2)
-            except subprocess.TimeoutExpired:
-                self._shell.kill()
-            self._shell = None
-
-    def create_file(self, filename: str, content: str, cwd: Path) -> str:
-        """Create a file in the working directory."""
-        try:
-            filepath = cwd / filename
-            filepath.parent.mkdir(parents=True, exist_ok=True)
-            filepath.write_text(content)
-            return f"Created file: {filename}"
-        except Exception as e:
-            return f"Error creating file {filename}: {e}"
-
-    async def execute_python_async(self, code: str, cwd: Path, pythonpath: Path | None = None) -> tuple[str, int]:
-        """Run Python code asynchronously (keeps event loop running for MCP calls)."""
-        import tempfile
-        try:
-            # Write code to temp file in cwd
-            with tempfile.NamedTemporaryFile(
-                mode='w', suffix='.py', dir=cwd, delete=False
-            ) as f:
-                f.write(code)
-                temp_path = f.name
-
-            try:
-                env = {
-                    **os.environ,
-                    'MCP_BRIDGE_URL': os.environ.get('MCP_BRIDGE_URL', 'http://localhost:8765')
-                }
-                if pythonpath:
-                    existing = os.environ.get('PYTHONPATH', '')
-                    env['PYTHONPATH'] = f"{pythonpath}:{existing}" if existing else str(pythonpath)
-
-                proc = await asyncio.create_subprocess_exec(
-                    'python', temp_path,
-                    cwd=cwd,
-                    stdout=asyncio.subprocess.PIPE,
-                    stderr=asyncio.subprocess.PIPE,
-                    env=env
-                )
-
-                try:
-                    stdout, stderr = await asyncio.wait_for(
-                        proc.communicate(),
-                        timeout=self.timeout
-                    )
-                    output = stdout.decode()
-                    if stderr:
-                        err = stderr.decode()
-                        output += f"\n{err}" if output else err
-                    return output.strip(), proc.returncode or 0
-                except asyncio.TimeoutError:
-                    proc.kill()
-                    await proc.wait()
-                    return f"Python execution timed out after {self.timeout}s", 1
-            finally:
-                Path(temp_path).unlink(missing_ok=True)
-        except Exception as e:
-            return f"Error executing Python: {e}", 1
-
-    async def execute_bash_async(self, command: str, cwd: Path) -> tuple[str, int]:
-        """Run bash command asynchronously (keeps event loop running for MCP calls)."""
-        try:
-            skills_dir = os.environ.get('PTC_SKILLS_DIR', str(cwd / 'skills'))
-            env = {
-                **os.environ,
-                'MCP_BRIDGE_URL': os.environ.get('MCP_BRIDGE_URL', 'http://localhost:8765'),
-                'PATH': f"{skills_dir}:{os.environ.get('PATH', '')}",
-            }
-            proc = await asyncio.create_subprocess_shell(
-                command,
-                cwd=cwd,
-                stdout=asyncio.subprocess.PIPE,
-                stderr=asyncio.subprocess.PIPE,
-                env=env,
-            )
-
-            try:
-                stdout, stderr = await asyncio.wait_for(
-                    proc.communicate(),
-                    timeout=self.timeout
-                )
-                output = stdout.decode()
-                if stderr:
-                    err = stderr.decode()
-                    output += f"\n{err}" if output else err
-                return output.strip(), proc.returncode or 0
-            except asyncio.TimeoutError:
-                proc.kill()
-                await proc.wait()
-                return f"Command timed out after {self.timeout}s", 1
-        except Exception as e:
-            return f"Error executing command: {e}", 1
-
-
 # =============================================================================
 # Skill Generator - Creates skills from MCP tools and @tool functions
 # =============================================================================
@@ -1091,17 +850,15 @@ def {name}({sig}) -> dict:
 '''
 
 
-def generate_tools_module(tools: dict[str, dict], bridge_port: int = 8765) -> str:
+def generate_tools_module(tools: dict[str, dict]) -> str:
     """Generate the complete tools.py module with all tool functions."""
     header = f'''"""Auto-generated tool bindings."""
 import os
 import json
 import socket
-import urllib.request
 
-# Unix socket path takes precedence over HTTP URL
+# The MCP bridge's Unix socket (inside a sandbox: the sandbox-side endpoint).
 _BRIDGE_SOCKET = os.environ.get('MCP_BRIDGE_SOCKET')
-_BRIDGE_URL = os.environ.get('MCP_BRIDGE_URL', 'http://localhost:{bridge_port}')
 
 
 def _call_via_socket(socket_path: str, tool_name: str, data: bytes) -> dict:
@@ -1141,28 +898,13 @@ def _call_via_socket(socket_path: str, tool_name: str, data: bytes) -> dict:
 
 
 def _call(tool_name: str, **kwargs):
-    """Call a tool via the bridge (Unix socket or HTTP)."""
+    """Call a tool via the MCP bridge's Unix socket."""
     # Filter out None values
     filtered = {{k: v for k, v in kwargs.items() if v is not None}}
     data = json.dumps(filtered).encode()
-
-    # Prefer Unix socket if available
-    if _BRIDGE_SOCKET and os.path.exists(_BRIDGE_SOCKET):
-        return _call_via_socket(_BRIDGE_SOCKET, tool_name, data)
-
-    # Fall back to HTTP
-    req = urllib.request.Request(
-        f"{{_BRIDGE_URL}}/call/{{tool_name}}",
-        data=data,
-        headers={{'Content-Type': 'application/json'}}
-    )
-    try:
-        with urllib.request.urlopen(req) as resp:
-            return json.loads(resp.read())
-    except urllib.error.HTTPError as e:
-        return {{"error": f"HTTP {{e.code}}: {{e.reason}}"}}
-    except Exception as e:
-        return {{"error": str(e)}}
+    if not _BRIDGE_SOCKET or not os.path.exists(_BRIDGE_SOCKET):
+        return {{"error": "MCP bridge not available (MCP_BRIDGE_SOCKET is not set or missing)"}}
+    return _call_via_socket(_BRIDGE_SOCKET, tool_name, data)
 
 # --- Generated tool functions below ---
 '''
@@ -1315,7 +1057,7 @@ def _setup_skill_dir(skill_dir: Path, skill_name: str, tools: dict[str, dict], d
     (skill_dir / 'SKILL.md').write_text(skill_md)
 
 
-def _setup_shared_lib(skills_dir: Path, all_tools: dict[str, dict], bridge_port: int):
+def _setup_shared_lib(skills_dir: Path, all_tools: dict[str, dict]):
     """Setup the shared lib/ directory at skills root with all tool bindings."""
     lib_dir = skills_dir / 'lib'
     lib_dir.mkdir(exist_ok=True)
@@ -1345,23 +1087,11 @@ from .tools import *
     if not init_path.exists() or init_path.read_text() != init_content:
         init_path.write_text(init_content)
 
-    # Generate lib/tools.py with ALL tools
-    tools_py = generate_tools_module(all_tools, bridge_port)
-
-    # Only write if tool definitions changed (ignoring port number)
-    # The port is read from MCP_BRIDGE_URL env var at runtime anyway
-    # This prevents StatReload triggering on every session
-    import re
-    if tools_path.exists():
-        existing = tools_path.read_text()
-        # Normalize by removing the port number for comparison
-        existing_normalized = re.sub(r'localhost:\d+', 'localhost:PORT', existing)
-        new_normalized = re.sub(r'localhost:\d+', 'localhost:PORT', tools_py)
-        if existing_normalized == new_normalized:
-            # Only port changed - don't rewrite, env var will provide correct port
-            return
-
-    tools_path.write_text(tools_py)
+    # Generate lib/tools.py with ALL tools; only rewrite when it changed
+    # (prevents StatReload triggering on every session).
+    tools_py = generate_tools_module(all_tools)
+    if not tools_path.exists() or tools_path.read_text() != tools_py:
+        tools_path.write_text(tools_py)
 
 
 def _setup_skills_cli(skills_dir: Path):
@@ -1387,7 +1117,6 @@ async def setup_skills_directory(
     skills_dir: Path,
     mcp_servers: list | None,
     server_cache: dict,
-    bridge_port: int | None = None,
     bridge_socket_path: str | Path | None = None,
     bridge_cache: dict | None = None,
     exit_stack: AsyncExitStack | None = None
@@ -1416,7 +1145,7 @@ async def setup_skills_directory(
                    closing the exit stack when done.
 
     Returns:
-        Tuple of (server_lookup dict, bridge_port_or_socket_path, tool_manifest)
+        Tuple of (server_lookup dict, bridge socket path, tool_manifest)
     """
     from agentd.mcp_bridge import MCPBridge
 
@@ -1430,9 +1159,11 @@ async def setup_skills_directory(
     # If MCP servers are present, use async mode so tool calls work properly
     if bridge_cache and 'bridge' in bridge_cache:
         bridge = bridge_cache['bridge']
-        bridge_address = str(bridge.socket_path) if bridge.socket_path else bridge.port
+        bridge_address = str(bridge.socket_path)
     else:
-        bridge = MCPBridge(port=bridge_port or 0, socket_path=bridge_socket_path)
+        if bridge_socket_path is None:
+            raise ValueError("the MCP bridge needs a Unix socket path (executor.bridge_socket_path)")
+        bridge = MCPBridge(socket_path=bridge_socket_path)
         if mcp_servers:
             # Use async start - bridge runs in same event loop as MCP connections
             bridge_address = await bridge.start_async()
@@ -1510,7 +1241,7 @@ async def setup_skills_directory(
 
     # 3) Create shared lib/ with ALL tools
     if all_tools:
-        _setup_shared_lib(skills_dir, all_tools, bridge_address)
+        _setup_shared_lib(skills_dir, all_tools)
 
     # 4) Create each skill directory (without lib/)
     for skill_name, tools, description in skill_configs:
@@ -1524,43 +1255,26 @@ async def setup_skills_directory(
     # 5b) Write CLI helper (cli.py + pyproject.toml)
     _setup_skills_cli(skills_dir)
 
-    # 5c) Set skills dir in env so executors can find the CLI
+    # 5c) Tell sandbox executors where the skills dir is (they put it on the
+    # sandbox's PATH and share it if it is outside the workspace)
     os.environ['PTC_SKILLS_DIR'] = str(skills_dir)
-    # Also prepend to PATH so all executors (including SandboxRuntimeExecutor
-    # which inherits os.environ without custom env) can find the `skills` CLI
-    skills_dir_str = str(skills_dir)
-    current_path = os.environ.get('PATH', '')
-    if skills_dir_str not in current_path.split(os.pathsep):
-        os.environ['PATH'] = f"{skills_dir_str}{os.pathsep}{current_path}"
 
     # 6) Generate tool manifest for system prompt injection
     tool_manifest = generate_tool_manifest(all_tools, skills_dir)
 
     logger.info(f"Setup {len(skill_configs)} skill(s) at {skills_dir}")
     logger.info(f"Shared lib/ contains {len(all_tools)} tools")
-    if bridge_socket_path:
-        logger.info(f"MCP Bridge running on unix://{bridge_address}")
-    else:
-        logger.info(f"MCP Bridge running on http://localhost:{bridge_address}")
+    logger.info(f"MCP Bridge running on unix://{bridge_address}")
     return server_lookup, bridge_address, tool_manifest
 
 
-def set_bridge_env(bridge_address: int | str) -> None:
-    """Set environment variables for MCP bridge connection.
+def set_bridge_env(bridge_address: str | Path) -> None:
+    """Point skills code run on the host at the MCP bridge's Unix socket.
 
-    Args:
-        bridge_address: Either a port number (int) for HTTP mode,
-                       or a socket path (str) for Unix socket mode.
+    Sandbox executors override this inside the sandbox (their sandbox-side
+    endpoint), so it only matters for code run directly on the host.
     """
-    if isinstance(bridge_address, str) and '/' in bridge_address:
-        # Unix socket path
-        os.environ['MCP_BRIDGE_SOCKET'] = bridge_address
-        # Also set URL as fallback
-        os.environ['MCP_BRIDGE_URL'] = f'http://localhost:0'
-    else:
-        # TCP port
-        os.environ.pop('MCP_BRIDGE_SOCKET', None)  # Clear socket if set
-        os.environ['MCP_BRIDGE_URL'] = f'http://localhost:{bridge_address}'
+    os.environ['MCP_BRIDGE_SOCKET'] = str(bridge_address)
 
 
 # =============================================================================
@@ -1731,10 +1445,10 @@ async def _handle_ptc_call(
                     **clean_kwargs
                 )
         else:
-            # Use LiteLLM for non-OpenAI providers, with auto-fallback to
-            # claude-agent-sdk for Claude models when no API key is set but
-            # the local `claude` CLI is logged in. Pass cwd so the SDK route
-            # doesn't escape to the Python-process working directory.
+            # Use LiteLLM for non-OpenAI providers, with auto-fallback to the
+            # `claude` CLI (tools disabled; inside the sandbox with a
+            # sandbox executor) for Claude models when no API key is set. Pass
+            # cwd/executor so that route runs in the right place.
             from agentd.llm_dispatch import smart_acompletion, smart_completion
             if async_mode:
                 response = await smart_acompletion(
@@ -2757,7 +2471,8 @@ def patch_openai_with_ptc(
     cwd: str | Path = ".",
     executor: Executor | None = None,
     skills_dir: str | Path | None = None,
-    bash_tool: bool = False
+    bash_tool: bool = False,
+    harness: str = "ptc",
 ):
     """
     Patch OpenAI client to use programmatic tool calling.
@@ -2773,14 +2488,21 @@ def patch_openai_with_ptc(
     Args:
         client: OpenAI or AsyncOpenAI client
         cwd: Working directory for skill scripts (default: current directory)
-        executor: Code execution backend (default: SubprocessExecutor)
+        executor: Sandbox to run code and harnesses in (default: KrunExecutor
+            if libkrun is set up, else DockerExecutor; see agentd.sandbox)
         skills_dir: Custom skills directory (default: cwd/skills)
+        harness: Agent loop: "ptc" (agentd's own), or "claude-code" / "codex"
+            (running inside the sandbox executor), for both chat.completions
+            and responses. Overridable per call with ``harness=``; switching
+            keeps the conversation (see agentd.harness.chat / .responses).
 
     Returns:
         Patched client
     """
     is_async = client.__class__.__name__ == 'AsyncOpenAI'
-    executor = executor or SubprocessExecutor()
+    if executor is None:
+        from agentd.sandbox.executor import default_executor
+        executor = default_executor()
     cwd_path = Path(cwd).resolve()
     skills_path = Path(skills_dir).resolve() if skills_dir else None
 
@@ -2789,6 +2511,7 @@ def patch_openai_with_ptc(
     client._bridge_cache = {}
     client._skills_dir = skills_path  # Custom skills dir (or None for default)
     client._bash_tool = bash_tool
+    client._harness = harness
 
     # Store original methods
     orig_completions_sync = Completions.create
@@ -2797,7 +2520,7 @@ def patch_openai_with_ptc(
     @wraps(orig_completions_sync)
     def patched_completions_sync(self, *args, model=None, messages=None,
                                   mcp_servers=None, mcp_strict=False,
-                                  ptc_enabled=True, bash_tool=False, stream=False, **kwargs):
+                                  ptc_enabled=True, bash_tool=False, stream=False, harness=None, **kwargs):
         if not ptc_enabled:
             return orig_completions_sync(self, *args, model=model, messages=messages, stream=stream, **kwargs)
 
@@ -2806,6 +2529,17 @@ def patch_openai_with_ptc(
         bridge_cache = getattr(client_obj, '_bridge_cache', {}) if client_obj else {}
         skills_override = getattr(client_obj, '_skills_dir', None) if client_obj else None
         use_bash_tool = bash_tool or getattr(client_obj, '_bash_tool', False)
+
+        harness_name = harness or getattr(client_obj, '_harness', 'ptc')
+        if harness_name != 'ptc':
+            from agentd.harness import chat as harness_chat
+            call = dict(client_obj=client, harness_name=harness_name, model=model, messages=messages,
+                        mcp_servers=mcp_servers, cwd=cwd_path, executor=executor, server_cache=server_cache,
+                        bridge_cache=bridge_cache, skills_override=skills_override,
+                        session_id=kwargs.get('session_id'))
+            if stream:
+                return _sync_generator_wrapper(harness_chat.stream_completion(**call))
+            return _run_async(harness_chat.handle_completion(**call))
 
         if use_bash_tool:
             if stream:
@@ -2836,7 +2570,7 @@ def patch_openai_with_ptc(
     @wraps(orig_completions_async)
     async def patched_completions_async(self, *args, model=None, messages=None,
                                          mcp_servers=None, mcp_strict=False,
-                                         ptc_enabled=True, bash_tool=False, stream=False, **kwargs):
+                                         ptc_enabled=True, bash_tool=False, stream=False, harness=None, **kwargs):
         if not ptc_enabled:
             return await orig_completions_async(self, *args, model=model, messages=messages, stream=stream, **kwargs)
 
@@ -2845,6 +2579,17 @@ def patch_openai_with_ptc(
         bridge_cache = getattr(client_obj, '_bridge_cache', {}) if client_obj else {}
         skills_override = getattr(client_obj, '_skills_dir', None) if client_obj else None
         use_bash_tool = bash_tool or getattr(client_obj, '_bash_tool', False)
+
+        harness_name = harness or getattr(client_obj, '_harness', 'ptc')
+        if harness_name != 'ptc':
+            from agentd.harness import chat as harness_chat
+            call = dict(client_obj=client, harness_name=harness_name, model=model, messages=messages,
+                        mcp_servers=mcp_servers, cwd=cwd_path, executor=executor, server_cache=server_cache,
+                        bridge_cache=bridge_cache, skills_override=skills_override,
+                        session_id=kwargs.get('session_id'))
+            if stream:
+                return harness_chat.stream_completion(**call)
+            return await harness_chat.handle_completion(**call)
 
         if use_bash_tool:
             if stream:
@@ -2876,7 +2621,7 @@ def patch_openai_with_ptc(
     @wraps(orig_responses_sync)
     def patched_responses_sync(self, *args, model=None, input=None,
                                 mcp_servers=None, mcp_strict=False,
-                                ptc_enabled=True, stream=False, **kwargs):
+                                ptc_enabled=True, stream=False, harness=None, **kwargs):
         if not ptc_enabled:
             return orig_responses_sync(self, *args, model=model, input=input, stream=stream, **kwargs)
 
@@ -2884,6 +2629,16 @@ def patch_openai_with_ptc(
         server_cache = getattr(client_obj, '_mcp_server_cache', {}) if client_obj else {}
         bridge_cache = getattr(client_obj, '_bridge_cache', {}) if client_obj else {}
         skills_override = getattr(client_obj, '_skills_dir', None) if client_obj else None
+
+        harness_name = harness or getattr(client_obj, '_harness', 'ptc')
+        if harness_name != 'ptc':
+            from agentd.harness import responses as harness_responses
+            call = dict(client_obj=client, harness_name=harness_name, model=model, input_data=input,
+                        kwargs=kwargs, mcp_servers=mcp_servers, cwd=cwd_path, executor=executor,
+                        server_cache=server_cache, bridge_cache=bridge_cache, skills_override=skills_override)
+            if stream:
+                return _sync_generator_wrapper(harness_responses.stream_response(**call))
+            return _run_async(harness_responses.handle_response(**call))
 
         if stream:
             # For sync streaming, wrap async generator directly (don't use _run_async)
@@ -2901,7 +2656,7 @@ def patch_openai_with_ptc(
     @wraps(orig_responses_async)
     async def patched_responses_async(self, *args, model=None, input=None,
                                        mcp_servers=None, mcp_strict=False,
-                                       ptc_enabled=True, stream=False, **kwargs):
+                                       ptc_enabled=True, stream=False, harness=None, **kwargs):
         if not ptc_enabled:
             return await orig_responses_async(self, *args, model=model, input=input, stream=stream, **kwargs)
 
@@ -2909,6 +2664,16 @@ def patch_openai_with_ptc(
         server_cache = getattr(client_obj, '_mcp_server_cache', {}) if client_obj else {}
         bridge_cache = getattr(client_obj, '_bridge_cache', {}) if client_obj else {}
         skills_override = getattr(client_obj, '_skills_dir', None) if client_obj else None
+
+        harness_name = harness or getattr(client_obj, '_harness', 'ptc')
+        if harness_name != 'ptc':
+            from agentd.harness import responses as harness_responses
+            call = dict(client_obj=client, harness_name=harness_name, model=model, input_data=input,
+                        kwargs=kwargs, mcp_servers=mcp_servers, cwd=cwd_path, executor=executor,
+                        server_cache=server_cache, bridge_cache=bridge_cache, skills_override=skills_override)
+            if stream:
+                return harness_responses.stream_response(**call)
+            return await harness_responses.handle_response(**call)
 
         if stream:
             return await _handle_ptc_responses_streaming(

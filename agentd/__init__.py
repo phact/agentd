@@ -2,22 +2,11 @@ from agentd.conversation_logger import ConversationLog
 from agentd.patch import patch_openai_with_mcp
 from agentd.ptc import patch_openai_with_ptc, display_events, display_events_async, TextDelta, CodeExecution, TurnEnd
 from agentd.tool_decorator import tool
-from agentd.microsandbox_executor import (
-    MicrosandboxExecutor,
-    create_microsandbox_executor,
-    SandboxConfig,
-)
-from agentd.microsandbox_cli_executor import (
-    MicrosandboxCLIExecutor,
-    create_microsandbox_cli_executor,
-)
-from agentd.sandbox_runtime_executor import (
-    SandboxRuntimeExecutor,
-    create_sandbox_runtime_executor,
-)
-from agentd.docker_executor import (
+from agentd.sandbox.executor import (
+    SandboxExecutor,
+    KrunExecutor,
     DockerExecutor,
-    create_docker_executor,
+    default_executor,
 )
 
 __all__ = [
@@ -30,17 +19,9 @@ __all__ = [
     'TurnEnd',
     'tool',
     'ConversationLog',
-    # API-based executor (blocked by https://github.com/microsandbox/microsandbox/issues/314)
-    'MicrosandboxExecutor',
-    'create_microsandbox_executor',
-    'SandboxConfig',
-    # CLI-based executor (recommended)
-    'MicrosandboxCLIExecutor',
-    'create_microsandbox_cli_executor',
-    # OS-level sandbox (lightweight, no containers)
-    'SandboxRuntimeExecutor',
-    'create_sandbox_runtime_executor',
-    # Container-based executor (fresh `docker run --rm` per call)
-    'DockerExecutor',
-    'create_docker_executor',
+    # Sandboxes: code and harnesses run here, never on the host.
+    'SandboxExecutor',
+    'KrunExecutor',     # libkrun microVM (preferred)
+    'DockerExecutor',   # Docker container, --network none
+    'default_executor',
 ]

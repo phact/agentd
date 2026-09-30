@@ -1,0 +1,30 @@
+import shutil
+import tempfile
+from pathlib import Path
+
+import pytest
+
+
+@pytest.fixture(scope="session")
+def _test_state_root():
+    # Under ~/.agentd so Docker Desktop / Colima share it with their VM.
+    from agentd.sandbox.base import DEFAULT_HOME
+
+    (DEFAULT_HOME / "tmp").mkdir(parents=True, exist_ok=True)
+    root = Path(tempfile.mkdtemp(prefix="state-", dir=DEFAULT_HOME / "tmp"))
+    yield root
+    shutil.rmtree(root, ignore_errors=True)
+
+
+@pytest.fixture(autouse=True)
+def _keep_test_state_out_of_real_dirs(monkeypatch, _test_state_root):
+    """Tests never write to the real ~/.claude/projects, ~/.codex/sessions,
+    ~/.agentd/transcripts or ~/.agentd/responses."""
+    from agentd.harness import responses, transcripts
+
+    root = _test_state_root
+    original_native = transcripts.native_dir
+    monkeypatch.setattr(transcripts, "native_dir",
+                        lambda harness, workspace: root / "native" / original_native(harness, workspace).name)
+    monkeypatch.setattr(transcripts, "DEFAULT_HOME", root)
+    monkeypatch.setattr(responses, "RESPONSES_DIR", root / "responses")
