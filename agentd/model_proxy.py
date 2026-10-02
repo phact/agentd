@@ -30,8 +30,10 @@ import os
 import subprocess
 import sys
 import time
+from dataclasses import dataclass
 from pathlib import Path
-from typing import Protocol
+from typing import Literal, Protocol
+from urllib.parse import urlsplit
 
 import aiohttp
 from aiohttp import web
@@ -95,26 +97,38 @@ class ClaudeKeychainCredentials:
                 )
             return self._token
 
+    @staticmethod
+    def credentials_file() -> Path:
+        """Where Claude Code keeps its login on Linux (and on macOS without Keychain)."""
+        return Path(os.environ.get("CLAUDE_CONFIG_DIR", Path.home() / ".claude")) / ".credentials.json"
+
     @classmethod
     def _read(cls) -> tuple[str, float]:
+        raw = None
+        keychain_error = ""
         if sys.platform == "darwin":
             r = subprocess.run(
                 ["security", "find-generic-password", "-s", cls.SERVICE, "-w"],
                 capture_output=True, text=True, timeout=30,
             )
-            if r.returncode != 0:
-                raise CredentialError(f"Claude Code credentials not in Keychain: {r.stderr.strip()}")
-            raw = r.stdout
-        else:
-            path = Path(os.environ.get("CLAUDE_CONFIG_DIR", Path.home() / ".claude")) / ".credentials.json"
+            if r.returncode == 0:
+                raw = r.stdout
+            else:
+                keychain_error = f"not in Keychain ({r.stderr.strip()}); "
+        if raw is None:
+            path = cls.credentials_file()
             try:
                 raw = path.read_text()
             except OSError as e:
-                raise CredentialError(f"Claude Code credentials not found at {path}: {e}") from e
+                raise CredentialError(f"Claude Code credentials {keychain_error}not found at {path}: {e}") from e
         oauth = json.loads(raw).get("claudeAiOauth") or {}
         if "accessToken" not in oauth:
             raise CredentialError("Claude Code credentials have no OAuth access token")
         return oauth["accessToken"], oauth.get("expiresAt", 0) / 1000
+
+
+# The name predates Linux support: it reads the Keychain on macOS, else the file.
+ClaudeCodeCredentials = ClaudeKeychainCredentials
 
 
 class BearerCredentials:
@@ -123,6 +137,53 @@ class BearerCredentials:
 
     async def apply(self, headers: dict[str, str]) -> None:
         headers["authorization"] = f"Bearer {self._token}"
+
+
+class NoCredentials:
+    """For upstreams that need no key: whatever auth the sandbox sent is still dropped."""
+
+    async def apply(self, headers: dict[str, str]) -> None:
+        pass
+
+
+@dataclass(frozen=True)
+class ModelUpstream:
+    """An OpenAI-compatible server for a harness's model calls (e.g. a LAN box).
+
+    The sandbox never reaches it directly: agentd proxies it from the host
+    and adds the key there. ``api`` is what the server speaks: ``"responses"``
+    (``/v1/responses``, passed through) or ``"chat"`` (chat completions only;
+    agentd translates the Responses API that Codex uses).
+    """
+
+    base_url: str                   # e.g. "http://10.0.2.58:8080/v1"
+    api: Literal["responses", "chat"] = "responses"
+    api_key: str | None = None      # or api_key_env; read on the host only
+    api_key_env: str | None = None
+    name: str = "upstream"          # shown by Codex
+
+    def __post_init__(self) -> None:
+        if self.api not in ("responses", "chat"):
+            raise ValueError(f"api must be 'responses' or 'chat', not {self.api!r}")
+        parts = urlsplit(self.base_url)
+        if parts.scheme not in ("http", "https") or not parts.netloc:
+            raise ValueError(f"base_url must be an http(s) URL, not {self.base_url!r}")
+
+    @property
+    def origin(self) -> str:
+        parts = urlsplit(self.base_url)
+        return f"{parts.scheme}://{parts.netloc}"
+
+    @property
+    def path(self) -> str:
+        """The base path, e.g. "/v1" (no trailing slash)."""
+        return urlsplit(self.base_url).path.rstrip("/")
+
+    def credentials(self) -> Credentials:
+        key = self.api_key or (os.environ.get(self.api_key_env) if self.api_key_env else None)
+        if self.api_key_env and not key:
+            raise CredentialError(f"{self.api_key_env} is not set on the host")
+        return BearerCredentials(key) if key else NoCredentials()
 
 
 class CodexChatGPTCredentials:
@@ -205,9 +266,15 @@ class ModelProxy:
         upstream: str = ANTHROPIC_API,
         allowed_prefixes: tuple[str, ...] = ("/v1/", "/api/hello"),
         ssl_context=None,
+        responses_via_chat: str | None = None,
     ):
         """``ssl_context``: terminate TLS on the socket (for sandbox clients that
-        must see the real ``https://`` hostname; see agentd.sandbox.tls)."""
+        must see the real ``https://`` hostname; see agentd.sandbox.tls).
+
+        ``responses_via_chat``: the upstream base URL (e.g. ``http://host/v1``)
+        of a server that only speaks chat completions; ``POST .../responses``
+        is then answered by translating to it (see :meth:`_responses_via_chat`)."""
+        self.responses_via_chat = responses_via_chat
         self.socket_path = Path(socket_path)
         self.credentials = credentials
         self.upstream = upstream.rstrip("/")
@@ -245,6 +312,94 @@ class ModelProxy:
     async def __aexit__(self, *exc) -> None:
         await self.stop()
 
+    async def _responses_via_chat(self, request: web.Request) -> web.StreamResponse:
+        """Answer a Responses API request from a chat-completions-only server.
+
+        litellm translates the request (instructions, input items, function
+        tools and their outputs) to chat completions and the reply back to
+        Responses output items. The upstream call isn't streamed: a streaming
+        client gets ``response.created`` at once, keep-alives while the model
+        runs, then each output item and ``response.completed`` -- the events
+        Codex acts on (it reports only completed items anyway)."""
+        import litellm
+
+        body = await request.json()
+        headers: dict[str, str] = {}
+        try:
+            await self.credentials.apply(headers)
+        except CredentialError as e:
+            return web.json_response({"error": {"type": "authentication_error", "message": str(e)}}, status=401)
+        api_key = headers.get("authorization", "").removeprefix("Bearer ").strip() or "none"
+        model = body.pop("model", None) or "default"
+        streaming = bool(body.pop("stream", False))
+        logger.info("model proxy: responses -> chat completions (%s)", model)
+        call = asyncio.ensure_future(litellm.aresponses(
+            model=f"hosted_vllm/{model}", api_base=self.responses_via_chat, api_key=api_key,
+            stream=False, drop_params=True, **body,
+        ))
+
+        def output(result) -> dict:
+            data = result.model_dump(exclude_none=True)
+            items = []
+            for item in data.get("output", []):
+                if item.get("type") == "message":
+                    parts = [dict(part, text=part.get("text", "")) for part in item.get("content", [])
+                             if part.get("type") != "output_text" or part.get("text")]
+                    if not parts:
+                        continue  # litellm adds an empty message next to tool calls
+                    item = dict(item, content=parts)
+                items.append(item)
+            data["output"] = items
+            return data
+
+        def error(e: BaseException) -> tuple[int, dict]:
+            status = getattr(e, "status_code", None) or 502
+            return status, {"code": "upstream_error", "message": f"{type(e).__name__}: {e}"[:2000]}
+
+        if not streaming:
+            try:
+                return web.json_response(output(await call))
+            except Exception as e:
+                status, err = error(e)
+                return web.json_response({"error": err}, status=status)
+
+        response = web.StreamResponse(headers={"content-type": "text/event-stream", "cache-control": "no-cache"})
+        await response.prepare(request)
+        seq = 0
+
+        async def send(event: dict) -> None:
+            nonlocal seq
+            event["sequence_number"] = seq
+            seq += 1
+            await response.write(f"event: {event['type']}\ndata: {json.dumps(event)}\n\n".encode())
+
+        try:
+            pending = {"id": f"resp_agentd_{os.urandom(8).hex()}", "object": "response", "status": "in_progress",
+                       "model": model, "output": []}
+            await send({"type": "response.created", "response": pending})
+            while True:
+                done, _ = await asyncio.wait({call}, timeout=15)
+                if done:
+                    break
+                await response.write(b": keep-alive\n\n")
+            try:
+                data = output(call.result())
+            except Exception as e:
+                _, err = error(e)
+                await send({"type": "response.failed",
+                            "response": dict(pending, status="failed", error=err)})
+            else:
+                for i, item in enumerate(data["output"]):
+                    await send({"type": "response.output_item.added", "output_index": i, "item": item})
+                    await send({"type": "response.output_item.done", "output_index": i, "item": item})
+                await send({"type": "response.completed", "response": dict(data, status="completed")})
+            await response.write_eof()
+        except (ConnectionResetError, aiohttp.ClientConnectionResetError):
+            logger.debug("model proxy: client went away during a translated response")
+        finally:
+            call.cancel()  # the client went away (or we're done): stop waiting on the model
+        return response
+
     async def _handle(self, request: web.Request) -> web.StreamResponse:
         path = request.rel_url.path
         if request.headers.get("upgrade", "").lower() == "websocket":
@@ -253,6 +408,8 @@ class ModelProxy:
         if not path.startswith(self.allowed_prefixes):
             logger.warning("model proxy: blocked %s %s", request.method, path)
             return web.json_response({"error": f"path {path} not allowed"}, status=403)
+        if self.responses_via_chat and request.method == "POST" and path.rstrip("/").endswith("/responses"):
+            return await self._responses_via_chat(request)
         headers = {k.lower(): v for k, v in request.headers.items() if k.lower() not in _STRIP_REQUEST}
         try:
             await self.credentials.apply(headers)
