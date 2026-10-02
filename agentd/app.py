@@ -9,6 +9,7 @@ from agents.mcp.server import MCPServerStdio
 import yaml
 import traceback
 import argparse
+import sys
 from typing import List, Any
 
 from mcp_subscribe.util import call_tool_from_uri
@@ -144,6 +145,10 @@ class Agent:
 
 
 def main():
+    if sys.argv[1:2] == ["serve"]:
+        from agentd.serve.cli import main as serve_main
+
+        sys.exit(serve_main(sys.argv[2:]))
     parser = argparse.ArgumentParser()
     parser.add_argument("config", help="Path to YAML config file")
     args = parser.parse_args()
