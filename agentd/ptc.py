@@ -605,15 +605,21 @@ def _make_execution_event(
     output: str,
     sequence_number: int,
     output_index: int = 0,
-    status: str = "completed"
+    status: str = "completed",
+    item_id: str | None = None,
+    container_id: str = "ptc",
 ) -> ResponseOutputItemDoneEvent:
-    """Create an OpenAI-compatible code execution event."""
+    """Create an OpenAI-compatible code execution event.
+
+    Used for PTC code fences and for harness tool calls (``container_id``
+    names the harness): either way the work already ran in the sandbox.
+    """
     # Prefix code with fence_type on first line so display_events can parse it
     prefixed_code = f"{fence_type}\n{code}"
     tool_call = ResponseCodeInterpreterToolCall(
-        id=f"ptc_{sequence_number}",
+        id=item_id or f"{container_id}_{sequence_number}",
         code=prefixed_code,
-        container_id="ptc",
+        container_id=container_id,
         status=status,
         type="code_interpreter_call",
         outputs=[OutputLogs(logs=output, type="logs")] if output else []
@@ -1291,6 +1297,10 @@ def _sync_generator_wrapper(async_gen_or_coro):
 
     Uses a persistent event loop in a background thread so that
     aiohttp servers (like MCP bridge) keep running between iterations.
+    If the consumer stops iterating early (``break``, an exception, or
+    ``close()``), the background run is cancelled and the async generator
+    closed, so whatever it drives (a harness in the sandbox, an LLM loop)
+    stops too instead of running on unobserved.
 
     Handles both:
     - Async generators directly
@@ -1299,9 +1309,12 @@ def _sync_generator_wrapper(async_gen_or_coro):
     import threading
     import queue
     import inspect
+    from contextlib import aclosing
 
     result_queue = queue.Queue()
     cleanup_queue = queue.Queue()
+    state: dict = {}
+    started = threading.Event()
 
     def run_loop():
         loop = asyncio.new_event_loop()
@@ -1314,35 +1327,60 @@ def _sync_generator_wrapper(async_gen_or_coro):
                 if inspect.iscoroutine(gen):
                     gen = await gen
 
-                async for item in gen:
-                    result_queue.put(('item', item))
+                async with aclosing(gen):
+                    async for item in gen:
+                        result_queue.put(('item', item))
                 result_queue.put(('done', None))
+            except asyncio.CancelledError:
+                return  # the consumer went away; aclosing has cleaned up
             except Exception as e:
                 result_queue.put(('error', e))
 
-            # Wait for cleanup signal before closing loop
-            # This allows graceful shutdown of MCP connections
-            cleanup_queue.get(timeout=5)
+            # Wait (without blocking the loop) for the consumer to finish
+            # before closing the loop, so MCP connections shut down cleanly.
+            await loop.run_in_executor(None, _wait_quietly, cleanup_queue, 5)
 
-        loop.run_until_complete(iterate())
-        loop.close()
+        task = loop.create_task(iterate())
+        state["loop"], state["task"] = loop, task
+        started.set()
+        try:
+            loop.run_until_complete(task)
+        except asyncio.CancelledError:
+            pass
+        finally:
+            loop.close()
 
     thread = threading.Thread(target=run_loop, daemon=True)
     thread.start()
+    started.wait()
 
+    finished = False
     try:
         while True:
             kind, value = result_queue.get()
             if kind == 'item':
                 yield value
             elif kind == 'done':
+                finished = True
                 break
             elif kind == 'error':
+                finished = True
                 raise value
     finally:
+        if not finished:
+            state["loop"].call_soon_threadsafe(state["task"].cancel)
         # Signal cleanup can proceed
         cleanup_queue.put(True)
-        thread.join(timeout=2)
+        thread.join(timeout=15)
+
+
+def _wait_quietly(q, timeout: float) -> None:
+    import queue
+
+    try:
+        q.get(timeout=timeout)
+    except queue.Empty:
+        pass
 
 
 def _extract_content(response, provider: str) -> str:
@@ -2102,6 +2140,54 @@ def _format_results_for_responses(results: list[tuple[CodeFence, str]]) -> list[
     return [{"role": "user", "content": "Execution results:\n" + "\n\n".join(formatted)}]
 
 
+# PTC uses the same response store as the harnesses (agentd.harness.responses):
+# ``previous_response_id`` replays the stored conversation as input (from any
+# harness), and each PTC response is recorded under its id, so the next call,
+# on PTC or another harness, can continue it. Ids the store doesn't know
+# (e.g. responses stored by the provider) are passed through unchanged.
+
+def _ptc_conversation(client_obj, input_data, kwargs: dict):
+    """(input, kwargs, conversation to record or None) for a PTC Responses call."""
+    from agentd.harness import responses as hr
+
+    previous = kwargs.get("previous_response_id")
+    if previous and hr._load(client_obj, previous) is None:
+        return input_data, kwargs, None  # not ours: the provider's own state
+    try:
+        messages, _ = hr._conversation(client_obj, "ptc", input_data, kwargs.get("instructions"), previous)
+    except ValueError:
+        if previous:
+            raise
+        return input_data, kwargs, None  # non-message input items: pass through, unrecorded
+    rest = {k: v for k, v in kwargs.items() if k not in ("previous_response_id", "instructions")}
+    return [dict(m) for m in messages], rest, messages
+
+
+def _response_id(response) -> str | None:
+    rid = getattr(response, "id", None)
+    if rid is None and hasattr(response, "get"):
+        rid = response.get("id")
+    return rid
+
+
+def _record_ptc(client_obj, response_ids, conversation: list[dict], reply: str) -> None:
+    from agentd.harness import responses as hr
+
+    for rid in dict.fromkeys(r for r in response_ids if r):
+        hr._remember(client_obj, rid, "ptc", None, conversation, reply)
+
+
+def _restore_fields(response, kwargs: dict) -> None:
+    """The returned response shows the caller's instructions / previous_response_id
+    (agentd sent them to the model as input instead)."""
+    for field in ("instructions", "previous_response_id"):
+        if kwargs.get(field) is not None:
+            try:
+                setattr(response, field, kwargs[field])
+            except Exception:
+                pass
+
+
 async def _handle_ptc_responses_call(
     self,
     args,
@@ -2121,6 +2207,9 @@ async def _handle_ptc_responses_call(
     """Handle PTC call for Responses API."""
     # Detect provider
     _, provider, api_key, _ = llm_utils.get_llm_provider(model)
+    client_obj = getattr(self, "_client", None)
+    caller_kwargs = kwargs
+    input_data, kwargs, conversation = _ptc_conversation(client_obj, input_data, kwargs)
 
     # Check if executor needs Unix socket for MCP bridge
     bridge_socket_path = getattr(executor, 'bridge_socket_path', None)
@@ -2142,6 +2231,13 @@ async def _handle_ptc_responses_call(
 
     # Inject PTC guidance with tool manifest
     current_input = _inject_ptc_guidance_responses(input_data, tool_manifest)
+    start = len(current_input)
+
+    def finish(response, content):
+        if conversation is not None:
+            _record_ptc(client_obj, [_response_id(response)], conversation + current_input[start:], content)
+            _restore_fields(response, caller_kwargs)
+        return response
 
     clog = create_log("ptc_responses", model)
     if clog:
@@ -2190,7 +2286,7 @@ async def _handle_ptc_responses_call(
 
         if not fences:
             if clog: clog.end(loop_count)
-            return response
+            return finish(response, content)
 
         logger.info(f"[Responses] Found {len(fences)} code fences to execute")
 
@@ -2236,7 +2332,7 @@ async def _handle_ptc_responses_call(
 
     if clog: clog.end(loop_count)
     logger.warning(f"[Responses] Reached max loops ({MAX_LOOPS})")
-    return response
+    return finish(response, content)
 
 
 async def _handle_ptc_responses_streaming(
@@ -2258,6 +2354,8 @@ async def _handle_ptc_responses_streaming(
     """Handle streaming PTC call for Responses API."""
     # Detect provider
     _, provider, api_key, _ = llm_utils.get_llm_provider(model)
+    client_obj = getattr(self, "_client", None)
+    input_data, kwargs, conversation = _ptc_conversation(client_obj, input_data, kwargs)
 
     # Check if executor needs Unix socket for MCP bridge
     bridge_socket_path = getattr(executor, 'bridge_socket_path', None)
@@ -2287,6 +2385,12 @@ async def _handle_ptc_responses_streaming(
             nonlocal current_input
             # Inject PTC guidance with tool manifest (after setup so manifest is available)
             current_input = _inject_ptc_guidance_responses(input_data, tool_manifest)
+            start = len(current_input)
+            response_ids = []  # every model round's response; the turn is recorded under each
+
+            def note(event):
+                if getattr(event, "type", None) == "response.completed":
+                    response_ids.append(_response_id(getattr(event, "response", None)))
 
             clog = create_log("ptc_responses_stream", model)
             if clog:
@@ -2335,6 +2439,7 @@ async def _handle_ptc_responses_streaming(
                 # Process stream - extract text from response events
                 if async_mode:
                     async for event in stream:
+                        note(event)
                         yield event
                         seq_num += 1
 
@@ -2387,6 +2492,7 @@ async def _handle_ptc_responses_streaming(
                                 buffer = remove_fence_from_buffer(buffer, fence)
                 else:
                     for event in stream:
+                        note(event)
                         yield event
                         seq_num += 1
 
@@ -2439,6 +2545,8 @@ async def _handle_ptc_responses_streaming(
                     if clog:
                         clog.message("assistant", buffer)
                         clog.end(loop_count)
+                    if conversation is not None:
+                        _record_ptc(client_obj, response_ids, conversation + current_input[start:], buffer)
                     return
 
                 # Continue with results (stripped of hallucinations)
@@ -2473,6 +2581,7 @@ def patch_openai_with_ptc(
     skills_dir: str | Path | None = None,
     bash_tool: bool = False,
     harness: str = "ptc",
+    harness_options: dict[str, dict] | None = None,
 ):
     """
     Patch OpenAI client to use programmatic tool calling.
@@ -2491,10 +2600,19 @@ def patch_openai_with_ptc(
         executor: Sandbox to run code and harnesses in (default: KrunExecutor
             if libkrun is set up, else DockerExecutor; see agentd.sandbox)
         skills_dir: Custom skills directory (default: cwd/skills)
-        harness: Agent loop: "ptc" (agentd's own), or "claude-code" / "codex"
+        harness: Agent loop: "ptc" (agentd's own), or "claude-code" / "codex" / "opencode" / "omp"
             (running inside the sandbox executor), for both chat.completions
             and responses. Overridable per call with ``harness=``; switching
             keeps the conversation (see agentd.harness.chat / .responses).
+        harness_options: Per-harness settings, e.g. for Codex on a custom
+            OpenAI-compatible server with some features off::
+
+                {"codex": {"upstream": ModelUpstream("http://10.0.2.58:8080/v1", api="chat"),
+                           "model": "qwen3-coder",
+                           "config": {"web_search": "disabled",
+                                      "features": {"multi_agent": False}}}}
+
+            (keys are the harness's fields; see agentd.harness.codex).
 
     Returns:
         Patched client
@@ -2512,6 +2630,11 @@ def patch_openai_with_ptc(
     client._skills_dir = skills_path  # Custom skills dir (or None for default)
     client._bash_tool = bash_tool
     client._harness = harness
+    client._harness_options = dict(harness_options or {})
+    client._agentd_executor = executor  # for agentd.available(client)
+    for name in client._harness_options:
+        if name not in ("claude-code", "codex", "opencode", "omp"):
+            raise ValueError(f"harness_options: unknown harness {name!r}")
 
     # Store original methods
     orig_completions_sync = Completions.create

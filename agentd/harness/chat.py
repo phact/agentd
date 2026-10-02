@@ -11,17 +11,26 @@ The caller's ``messages`` list is the harness-neutral transcript. Each call:
     rendered into the prompt, so switching harness keeps the conversation;
   * with ``session_id=`` (an id agentd returned as ``agentd.session_id``)
     resumes exactly that native session, even in a new sandbox or process;
+  * the CLIs keep a session's system prompt from its first turn, so when a
+    resumed turn's system text differs, it is stated in that turn's prompt;
   * returns the harness's final reply as an OpenAI chat completion (or
     streams its text), and logs every event to the agentd ConversationLog.
 """
 from __future__ import annotations
 
+import logging
+from contextlib import aclosing
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, AsyncIterator
 
 from agentd.harness import get_harness
 
+logger = logging.getLogger(__name__)
+
+from agentd.sandbox.base import DEFAULT_HOME
+
+SESSIONS_DIR = DEFAULT_HOME / "harness-sessions"  # each native session's current instructions
 _MODEL_ALIASES = ("sonnet", "opus", "haiku", "fable")
 # Between separate assistant text blocks of one turn when streaming them.
 TEXT_SEPARATOR = "\n\n"
@@ -82,6 +91,48 @@ class HarnessConversations:
         self.runs.append(_Run(harness, session_id, transcript))
 
 
+# --------------------------------------------------------------------------- #
+# Instructions of native sessions
+# --------------------------------------------------------------------------- #
+# Claude Code and Codex fix a session's system prompt when it is created: on
+# resume (and fork) they ignore --append-system-prompt / developer_instructions,
+# and instructions restated in the prompt are rightly treated as an injection.
+# So agentd records the instructions each native session was started with, and
+# a turn with different ones starts a fresh session seeded with the history.
+
+def _sessions_dir() -> Path:
+    return SESSIONS_DIR
+
+
+_UNKNOWN = object()  # a session agentd didn't start (or from before this record existed)
+
+
+def session_instructions(harness_name: str, session_id: str) -> Any:
+    """The instructions ``session_id`` was started with, or ``_UNKNOWN``."""
+    import json
+
+    path = _sessions_dir() / harness_name / f"{session_id}.json"
+    if "/" in session_id or not path.is_file():
+        return _UNKNOWN
+    try:
+        return json.loads(path.read_text()).get("instructions")
+    except (OSError, ValueError):
+        return _UNKNOWN
+
+
+def record_session_instructions(harness_name: str, session_id: str, instructions: str | None) -> None:
+    import json
+    import os
+
+    if "/" in session_id:
+        return
+    d = _sessions_dir() / harness_name
+    d.mkdir(parents=True, exist_ok=True)
+    tmp = d / f".{session_id}.tmp"
+    tmp.write_text(json.dumps({"instructions": instructions}))
+    os.replace(tmp, d / f"{session_id}.json")
+
+
 def _is_claude_model(model: str) -> bool:
     bare = model.split("/", 1)[1] if model.startswith("anthropic/") else model
     return bare.startswith("claude") or bare in _MODEL_ALIASES
@@ -135,14 +186,22 @@ async def run_turn(
     from agentd.conversation_logger import create_log
 
     system, history, prompt = split_messages(messages)
+    append = "\n\n".join(p for p in (system, tool_manifest) if p) or None
     if session_id:
         resume = session_id
-        await asyncio.to_thread(_pull_transcript, harness, harness_name, cwd, session_id)
+        started_with = await asyncio.to_thread(session_instructions, harness_name, session_id)
+        if started_with is not _UNKNOWN and started_with != append:
+            if history:
+                resume = None  # new instructions need a new session (see above)
+            else:
+                logger.warning("session %s was started with different instructions; resuming it anyway, since "
+                               "the call has no history to start a new session from", session_id)
+        if resume:
+            await asyncio.to_thread(_pull_transcript, harness, harness_name, cwd, session_id)
     else:
         resume = conversations.match(harness_name, normalize(messages[:-1]))
-        if resume is None and history:
-            prompt = render_history(history) + prompt
-    append = "\n\n".join(p for p in (system, tool_manifest) if p) or None
+    if resume is None and history:
+        prompt = render_history(history) + prompt
 
     clog = create_log(f"harness:{harness_name}", model or "")
     if clog:
@@ -150,29 +209,33 @@ async def run_turn(
             clog.message(role, content)
 
     final, streamed, turns = None, [], 0
-    async for event in harness.run(
+    events = harness.run(
         prompt, cwd=cwd, model=_harness_model(harness_name, model), resume=resume, append_system_prompt=append
-    ):
-        if event.kind == "text":
-            streamed.append(event.text)
-        elif event.kind == "tool_use":
-            turns += 1
-        if clog:
+    )
+    async with aclosing(events):  # abandoning this turn stops the harness in the sandbox
+        async for event in events:
             if event.kind == "text":
-                clog.message("assistant", event.text)
+                streamed.append(event.text)
             elif event.kind == "tool_use":
-                clog.tool_call(harness_name, event.name, event.data)
-            elif event.kind == "tool_result":
-                clog.tool_result(harness_name, "", event.data)
-        if event.kind == "result":
-            final = event
-        yield event
+                turns += 1
+            if clog:
+                if event.kind == "text":
+                    clog.message("assistant", event.text)
+                elif event.kind == "tool_use":
+                    clog.tool_call(harness_name, event.name, event.data)
+                elif event.kind == "tool_result":
+                    clog.tool_result(harness_name, "", event.data)
+            if event.kind == "result":
+                final = event
+            yield event
     if clog:
         clog.end(turns)
     session = getattr(getattr(harness, "executor", None), "session", None)
     if session is not None:
         await asyncio.to_thread(session.sync_transcripts_out, harness_name)
     if final is not None and final.session_id and not final.is_error:
+        if not resume:  # a new native session: these instructions are its system prompt for good
+            await asyncio.to_thread(record_session_instructions, harness_name, final.session_id, append)
         reply = TEXT_SEPARATOR.join(streamed) if streaming else final.text
         conversations.record(harness_name, final.session_id, normalize(messages) + [("assistant", reply)])
 
@@ -209,7 +272,8 @@ def _state(client_obj: Any, executor: Any, harness_name: str):
         client_obj._harness_objs = {}
         client_obj._harness_conversations = HarnessConversations()
     if harness_name not in client_obj._harness_objs:
-        client_obj._harness_objs[harness_name] = get_harness(harness_name)(executor)
+        options = (getattr(client_obj, "_harness_options", None) or {}).get(harness_name, {})
+        client_obj._harness_objs[harness_name] = get_harness(harness_name)(executor, **options)
     return client_obj._harness_objs[harness_name], client_obj._harness_conversations
 
 
@@ -238,12 +302,14 @@ async def handle_completion(
     harness, conversations = _state(client_obj, executor, harness_name)
     manifest = await _prepare_skills(executor, cwd, mcp_servers, server_cache, bridge_cache, skills_override)
     final = None
-    async for event in run_turn(
+    _turn = run_turn(
         harness_name=harness_name, harness=harness, conversations=conversations,
         model=model, messages=messages, cwd=cwd, tool_manifest=manifest, session_id=session_id,
-    ):
-        if event.kind == "result":
-            final = event
+    )
+    async with aclosing(_turn):
+        async for event in _turn:
+            if event.kind == "result":
+                final = event
     if final is None:
         raise RuntimeError(f"harness {harness_name} ended without a result")
     response = _make_openai_shaped_response(final.text, model or harness_name)
@@ -255,20 +321,44 @@ async def stream_completion(
     *, client_obj, harness_name, model, messages, mcp_servers, cwd, executor,
     server_cache, bridge_cache, skills_override, session_id=None,
 ):
-    """OpenAI-style chunks: assistant text as it arrives, then a stop chunk."""
+    """OpenAI-style chunks: assistant text as it arrives, then a stop chunk.
+
+    Each tool the harness runs is interleaved as a completed
+    ``code_interpreter_call`` event, exactly like PTC's code executions
+    (``display_events`` renders both as ``CodeExecution``)."""
+    from agentd.harness.tool_events import ToolCalls
     from agentd.llm_dispatch import _make_openai_shaped_chunk
+    from agentd.ptc import _make_execution_event
 
     harness, conversations = _state(client_obj, executor, harness_name)
     manifest = await _prepare_skills(executor, cwd, mcp_servers, server_cache, bridge_cache, skills_override)
     first = True
-    async for event in run_turn(
+    calls, seq = ToolCalls(), 0
+
+    def execution(call):
+        nonlocal seq
+        seq += 1
+        return _make_execution_event(fence_type=call.name, code=call.code, output=call.output,
+                                     sequence_number=seq, status=call.status, container_id=f"agentd-{harness_name}")
+
+    _turn = run_turn(
         harness_name=harness_name, harness=harness, conversations=conversations,
         model=model, messages=messages, cwd=cwd, tool_manifest=manifest, streaming=True,
         session_id=session_id,
-    ):
-        if event.kind == "text":
-            text = event.text if first else TEXT_SEPARATOR + event.text
-            yield _make_openai_shaped_chunk(text, model or harness_name, include_role=first)
-            first = False
+    )
+    async with aclosing(_turn):
+        async for event in _turn:
+            if event.kind == "text":
+                text = event.text if first else TEXT_SEPARATOR + event.text
+                yield _make_openai_shaped_chunk(text, model or harness_name, include_role=first)
+                first = False
+            elif event.kind == "tool_use":
+                calls.started(event)
+            elif event.kind == "tool_result":
+                call = calls.finished(event)
+                if call is not None:
+                    yield execution(call)
+    for call in calls.unfinished():
+        yield execution(call)
     yield _make_openai_shaped_chunk(None, model or harness_name, finish_reason="stop", include_role=first)
 

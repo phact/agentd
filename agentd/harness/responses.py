@@ -21,6 +21,8 @@ API:
 """
 from __future__ import annotations
 
+from contextlib import aclosing
+
 import json
 import os
 import time
@@ -77,10 +79,15 @@ def _conversation(client_obj, harness_name, input_data, instructions, previous_r
     prior = _load(client_obj, previous_response_id)
     if prior is None:
         raise ValueError(f"unknown previous_response_id {previous_response_id!r}")
+    # Omitted instructions keep the conversation's (unlike OpenAI's API, where
+    # they lapse): a native session can't drop its system prompt, and lapsing
+    # would mean a new session, losing its tool history. Given ones (even "")
+    # replace them; if they differ, run_turn starts a new session.
     messages = prior["messages"]
-    if instructions:
-        new.insert(0, {"role": "system", "content": instructions})
+    if instructions is not None:
         messages = [m for m in messages if m["role"] != "system"]
+        if instructions:
+            new.insert(0, {"role": "system", "content": instructions})
     resume = prior.get("session_id") if prior.get("harness") == harness_name else None
     return messages + new, resume
 
@@ -146,13 +153,15 @@ async def handle_response(
     manifest = await _prepare_skills(executor, cwd, mcp_servers, server_cache, bridge_cache, skills_override)
 
     final = None
-    async for event in run_turn(
+    _turn = run_turn(
         harness_name=harness_name, harness=harness, conversations=conversations,
         model=model, messages=messages, cwd=cwd, tool_manifest=manifest,
         session_id=kwargs.get("session_id") or resume,
-    ):
-        if event.kind == "result":
-            final = event
+    )
+    async with aclosing(_turn):
+        async for event in _turn:
+            if event.kind == "result":
+                final = event
     if final is None:
         raise RuntimeError(f"harness {harness_name} ended without a result")
 
@@ -173,7 +182,18 @@ async def stream_response(
     *, client_obj, harness_name, model, input_data, kwargs, mcp_servers, cwd, executor,
     server_cache, bridge_cache, skills_override,
 ):
+    """The standard Responses event stream for one harness turn.
+
+    Output items follow the turn: assistant text goes in ``message`` items and
+    each tool the harness runs becomes a ``code_interpreter_call`` item (added
+    when it starts, done with its output), the same shape PTC uses for its
+    code executions. A tool call closes the current message item; later text
+    opens a new one. The final ``response.output`` lists every item in order.
+    """
     from openai.types import responses as R
+
+    from agentd.harness.tool_events import ToolCalls, _code
+    from agentd.ptc import _make_execution_event
 
     _check_kwargs(kwargs)
     instructions, previous = kwargs.get("instructions"), kwargs.get("previous_response_id")
@@ -181,61 +201,122 @@ async def stream_response(
     harness, conversations = _state(client_obj, executor, harness_name)
     manifest = await _prepare_skills(executor, cwd, mcp_servers, server_cache, bridge_cache, skills_override)
 
-    response_id, item_id = _new_id("resp"), _new_id("msg")
+    response_id = _new_id("resp")
     model_name = model or harness_name
+    container = f"agentd-{harness_name}"
     seq = 0
+    indexes = iter(range(1 << 30))  # output_index, assigned when an item starts
+    output: list = []          # (output_index, item) for finished items
+    msg: dict | None = None    # the open message item: {"id", "index", "text"}
+    tools: dict[str, tuple[str, int]] = {}  # tool_use id -> (item id, output index)
+    calls = ToolCalls()
+    texts: list[str] = []
 
     def nxt() -> int:
         nonlocal seq
         seq += 1
         return seq - 1
 
-    def snapshot(status, output, error=None, agentd=None):
-        return _response(response_id, model=model_name, status=status, output=output, instructions=instructions,
+    def snapshot(status, items, error=None, agentd=None):
+        return _response(response_id, model=model_name, status=status, output=items, instructions=instructions,
                          previous_response_id=previous, error=error, agentd=agentd)
+
+    def finished_items():
+        return [item for _, item in sorted(output, key=lambda pair: pair[0])]
+
+    def open_message():
+        nonlocal msg
+        msg = {"id": _new_id("msg"), "index": next(indexes), "text": ""}
+        yield R.ResponseOutputItemAddedEvent(type="response.output_item.added", output_index=msg["index"],
+                                             item=_message(msg["id"], "", "in_progress"), sequence_number=nxt())
+        yield R.ResponseContentPartAddedEvent(
+            type="response.content_part.added", item_id=msg["id"], output_index=msg["index"], content_index=0,
+            part=R.ResponseOutputText(type="output_text", text="", annotations=[]), sequence_number=nxt())
+
+    def close_message():
+        nonlocal msg
+        if msg is None:
+            return
+        part = R.ResponseOutputText(type="output_text", text=msg["text"], annotations=[])
+        item = _message(msg["id"], msg["text"], "completed")
+        yield R.ResponseTextDoneEvent(type="response.output_text.done", item_id=msg["id"], output_index=msg["index"],
+                                      content_index=0, text=msg["text"], logprobs=[], sequence_number=nxt())
+        yield R.ResponseContentPartDoneEvent(type="response.content_part.done", item_id=msg["id"],
+                                             output_index=msg["index"], content_index=0, part=part,
+                                             sequence_number=nxt())
+        yield R.ResponseOutputItemDoneEvent(type="response.output_item.done", output_index=msg["index"], item=item,
+                                            sequence_number=nxt())
+        output.append((msg["index"], item))
+        msg = None
+
+    def tool_done(call, item_id, index):
+        done = _make_execution_event(fence_type=call.name, code=call.code, output=call.output, sequence_number=nxt(),
+                                     output_index=index, status=call.status, item_id=item_id, container_id=container)
+        output.append((index, done.item))
+        return done
 
     start = snapshot("in_progress", [])
     yield R.ResponseCreatedEvent(type="response.created", response=start, sequence_number=nxt())
     yield R.ResponseInProgressEvent(type="response.in_progress", response=start, sequence_number=nxt())
-    yield R.ResponseOutputItemAddedEvent(type="response.output_item.added", output_index=0,
-                                         item=_message(item_id, "", "in_progress"), sequence_number=nxt())
-    yield R.ResponseContentPartAddedEvent(
-        type="response.content_part.added", item_id=item_id, output_index=0, content_index=0,
-        part=R.ResponseOutputText(type="output_text", text="", annotations=[]), sequence_number=nxt())
 
-    texts: list[str] = []
     final = None
-    async for event in run_turn(
+    _turn = run_turn(
         harness_name=harness_name, harness=harness, conversations=conversations,
         model=model, messages=messages, cwd=cwd, tool_manifest=manifest, streaming=True,
         session_id=kwargs.get("session_id") or resume,
-    ):
-        if event.kind == "text":
-            delta = event.text if not texts else TEXT_SEPARATOR + event.text
-            texts.append(event.text)
-            yield R.ResponseTextDeltaEvent(type="response.output_text.delta", item_id=item_id, output_index=0,
-                                           content_index=0, delta=delta, logprobs=[], sequence_number=nxt())
-        elif event.kind == "result":
-            final = event
+    )
+    async with aclosing(_turn):
+        async for event in _turn:
+            if event.kind == "text":
+                if msg is None:
+                    for e in open_message():
+                        yield e
+                # Separators keep output_text equal to the reply recorded for resume.
+                delta = event.text if not texts else TEXT_SEPARATOR + event.text
+                texts.append(event.text)
+                msg["text"] += delta
+                yield R.ResponseTextDeltaEvent(type="response.output_text.delta", item_id=msg["id"],
+                                               output_index=msg["index"], content_index=0, delta=delta,
+                                               logprobs=[], sequence_number=nxt())
+            elif event.kind == "tool_use":
+                for e in close_message():
+                    yield e
+                calls.started(event)
+                item_id = _new_id("ci")
+                index = next(indexes)
+                tools[event.id or item_id] = (item_id, index)
+                started = R.ResponseCodeInterpreterToolCall(
+                    id=item_id, type="code_interpreter_call", status="in_progress", container_id=container,
+                    code=f"{event.name}\n{_code(event)}", outputs=[])
+                yield R.ResponseOutputItemAddedEvent(type="response.output_item.added", output_index=index,
+                                                     item=started, sequence_number=nxt())
+            elif event.kind == "tool_result":
+                call = calls.finished(event)
+                if call is not None and event.id in tools:
+                    item_id, index = tools.pop(event.id)
+                    yield tool_done(call, item_id, index)
+            elif event.kind == "result":
+                final = event
+
+    for call, (item_id, index) in zip(calls.unfinished(), list(tools.values())):
+        yield tool_done(call, item_id, index)
+    tools.clear()
 
     text = TEXT_SEPARATOR.join(texts)
     failed = final is None or final.is_error
     if final is not None and not text and final.text:
         text = final.text  # e.g. an error message with no streamed text
-    part = R.ResponseOutputText(type="output_text", text=text, annotations=[])
-    message = _message(item_id, text, "completed")
-    yield R.ResponseTextDoneEvent(type="response.output_text.done", item_id=item_id, output_index=0,
-                                  content_index=0, text=text, logprobs=[], sequence_number=nxt())
-    yield R.ResponseContentPartDoneEvent(type="response.content_part.done", item_id=item_id, output_index=0,
-                                         content_index=0, part=part, sequence_number=nxt())
-    yield R.ResponseOutputItemDoneEvent(type="response.output_item.done", output_index=0, item=message,
-                                        sequence_number=nxt())
+        for e in open_message():
+            yield e
+        msg["text"] = text
+    for e in close_message():
+        yield e
     agentd = {"harness": harness_name, "session_id": final and final.session_id, "is_error": failed}
     if failed:
         error = {"code": "server_error", "message": (final and final.text) or "harness ended without a result"}
         yield R.ResponseFailedEvent(type="response.failed", sequence_number=nxt(),
-                                    response=snapshot("failed", [message], error=error, agentd=agentd))
+                                    response=snapshot("failed", finished_items(), error=error, agentd=agentd))
     else:
         _remember(client_obj, response_id, harness_name, final.session_id, messages, text)
         yield R.ResponseCompletedEvent(type="response.completed", sequence_number=nxt(),
-                                       response=snapshot("completed", [message], agentd=agentd))
+                                       response=snapshot("completed", finished_items(), agentd=agentd))
