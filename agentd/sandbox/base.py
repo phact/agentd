@@ -46,6 +46,18 @@ _RESERVED = {"", "agentd", "bin", "boot", "dev", "etc", "lib", "lib64", "proc", 
 DEFAULT_HOME = Path(os.environ.get("AGENTD_HOME", Path.home() / ".agentd"))
 
 
+def protected_host_paths() -> list[Path]:
+    """Host paths no sandbox may see: agentd's host-side sockets (MCP bridge,
+    model proxies that add credentials, the serve API) and its CA key, plus the
+    host logins those proxies read. A share that is, contains or sits inside
+    one of these is refused (e.g. mounting ``~`` read-only)."""
+    home = Path.home()
+    paths = [DEFAULT_HOME / "run", DEFAULT_HOME / "ca", DEFAULT_HOME / "serve",
+             Path(os.environ.get("CODEX_HOME", home / ".codex")) / "auth.json",
+             home / ".claude" / ".credentials.json"]
+    return [p.expanduser().resolve() for p in paths]
+
+
 @dataclass
 class Endpoint:
     """A sandbox-side socket and the host target its connections go to.
@@ -100,6 +112,10 @@ class Sandbox:
         """Root shell commands run once sandboxd is up (e.g. mounting shares)."""
         return []
 
+    def _expected_user_ids(self) -> tuple[int, int]:
+        """The (uid, gid) shared files have inside the sandbox; the user must match."""
+        return os.getuid(), os.getgid()
+
     async def _teardown(self) -> None:
         """Make sure the environment is gone (after sandboxd was asked to exit)."""
 
@@ -125,7 +141,7 @@ class Sandbox:
 
         setup = []
         if self.user is not None:
-            uid, gid = os.getuid(), os.getgid()
+            uid, gid = self._expected_user_ids()
             setup.append(
                 f'[ "$(id -u {self.user}):$(id -g {self.user})" = "{uid}:{gid}" ] || '
                 f'{{ echo "sandbox user {self.user} is $(id -u {self.user}):$(id -g {self.user}), host user is {uid}:{gid};'
@@ -262,6 +278,17 @@ class Sandbox:
         self._mux, self._mux_task = mux, task
         logger.debug("sandbox %s (%s) ready: %s", self.id, self.backend, hello)
 
+    async def add_endpoint(self, name: str, ep: Endpoint) -> None:
+        """Add a sandbox-side endpoint to a running sandbox."""
+        if name in self.endpoints:
+            raise ValueError(f"endpoint {name!r} already exists")
+        self.endpoints[name] = ep
+        try:
+            await self._listen(name, ep)
+        except BaseException:
+            del self.endpoints[name]
+            raise
+
     async def _listen(self, name: str, ep: Endpoint) -> None:
         kind, *addr = ep.sandbox
         meta: dict[str, Any] = {"kind": "listen", "name": name}
@@ -308,12 +335,43 @@ class Sandbox:
         if len(set(targets)) != len(targets):
             raise ValueError(f"two shared directories at the same sandbox path: {sorted(targets)}")
         shares = []
+        protected = protected_host_paths()
         for i, (target, host, read_only) in enumerate(sorted(entries)):
             top = Path(target).parts[1] if len(Path(target).parts) > 1 else ""
             if not target.startswith("/") or top in _RESERVED:
                 raise ValueError(f"cannot mount {host} over sandbox path {target!r}")
+            for p in protected:
+                if host == p or p.is_relative_to(host) or host.is_relative_to(p):
+                    raise ValueError(f"cannot share {host} with a sandbox: it would expose {p} "
+                                     "(agentd's sockets, CA key or host credentials)")
             shares.append((f"share{i}", target, host, read_only))
         return shares
+
+    def _write_probes(self) -> dict[str, tuple[str, Path | None]]:
+        """Something to look for in each share, to check the bind mount is real.
+
+        (Docker Desktop / Colima silently show an empty directory for host
+        paths not shared with their VM.) Used by the Docker and Colima backends. Writable shares get a marker file;
+        read-only shares are never written to, so an existing entry is used
+        instead (an empty read-only dir can't be checked and is skipped).
+
+        Returns {sandbox path: (name to look for, marker to delete or None)}."""
+        probes = {}
+        for _, target, host, read_only in self._shares():
+            if read_only:
+                entry = next(iter(sorted(host.iterdir())), None)
+                if entry is not None:
+                    probes[target] = (entry.name, None)
+            else:
+                marker = host / f".agentd-probe-{self.id}"
+                marker.touch()
+                probes[target] = (marker.name, marker)
+        return probes
+
+    def _remove_markers(self) -> None:
+        for _, marker in getattr(self, "_probes", {}).values():
+            if marker is not None:
+                marker.unlink(missing_ok=True)
 
     def _require_mux(self) -> Mux:
         if self._mux is None or self._mux.closed.is_set():

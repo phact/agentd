@@ -21,9 +21,11 @@ from __future__ import annotations
 import asyncio
 import os
 from dataclasses import dataclass, field
+from typing import Any
 from pathlib import Path
 
-from agentd.model_proxy import Credentials, ModelProxy, default_anthropic_credentials, default_openai_upstream
+from agentd.model_proxy import (Credentials, ModelProxy, ModelUpstream, default_anthropic_credentials,
+                                default_openai_upstream)
 from agentd.sandbox.base import DEFAULT_HOME, Endpoint, Sandbox
 from agentd.sandbox.docker import DEFAULT_IMAGE, DockerSandbox
 from agentd.sandbox.krun import KrunSandbox
@@ -38,6 +40,8 @@ OPENAI_ENDPOINT = ("tcp", "127.0.0.1", 8081)
 # Real hostnames served inside the sandbox over TLS (agentd.sandbox.tls), for
 # clients that require them: hostname -> sandbox loopback address.
 TLS_HOSTS = {"chatgpt.com": "127.0.0.2"}
+# Sandbox-side ports for extra model upstreams (see SandboxSession.model_upstream).
+UPSTREAM_PORTS = range(8090, 8190)
 SANDBOX_PATH = "/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin"
 
 
@@ -55,8 +59,9 @@ class TranscriptMount:
 class SandboxSession:
     workspace: Path
     backend: str = "krun"
-    rootfs: Path = DEFAULT_ROOTFS  # krun: base image directory
+    rootfs: Path = DEFAULT_ROOTFS  # krun: base image directory (on the Colima VM's disk with colima)
     image: str = DEFAULT_IMAGE      # docker: image name
+    colima: str | None = None       # krun: run inside this Colima profile's VM
     user: str = SANDBOX_USER
     cpus: int = 2
     mem_mib: int = 2048
@@ -73,6 +78,9 @@ class SandboxSession:
     sync_transcripts: bool = True
     # Extra host directories shared read-only, as {sandbox_path: host_path}.
     read_only_mounts: dict[str, Path] = field(default_factory=dict)
+    # Network access through agentd's egress proxy (agentd.egress.Egress);
+    # libkrun only. None: no network at all.
+    egress: Any = None
 
     def __post_init__(self) -> None:
         if self.backend not in BACKENDS:
@@ -84,6 +92,9 @@ class SandboxSession:
         self.sandbox: Sandbox | None = None
         self._proxies: list[ModelProxy] = []
         self.openai_credentials: Credentials | None = None
+        self._upstreams: dict[ModelUpstream, str] = {}
+        self._egress = None
+        self._upstream_lock = asyncio.Lock()
 
     async def start(self) -> "SandboxSession":
         if self.sandbox is not None:
@@ -124,6 +135,22 @@ class SandboxSession:
             mount.host_dir.mkdir(parents=True, exist_ok=True)
             mounts[mount.sandbox_path] = mount.host_dir
 
+        egress_extra: dict[str, Any] = {}
+        if self.egress is not None:
+            if self.backend != "krun":
+                raise ValueError("egress (network access) is only available with libkrun sandboxes; "
+                                 "Docker sandboxes have no network")
+            from agentd.egress import EgressSession
+
+            self._egress = EgressSession(self.egress, self.workspace, run_dir / f"{self.tag}-egress.sock",
+                                         session=self.tag)
+            try:
+                await self._egress.start()
+            except BaseException:
+                await self._stop_proxies()
+                raise
+            egress_extra["net_streams"] = self._egress.socket_path
+
         common = dict(
             workspace=self.workspace,
             mounts=mounts,
@@ -139,18 +166,56 @@ class SandboxSession:
             user=self.user,
         )
         if self.backend == "krun":
-            sandbox: Sandbox = KrunSandbox(rootfs=self.rootfs, **common)
+            sandbox: Sandbox = KrunSandbox(rootfs=self.rootfs, colima=self.colima, **egress_extra, **common)
         else:
             sandbox = DockerSandbox(image=self.image, **common)
         try:
             await sandbox.start()
             if tls_endpoints:
                 await self._trust_tls_hosts(sandbox, list(tls_endpoints))
+            if self._egress is not None:
+                script, ca = self._egress.trust_script()
+                out, code = await sandbox.exec(["/bin/sh", "-c", script], stdin=ca, user="root")
+                if code != 0:
+                    raise RuntimeError(f"installing the egress CA failed: {out.decode(errors='replace')}")
         except BaseException:
             await self._stop_proxies()
+            if self._egress is not None:
+                await self._egress.stop()
+                self._egress = None
             raise
         self.sandbox = sandbox
         return self
+
+    async def model_upstream(self, upstream: ModelUpstream) -> str:
+        """The base URL inside the sandbox for ``upstream``, proxied from the host.
+
+        Started on first use: a :class:`ModelProxy` on the host that adds the
+        key (if any) and, for ``api="chat"``, translates the Responses API, plus
+        a sandbox-side endpoint on the next free port in UPSTREAM_PORTS."""
+        if self.sandbox is None:
+            raise RuntimeError("the sandbox session is not running")
+        async with self._upstream_lock:
+            if upstream in self._upstreams:
+                return self._upstreams[upstream]
+            index = len(self._upstreams)
+            if index >= len(UPSTREAM_PORTS):
+                raise RuntimeError("too many model upstreams in one sandbox session")
+            port = UPSTREAM_PORTS[index]
+            proxy = ModelProxy(
+                DEFAULT_HOME / "run" / f"{self.tag}-upstream{index}.sock",
+                upstream.credentials(),
+                upstream.origin,
+                (upstream.path + "/",),
+                responses_via_chat=upstream.base_url.rstrip("/") if upstream.api == "chat" else None,
+            )
+            await proxy.start()
+            self._proxies.append(proxy)
+            await self.sandbox.add_endpoint(
+                f"upstream{index}", Endpoint(("tcp", "127.0.0.1", port), ("unix", str(proxy.socket_path))))
+            url = f"http://127.0.0.1:{port}{upstream.path}"
+            self._upstreams[upstream] = url
+            return url
 
     async def stop(self) -> None:
         if self.sandbox is not None:
@@ -158,6 +223,9 @@ class SandboxSession:
             self.sandbox = None
             await asyncio.to_thread(self.sync_transcripts_out)
         await self._stop_proxies()
+        if self._egress is not None:
+            await self._egress.stop()
+            self._egress = None
         self.bridge_socket_path.unlink(missing_ok=True)
 
     async def _trust_tls_hosts(self, sandbox: Sandbox, hosts: list[str]) -> None:
@@ -202,8 +270,11 @@ class SandboxSession:
     def base_env(self) -> dict[str, str]:
         """Environment every exec, shell and harness CLI gets in the sandbox."""
         skills = self.skills_dir or (self.workspace / "skills")
-        return {
+        env = {
             "PATH": f"{skills}:{SANDBOX_PATH}",
             "PTC_SKILLS_DIR": str(skills),
             "MCP_BRIDGE_SOCKET": SANDBOX_BRIDGE_SOCKET,
         }
+        if self._egress is not None:
+            env.update(self._egress.sandbox_env())  # secret placeholders, CA settings
+        return env

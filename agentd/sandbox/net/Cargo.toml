@@ -1,0 +1,23 @@
+[package]
+name = "agentd-net"
+version = "0.1.0"
+edition = "2021"
+description = "The network card of an agentd libkrun sandbox: Ethernet frames in, policy-ready TCP connections out"
+license = "MIT"
+publish = false
+
+[[bin]]
+name = "agentd-net"
+path = "src/main.rs"
+
+[dependencies]
+smoltcp = { version = "0.14", default-features = false, features = ["std", "log", "medium-ethernet", "proto-ipv4", "socket-tcp", "socket-udp"] }
+tokio = { version = "1", features = ["rt", "net", "io-util", "io-std", "sync", "time", "macros"] }
+simple-dns = "0.12"
+serde_json = "1"
+
+[profile.release]
+opt-level = 3
+lto = true
+codegen-units = 1
+strip = true

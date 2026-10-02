@@ -85,27 +85,6 @@ class DockerSandbox(Sandbox):
         except Exception as e:
             raise RuntimeError(f"container {self.container_name} failed to start: {e}; {self._console_tail()}") from e
 
-    def _write_probes(self) -> dict[str, tuple[str, Path | None]]:
-        """Something to look for in each share, to check the bind mount is real.
-
-        (Docker Desktop / Colima silently mount an empty directory for host
-        paths not shared with their VM.) Writable shares get a marker file;
-        read-only shares are never written to, so an existing entry is used
-        instead (an empty read-only dir can't be checked and is skipped).
-
-        Returns {sandbox path: (name to look for, marker to delete or None)}."""
-        probes = {}
-        for _, target, host, read_only in self._shares():
-            if read_only:
-                entry = next(iter(sorted(host.iterdir())), None)
-                if entry is not None:
-                    probes[target] = (entry.name, None)
-            else:
-                marker = host / f".agentd-probe-{self.id}"
-                marker.touch()
-                probes[target] = (marker.name, marker)
-        return probes
-
     def _setup_commands(self) -> list[str]:
         commands = []
         for target, (name, _) in getattr(self, "_probes", {}).items():
@@ -128,11 +107,6 @@ class DockerSandbox(Sandbox):
             if dirs:
                 commands.append(f"chown {self.user}: " + " ".join(shlex.quote(d) for d in sorted(dirs)))
         return commands
-
-    def _remove_markers(self) -> None:
-        for _, marker in getattr(self, "_probes", {}).values():
-            if marker is not None:
-                marker.unlink(missing_ok=True)
 
     async def _start(self):
         try:

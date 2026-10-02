@@ -53,9 +53,38 @@ def _xattr_setter():
     return set_stat
 
 
+def _export_with_real_owners(image: str, dest: Path) -> Path:
+    """Linux: extract as root, keeping the image's owners and modes.
+
+    Linux libkrun serves files with their real owners (it ignores the
+    override_stat xattrs macOS libkrun uses), so a rootfs owned by the host
+    user would make setuid binaries such as ``mount`` drop root inside the
+    sandbox. Needs root (``sudo`` unless already root)."""
+    sudo = [] if os.geteuid() == 0 else ["sudo"]
+    tmp = dest.with_name(f"{dest.name}.tmp.{os.getpid()}")
+    subprocess.run(sudo + ["rm", "-rf", str(tmp)], check=True)
+    subprocess.run(sudo + ["mkdir", "-p", str(tmp)], check=True)
+    cid = subprocess.run(["docker", "create", image], check=True, capture_output=True, text=True).stdout.strip()
+    try:
+        export = subprocess.Popen(["docker", "export", cid], stdout=subprocess.PIPE)
+        untar = subprocess.run(sudo + ["tar", "-x", "--numeric-owner", "-C", str(tmp)], stdin=export.stdout)
+        export.stdout.close()
+        if export.wait() != 0 or untar.returncode != 0:
+            raise RuntimeError(f"exporting {image} failed")
+    finally:
+        subprocess.run(["docker", "rm", cid], capture_output=True)
+    subprocess.run(sudo + ["rm", "-rf", str(dest)], check=True)
+    subprocess.run(sudo + ["mv", str(tmp), str(dest)], check=True)
+    return dest
+
+
 def export_image(image: str, name: str, home: Path = DEFAULT_HOME) -> Path:
-    """Export ``image`` to ``home/rootfs/name`` with ownership xattrs."""
+    """Export ``image`` to ``home/rootfs/name``: on macOS owned by you with
+    ownership xattrs; on Linux with its real owners (see above)."""
     dest = home / "rootfs" / name
+    dest.parent.mkdir(parents=True, exist_ok=True)
+    if sys.platform != "darwin":
+        return _export_with_real_owners(image, dest)
     tmp = dest.with_name(f"{name}.tmp.{os.getpid()}")
     shutil.rmtree(tmp, ignore_errors=True)
     tmp.mkdir(parents=True)
@@ -85,7 +114,7 @@ def export_image(image: str, name: str, home: Path = DEFAULT_HOME) -> Path:
             raise RuntimeError(f"docker export {cid} failed")
     finally:
         subprocess.run(["docker", "rm", cid], capture_output=True)
-    if collisions:
+    if collisions and sys.platform == "darwin":  # only case-insensitive filesystems collide
         print(f"warning: {len(collisions)} paths differ only by case and collided on this "
               f"filesystem, e.g. {collisions[:3]}", file=sys.stderr)
     shutil.rmtree(dest, ignore_errors=True)

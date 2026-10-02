@@ -131,16 +131,21 @@ def test_claude_project_dirname():
 def _live_backends():
     from agentd.sandbox.executor import docker_available, krun_available
 
-    return [b for b, ok in (("krun", krun_available()), ("docker", docker_available())) if ok]
+    from agentd.sandbox.executor import colima_available
+
+    return [b for b, ok in (("krun", krun_available()), ("krun-colima", colima_available()),
+                            ("docker", docker_available())) if ok]
 
 
-@pytest.fixture(params=["krun", "docker"])
+@pytest.fixture(params=["krun", "krun-colima", "docker"])
 def live_executor(request):
     """Executor factory per backend for live tests (workspaces under ~/.agentd/tmp)."""
     from agentd.sandbox.executor import DockerExecutor, KrunExecutor
 
     if request.param not in _live_backends():
         pytest.skip(f"{request.param} sandbox not set up")
+    if request.param == "krun-colima":
+        return lambda **kw: KrunExecutor(colima=True, **kw)
     return KrunExecutor if request.param == "krun" else DockerExecutor
 
 

@@ -23,10 +23,63 @@
 //                    -- EXEC [ARG]...
 
 #include <libkrun.h>
+#include <pthread.h>
+#include <signal.h>
 #include <stdbool.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <unistd.h>
+#include <limits.h>
+#include <sys/resource.h>
+#ifdef __APPLE__
+#include <sys/event.h>
+#else
+#include <sys/prctl.h>
+#endif
+
+// The microVM must not outlive the host process that started it (if that
+// process is killed, nothing could ever talk to or stop the VM again).
+#ifdef __APPLE__
+static void *watch_parent(void *arg) {
+    pid_t parent = (pid_t)(intptr_t)arg;
+    int kq = kqueue();
+    struct kevent ev;
+    EV_SET(&ev, parent, EVFILT_PROC, EV_ADD | EV_ONESHOT, NOTE_EXIT, 0, NULL);
+    if (kq < 0 || kevent(kq, &ev, 1, NULL, 0, NULL) < 0) {
+        // Already gone (ESRCH) or no kqueue: fall back to polling.
+        while (getppid() == parent) sleep(1);
+    } else {
+        kevent(kq, NULL, 0, &ev, 1, NULL);
+    }
+    _exit(137);
+    return NULL;
+}
+#endif
+
+// libkrun's file server keeps a descriptor per open file in shared
+// directories; login sessions often start with a soft limit of 1024.
+static void raise_nofile(void) {
+    struct rlimit rl;
+    if (getrlimit(RLIMIT_NOFILE, &rl) == 0 && rl.rlim_cur < rl.rlim_max) {
+        rl.rlim_cur = rl.rlim_max;
+#ifdef __APPLE__
+        if (rl.rlim_cur > OPEN_MAX) rl.rlim_cur = OPEN_MAX;  // macOS caps it here
+#endif
+        setrlimit(RLIMIT_NOFILE, &rl);
+    }
+}
+
+static void exit_with_parent(void) {
+    pid_t parent = getppid();
+#ifdef __APPLE__
+    pthread_t t;
+    if (pthread_create(&t, NULL, watch_parent, (void *)(intptr_t)parent) == 0) pthread_detach(t);
+#else
+    prctl(PR_SET_PDEATHSIG, SIGKILL);
+#endif
+    if (getppid() != parent) _exit(137);  // died before we were watching
+}
 
 #define MAX_ITEMS 64
 
@@ -51,7 +104,9 @@ static uint8_t *slurp(const char *path, size_t *len) {
 }
 
 int main(int argc, char **argv) {
-    const char *root = NULL, *vsock_sock = NULL, *workdir = "/";
+    exit_with_parent();
+    raise_nofile();
+    const char *root = NULL, *vsock_sock = NULL, *workdir = "/", *net_sock = NULL;
     const char *shares[MAX_ITEMS], *overlay_dirs[MAX_ITEMS], *injects[MAX_ITEMS];
     bool share_ro[MAX_ITEMS];
     const char *envp[MAX_ITEMS + 1];
@@ -68,6 +123,7 @@ int main(int argc, char **argv) {
         if (!strcmp(flag, "--root")) root = v;
         else if (!strcmp(flag, "--vsock-sock")) vsock_sock = v;
         else if (!strcmp(flag, "--vsock-port")) vsock_port = atoi(v);
+        else if (!strcmp(flag, "--net-sock")) net_sock = v;
         else if (!strcmp(flag, "--cpus")) cpus = atoi(v);
         else if (!strcmp(flag, "--mem")) mem = atoi(v);
         else if (!strcmp(flag, "--workdir")) workdir = v;
@@ -117,7 +173,14 @@ int main(int argc, char **argv) {
         if ((rc = krun_add_virtiofs3(ctx, spec, eq + 1, 0, share_ro[s]))) die("krun_add_virtiofs3", rc);
     }
 
-    // Zero egress: no TSI, no NIC. The host-dialed port is the only channel.
+    // No TSI ever. Without --net-sock there is no NIC either: the host-dialed
+    // vsock port is the only channel. With it, eth0 is a virtio-net device
+    // whose frames go to agentd-net on the host (passt's unixstream protocol),
+    // which decides what, if anything, leaves.
+    if (net_sock) {
+        uint8_t mac[6] = {0x02, 0x61, 0x67, 0x65, 0x6e, 0x74};  // locally administered
+        if ((rc = krun_add_net_unixstream(ctx, net_sock, -1, mac, 0, 0))) die("krun_add_net_unixstream", rc);
+    }
     if ((rc = krun_disable_implicit_vsock(ctx))) die("krun_disable_implicit_vsock", rc);
     if ((rc = krun_add_vsock(ctx, 0))) die("krun_add_vsock", rc);
     if ((rc = krun_add_vsock_port2(ctx, (uint32_t)vsock_port, vsock_sock, true)))

@@ -43,6 +43,18 @@ def _krun_rootfs(rootfs: Path) -> bool:
     return DEFAULT_LAUNCHER.exists() and (rootfs / "usr" / "local" / "bin" / "python3").exists()
 
 
+_COLIMA_READY = None
+
+
+def _colima_ready() -> bool:
+    global _COLIMA_READY
+    if _COLIMA_READY is None:
+        from agentd.sandbox.executor import colima_available
+
+        _COLIMA_READY = colima_available()
+    return _COLIMA_READY
+
+
 def run(coro):
     return asyncio.run(coro)
 
@@ -58,13 +70,18 @@ async def _py(sb, code, **kw):
     return out.decode(errors="replace"), rc
 
 
-@pytest.fixture(params=["krun", "docker"])
+@pytest.fixture(params=["krun", "krun-colima", "docker"])
 def make_sandbox(request):
     """A sandbox factory for each backend, on a plain python image."""
     if request.param == "krun":
         if not _krun_rootfs(PY_ROOTFS):
             pytest.skip("libkrun launcher or python-3.11-slim rootfs not set up")
         make = lambda **kw: KrunSandbox(rootfs=PY_ROOTFS, **kw)  # noqa: E731
+    elif request.param == "krun-colima":
+        if not _colima_ready():
+            pytest.skip("Colima profile not set up (agentd-sandbox colima setup)")
+        from agentd.sandbox import colima
+        make = lambda **kw: KrunSandbox(rootfs=colima.vm_rootfs("agents"), colima=colima.PROFILE, **kw)  # noqa: E731
     else:
         if not _docker_image(PY_IMAGE):
             pytest.skip(f"docker or the {PY_IMAGE} image not available")
@@ -73,7 +90,7 @@ def make_sandbox(request):
     return make
 
 
-@pytest.fixture(params=["krun", "docker"])
+@pytest.fixture(params=["krun", "krun-colima", "docker"])
 def make_executor(request):
     """An executor factory for each backend, on the agents image."""
     from agentd.sandbox.executor import DockerExecutor, KrunExecutor
@@ -82,6 +99,10 @@ def make_executor(request):
         if not (_krun_rootfs(AGENTS_ROOTFS) and os.path.lexists(AGENTS_ROOTFS / "usr/local/bin/claude")):
             pytest.skip("libkrun launcher or agents rootfs not set up")
         make = lambda **kw: KrunExecutor(AGENTS_ROOTFS, **kw)  # noqa: E731
+    elif request.param == "krun-colima":
+        if not _colima_ready():
+            pytest.skip("Colima profile not set up (agentd-sandbox colima setup)")
+        make = lambda **kw: KrunExecutor(colima=True, **kw)  # noqa: E731
     else:
         if not _docker_image(AGENTS_IMAGE):
             pytest.skip(f"docker or the {AGENTS_IMAGE} image not available")
@@ -502,3 +523,30 @@ def test_executor_mounts_option(make_executor):
             out, rc = ex.execute_bash("touch /home/agent/models/x", Path(ws))
             assert rc != 0 and "Read-only file system" in out
         assert sorted(p.name for p in data.iterdir()) == ["model.bin"]
+
+
+def test_shares_never_expose_agentd_sockets_or_credentials(tmp_path, monkeypatch):
+    """Mounting e.g. ~ read-only must not hand a sandbox agentd's sockets, CA key or host logins."""
+    from agentd.sandbox import base
+
+    home = tmp_path / "home"
+    agentd_home = home / ".agentd"
+    (agentd_home / "run").mkdir(parents=True)
+    (home / ".codex").mkdir()
+    monkeypatch.setattr(base.Path, "home", classmethod(lambda cls: home))
+    monkeypatch.setattr(base, "DEFAULT_HOME", agentd_home)
+    monkeypatch.delenv("CODEX_HOME", raising=False)
+    ws = home / "work"
+    ws.mkdir()
+
+    def shares(**kw):
+        return base.Sandbox(workspace=ws, **kw)._shares()
+
+    assert len(shares(read_only_mounts={"/data": home / "work"})) == 2, "ordinary dirs are fine"
+    assert len(shares(mounts={"/t": agentd_home / "transcripts"})) == 2, "agentd's own stores are fine"
+    for bad in (home, agentd_home, agentd_home / "run", agentd_home / "run" / "x", agentd_home / "ca",
+                home / ".codex", home / ".claude"):
+        with pytest.raises(ValueError, match="would expose"):
+            shares(read_only_mounts={"/x": bad})
+    with pytest.raises(ValueError, match="would expose"):
+        base.Sandbox(workspace=home)._shares()

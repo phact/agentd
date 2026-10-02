@@ -61,21 +61,30 @@ def enter_overlay_root() -> None:
     /usr) work and vanish with the VM, and the base image is never touched.
     Everything sandboxd starts afterwards inherits the new root.
     """
-    import subprocess
-
-    def run(*argv: str) -> None:
-        subprocess.run(argv, check=True)
-
-    run("mount", "-t", "tmpfs", "-o", "mode=0755", "tmpfs", OVERLAY_BASE)
+    _mount("tmpfs", OVERLAY_BASE, "tmpfs", 0, "mode=0755")
     for d in ("upper", "work", "root"):
         os.mkdir(os.path.join(OVERLAY_BASE, d))
     root = os.path.join(OVERLAY_BASE, "root")
-    run("mount", "-t", "overlay", "overlay", "-o",
-        f"lowerdir=/,upperdir={OVERLAY_BASE}/upper,workdir={OVERLAY_BASE}/work", root)
+    _mount("overlay", root, "overlay", 0,
+           f"lowerdir=/,upperdir={OVERLAY_BASE}/upper,workdir={OVERLAY_BASE}/work")
     for d in ("proc", "sys", "dev"):
-        run("mount", "--rbind", f"/{d}", os.path.join(root, d))
+        _mount(f"/{d}", os.path.join(root, d), None, _MS_BIND | _MS_REC, None)
     os.chroot(root)
     os.chdir("/")
+
+
+_MS_BIND, _MS_REC = 0x1000, 0x4000
+
+
+def _mount(source: str, target: str, fstype: str | None, flags: int, data: str | None) -> None:
+    """mount(2) directly: spawning `mount` costs ~100ms each under nested virtualization."""
+    import ctypes
+
+    libc = ctypes.CDLL(None, use_errno=True)
+    enc = lambda s: s.encode() if s is not None else None  # noqa: E731
+    if libc.mount(enc(source), enc(target), enc(fstype), ctypes.c_ulong(flags), enc(data)) != 0:
+        err = ctypes.get_errno()
+        raise OSError(err, f"mount {source} on {target}: {os.strerror(err)}")
 
 VERSION = 1
 
@@ -127,10 +136,7 @@ class ShellSession:
 
     def _kill(self) -> None:
         if self.proc is not None and self.proc.returncode is None:
-            try:
-                os.killpg(self.proc.pid, signal.SIGKILL)
-            except ProcessLookupError:
-                pass
+            kill_tree(self.proc.pid)
         self.proc = None
 
     async def run(self, stream: Stream, command: str, cwd: str | None, timeout: float | None) -> dict:
@@ -200,6 +206,41 @@ class ShellSession:
             if len(buf) > hold:
                 await stream.write(buf[:-hold])
                 buf = buf[-hold:]
+
+
+def _descendants(pid: int) -> list[int]:
+    """All live descendants of ``pid`` (children may have left its process group)."""
+    children: dict[int, list[int]] = {}
+    for entry in os.listdir("/proc"):
+        if not entry.isdigit():
+            continue
+        try:
+            with open(f"/proc/{entry}/stat") as f:
+                # comm may contain spaces/parens: the ppid follows the last ')'
+                ppid = int(f.read().rsplit(")", 1)[1].split()[1])
+        except (OSError, ValueError, IndexError):
+            continue
+        children.setdefault(ppid, []).append(int(entry))
+    found, stack = [], [pid]
+    while stack:
+        for child in children.get(stack.pop(), []):
+            found.append(child)
+            stack.append(child)
+    return found
+
+
+def kill_tree(pid: int) -> None:
+    """SIGKILL ``pid``, its process group, and every descendant."""
+    targets = _descendants(pid)
+    try:
+        os.killpg(pid, signal.SIGKILL)
+    except (ProcessLookupError, PermissionError):
+        pass
+    for target in [pid, *targets]:
+        try:
+            os.kill(target, signal.SIGKILL)
+        except (ProcessLookupError, PermissionError):
+            pass
 
 
 def _unlink(path: str) -> None:
@@ -312,13 +353,11 @@ class Sandboxd:
                 pass
 
         async def kill_if_abandoned() -> None:
-            # The host closed the stream before the command finished.
+            # The host closed the stream before the command finished: kill
+            # the command and everything it started (e.g. a harness CLI's tools).
             await stream.wait_closed()
             if proc.returncode is None:
-                try:
-                    os.killpg(proc.pid, signal.SIGKILL)
-                except ProcessLookupError:
-                    pass
+                kill_tree(proc.pid)
 
         stdin_task = asyncio.ensure_future(feed_stdin())
         watchdog = asyncio.ensure_future(kill_if_abandoned())
@@ -357,14 +396,58 @@ class Sandboxd:
 
 
 def log(msg: str) -> None:
-    print(f"sandboxd: {msg}", file=sys.stderr, flush=True)
+    import time as _time
+
+    print(f"sandboxd [{_time.monotonic():.2f} mono]: {msg}", file=sys.stderr, flush=True)
+
+
+def configure_net(address: str, gateway: str) -> None:
+    """Bring up eth0 (agentd-net's network card): address, default route via
+    the gateway, DNS at the gateway, no IPv6. Plain ioctls: no `ip` needed."""
+    import fcntl
+    import struct
+
+    ip, prefix = address.split("/")
+    mask = socket.inet_ntoa(struct.pack(">I", (0xFFFFFFFF << (32 - int(prefix))) & 0xFFFFFFFF))
+    s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+
+    def sockaddr(addr: str) -> bytes:
+        return struct.pack("HH4s8s", socket.AF_INET, 0, socket.inet_aton(addr), b"\0" * 8)
+
+    def ifreq(data: bytes) -> bytes:
+        return struct.pack("16s", b"eth0") + data + b"\0" * (24 - len(data))
+
+    fcntl.ioctl(s, 0x8916, ifreq(sockaddr(ip)))      # SIOCSIFADDR
+    fcntl.ioctl(s, 0x891C, ifreq(sockaddr(mask)))    # SIOCSIFNETMASK
+    flags = struct.unpack("H", fcntl.ioctl(s, 0x8913, ifreq(b""))[16:18])[0]  # SIOCGIFFLAGS
+    fcntl.ioctl(s, 0x8914, ifreq(struct.pack("H", flags | 0x1 | 0x40)))       # SIOCSIFFLAGS: up, running
+    route = struct.pack("@L16s16s16sHhLPhPLLH", 0, sockaddr("0.0.0.0"), sockaddr(gateway), sockaddr("0.0.0.0"),
+                        0x3, 0, 0, 0, 0, 0, 0, 0, 0)  # RTF_UP | RTF_GATEWAY
+    fcntl.ioctl(s, 0x890B, route)                     # SIOCADDRT: default route
+    for knob in ("all", "default", "eth0"):
+        try:
+            with open(f"/proc/sys/net/ipv6/conf/{knob}/disable_ipv6", "w") as f:
+                f.write("1")
+        except OSError:
+            pass
+    try:
+        os.unlink("/etc/resolv.conf")  # may be a symlink into /run
+    except OSError:
+        pass
+    with open("/etc/resolv.conf", "w") as f:
+        f.write(f"nameserver {gateway}\noptions single-request\n")
 
 
 def main() -> None:
     args = sys.argv[1:]
+    if args[:1] == ["--configure-net"]:
+        configure_net(args[1], args[2])
+        return
     if "--overlay" in args:
         args.remove("--overlay")
+        log("starting; building the session overlay")
         enter_overlay_root()
+        log("overlay ready")
     if "--stdio" in args:
         asyncio.run(Sandboxd(0).serve_stdio())
         return

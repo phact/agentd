@@ -123,10 +123,13 @@ def test_previous_response_id_survives_a_new_client(monkeypatch, tmp_path):
 def _live_backends():
     from agentd.sandbox.executor import docker_available, krun_available
 
-    return [b for b, ok in (("krun", krun_available()), ("docker", docker_available())) if ok]
+    from agentd.sandbox.executor import colima_available
+
+    return [b for b, ok in (("krun", krun_available()), ("krun-colima", colima_available()),
+                            ("docker", docker_available())) if ok]
 
 
-@pytest.fixture(params=["krun", "docker"])
+@pytest.fixture(params=["krun", "krun-colima", "docker"])
 def live_executor(request):
     from agentd.sandbox.executor import DockerExecutor, KrunExecutor
 
@@ -134,6 +137,8 @@ def live_executor(request):
         pytest.skip("set AGENTD_LIVE=1 (makes real model calls)")
     if request.param not in _live_backends():
         pytest.skip(f"{request.param} sandbox not set up")
+    if request.param == "krun-colima":
+        return lambda **kw: KrunExecutor(colima=True, **kw)
     return KrunExecutor if request.param == "krun" else DockerExecutor
 
 

@@ -21,6 +21,7 @@ from __future__ import annotations
 import asyncio
 import os
 import shlex
+import shutil
 import threading
 from pathlib import Path, PurePosixPath
 
@@ -72,6 +73,7 @@ class SandboxExecutor:
         *,
         rootfs: Path | str = DEFAULT_ROOTFS,
         image: str = DEFAULT_IMAGE,
+        colima: str | None = None,
         timeout: int = 60,
         user: str = SANDBOX_USER,
         cpus: int = 2,
@@ -80,6 +82,7 @@ class SandboxExecutor:
         transcripts_dir: Path | str | None = None,
         sync_transcripts: bool = True,
         mounts: Mounts = None,
+        egress: Any = None,
     ):
         """``transcripts_dir``: root for harness transcript stores (default
         ``~/.agentd/transcripts``). ``sync_transcripts``: also copy them to
@@ -87,8 +90,9 @@ class SandboxExecutor:
         ``mounts``: extra host directories the sandbox can read but never
         change, as a list (each at the same path inside) or a
         ``{host_path: sandbox_path}`` dict (see :func:`read_only_mounts`)."""
-        self.rootfs = Path(rootfs)
+        self.rootfs = Path(rootfs) if not colima else rootfs
         self.image = image
+        self.colima = colima
         self.timeout = timeout
         self.user = user
         self.cpus = cpus
@@ -97,6 +101,7 @@ class SandboxExecutor:
         self.transcripts_dir = Path(transcripts_dir).resolve() if transcripts_dir else None
         self.sync_transcripts = sync_transcripts
         self.read_only_mounts = read_only_mounts(mounts)
+        self.egress = egress  # agentd.egress.Egress: network access (libkrun only)
         self._id = os.urandom(4).hex()
         self._bridge_socket = DEFAULT_HOME / "run" / f"{self._id}-bridge.sock"
         self.session: SandboxSession | None = None
@@ -159,6 +164,12 @@ class SandboxExecutor:
     async def run(self, coro):
         """Run a coroutine on the session's event loop (from any loop)."""
         return await asyncio.wrap_future(asyncio.run_coroutine_threadsafe(coro, self._loop))
+
+    async def stop_session(self) -> None:
+        """Stop the sandbox but keep the executor: the next use boots a fresh one."""
+        session, self.session = self.session, None
+        if session is not None:
+            await self.run(session.stop())
 
     async def ensure_session(self, cwd: Path) -> SandboxSession:
         """Boot the sandbox (if needed) with ``cwd`` as its workspace."""
@@ -250,6 +261,7 @@ class SandboxExecutor:
                     backend=self.backend,
                     rootfs=self.rootfs,
                     image=self.image,
+                    colima=self.colima,
                     user=self.user,
                     cpus=self.cpus,
                     mem_mib=self.mem_mib,
@@ -258,6 +270,7 @@ class SandboxExecutor:
                     transcripts_root=self.transcripts_dir,
                     sync_transcripts=self.sync_transcripts,
                     read_only_mounts=self.read_only_mounts,
+                    egress=self.egress,
                 )
                 await session.start()
                 self.session = session
@@ -301,12 +314,30 @@ class SandboxExecutor:
 
 
 class KrunExecutor(SandboxExecutor):
-    """Sandbox executor on a libkrun microVM (the strongest isolation)."""
+    """Sandbox executor on a libkrun microVM (the strongest isolation).
+
+    ``colima=True`` (or a profile name) runs the microVMs with Linux libkrun
+    inside a Colima VM with nested virtualization instead of natively; the
+    base image then lives on that VM's disk. ``agentd-sandbox colima setup``
+    prepares the VM (it asks before changing anything).
+
+    ``image`` picks a base image by name (``~/.agentd/rootfs/NAME`` natively,
+    or one built into the Colima VM with ``agentd-sandbox colima setup
+    --image-dir DIR --image NAME``); ``rootfs`` gives a path instead."""
 
     backend = "krun"
 
-    def __init__(self, rootfs: Path | str = DEFAULT_ROOTFS, **kwargs):
-        super().__init__(rootfs=rootfs, **kwargs)
+    def __init__(self, rootfs: Path | str | None = None, *, colima: bool | str | None = None,
+                 image: str | None = None, **kwargs):
+        from agentd.sandbox import colima as colima_mod
+
+        profile = colima_mod.PROFILE if colima is True else (colima or None)
+        if rootfs is not None and image is not None:
+            raise ValueError("pass rootfs= or image=, not both")
+        if rootfs is None:
+            name = image or "agents"
+            rootfs = colima_mod.vm_rootfs(name) if profile else DEFAULT_ROOTFS.parent / name
+        super().__init__(rootfs=rootfs, colima=profile, **kwargs)
 
 
 class DockerExecutor(SandboxExecutor):
@@ -319,11 +350,11 @@ class DockerExecutor(SandboxExecutor):
 
 
 def krun_available(rootfs: Path | str = DEFAULT_ROOTFS) -> bool:
+    """Native libkrun: the signed launcher and a local base image exist."""
     return DEFAULT_LAUNCHER.exists() and (Path(rootfs) / "usr").is_dir()
 
 
 def docker_available(image: str = DEFAULT_IMAGE) -> bool:
-    import shutil
     import subprocess
 
     if shutil.which("docker") is None:
@@ -332,16 +363,40 @@ def docker_available(image: str = DEFAULT_IMAGE) -> bool:
     return r.returncode == 0
 
 
+def colima_available(profile: str | None = None) -> bool:
+    """True if a Colima profile is already set up for libkrun (read-only check)."""
+    from agentd.sandbox import colima
+
+    profile = profile or colima.PROFILE
+    if shutil.which("colima") is None or not (Path.home() / ".colima" / profile).is_dir():
+        return False
+    return colima.status(profile).ready
+
+
 def default_executor() -> SandboxExecutor:
-    """A libkrun executor if it is set up, else Docker, else an error saying how."""
+    """The best sandbox that is already set up: native libkrun, libkrun in
+    Colima, then Docker. ``AGENTD_SANDBOX`` = ``krun`` | ``krun-colima`` |
+    ``docker`` forces one. Nothing is set up implicitly."""
+    choice = os.environ.get("AGENTD_SANDBOX")
+    if choice == "krun":
+        return KrunExecutor()
+    if choice == "krun-colima":
+        return KrunExecutor(colima=True)
+    if choice == "docker":
+        return DockerExecutor()
+    if choice:
+        raise ValueError(f"AGENTD_SANDBOX must be krun, krun-colima or docker, not {choice!r}")
     if krun_available():
         return KrunExecutor()
+    if colima_available():
+        return KrunExecutor(colima=True)
     if docker_available():
         return DockerExecutor()
     raise RuntimeError(
         "No sandbox available for agentd. Set one up:\n"
         "  libkrun (macOS arm64 / Linux KVM): agentd/sandbox/build.sh && "
         "python -m agentd.sandbox.rootfs build agentd/sandbox/images/agents agents\n"
+        "  libkrun in Colima (macOS, M3+): agentd-sandbox colima setup\n"
         "  Docker: python -m agentd.sandbox.rootfs build agentd/sandbox/images/agents agents "
         "(builds the agentd-sandbox-agents image too)\n"
         "or pass executor=KrunExecutor(...) / DockerExecutor(...) explicitly."
