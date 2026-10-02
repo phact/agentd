@@ -9,6 +9,7 @@ placeholder. Permissions are ``bypassPermissions``: the VM is the boundary.
 from __future__ import annotations
 
 import shlex
+from contextlib import aclosing
 from dataclasses import dataclass, field
 from typing import AsyncIterator
 
@@ -50,5 +51,7 @@ class ClaudeCodeHarness:
             setting_sources=["user", "project"], permission_mode="bypassPermissions",
             extra_args=self.extra_args,
         )
-        async for event in claude_cli.run_in_sandbox(self.executor, argv, prompt, cwd=str(session.workspace)):
-            yield event
+        events = claude_cli.run_in_sandbox(self.executor, argv, prompt, cwd=str(session.workspace))
+        async with aclosing(events):
+            async for event in events:
+                yield event

@@ -15,6 +15,7 @@ from __future__ import annotations
 import asyncio
 import json
 import os
+from contextlib import aclosing
 from pathlib import Path
 from typing import Any, AsyncIterator
 
@@ -82,11 +83,13 @@ def parse_line(line: bytes | str) -> list[HarnessEvent]:
             if block.get("type") == "text":
                 events.append(HarnessEvent("text", text=block.get("text", "")))
             elif block.get("type") == "tool_use":
-                events.append(HarnessEvent("tool_use", name=block.get("name", ""), data=block.get("input")))
+                events.append(HarnessEvent("tool_use", name=block.get("name", ""), data=block.get("input"),
+                                           id=block.get("id", "")))
         return events
     if kind == "user" and isinstance(blocks, list):
         return [
-            HarnessEvent("tool_result", data=block.get("content"), is_error=bool(block.get("is_error")))
+            HarnessEvent("tool_result", data=block.get("content"), is_error=bool(block.get("is_error")),
+                         id=block.get("tool_use_id", ""))
             for block in blocks if isinstance(block, dict) and block.get("type") == "tool_result"
         ]
     if kind == "result":
@@ -101,17 +104,19 @@ async def run_in_sandbox(executor, argv: list[str], prompt: str, *, cwd: str) ->
     """Run ``argv`` in the executor's (started) sandbox session."""
     tail: list[str] = []
     done = False
-    async for kind, value in executor.stream_exec(argv, cwd=cwd, env=sandbox_env(), stdin=prompt.encode()):
-        if kind == "line":
-            events = parse_line(value)
-            if not events and value.strip() and not value.lstrip().startswith(b"{"):
-                tail = (tail + [value.decode(errors="replace")])[-20:]
-            for event in events:
-                done = done or event.kind == "result"
-                yield event
-        elif not done:
-            yield HarnessEvent("result", text=f"claude exited {value.get('exit')}: " + "\n".join(tail),
-                               is_error=True)
+    lines = executor.stream_exec(argv, cwd=cwd, env=sandbox_env(), stdin=prompt.encode())
+    async with aclosing(lines):  # closing it kills the CLI in the sandbox
+        async for kind, value in lines:
+            if kind == "line":
+                events = parse_line(value)
+                if not events and value.strip() and not value.lstrip().startswith(b"{"):
+                    tail = (tail + [value.decode(errors="replace")])[-20:]
+                for event in events:
+                    done = done or event.kind == "result"
+                    yield event
+            elif not done:
+                yield HarnessEvent("result", text=f"claude exited {value.get('exit')}: " + "\n".join(tail),
+                                   is_error=True)
 
 
 async def run_on_host(argv: list[str], prompt: str, *, cwd: str | Path | None) -> AsyncIterator[HarnessEvent]:

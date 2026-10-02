@@ -18,6 +18,7 @@ from __future__ import annotations
 
 import asyncio
 import os
+from contextlib import aclosing
 import shutil
 import subprocess
 from functools import lru_cache
@@ -232,15 +233,17 @@ async def _claude_cli_events(model: str, messages: list[dict[str, Any]], **kwarg
         events = claude_cli.run_in_sandbox(executor, argv, user_prompt, cwd=str(session.workspace))
     else:
         events = claude_cli.run_on_host(argv, user_prompt, cwd=cwd)
-    async for event in events:
-        if event.kind == "result" and event.is_error:
-            raise RuntimeError(f"claude CLI transport failed: {event.text}")
-        yield event
+    async with aclosing(events):  # abandoning the call stops the CLI
+        async for event in events:
+            if event.kind == "result" and event.is_error:
+                raise RuntimeError(f"claude CLI transport failed: {event.text}")
+            yield event
 
 
 async def _call_claude_cli(model: str, messages: list[dict[str, Any]], **kwargs) -> _DualAccess:
     """Run a single non-streaming turn, return an OpenAI-shaped response."""
-    parts = [e.text async for e in _claude_cli_events(model, messages, **kwargs) if e.kind == "text"]
+    async with aclosing(_claude_cli_events(model, messages, **kwargs)) as events:
+        parts = [e.text async for e in events if e.kind == "text"]
     content = "\n".join(parts).strip() or "(no response)"
     return _make_openai_shaped_response(content, model)
 
@@ -248,10 +251,11 @@ async def _call_claude_cli(model: str, messages: list[dict[str, Any]], **kwargs)
 async def _claude_cli_stream_async(model: str, messages: list[dict[str, Any]], **kwargs):
     """Async generator: yield OpenAI-shaped chunks, one per assistant text block."""
     first = True
-    async for event in _claude_cli_events(model, messages, **kwargs):
-        if event.kind == "text" and event.text:
-            yield _make_openai_shaped_chunk(event.text, model, include_role=first)
-            first = False
+    async with aclosing(_claude_cli_events(model, messages, **kwargs)) as events:
+        async for event in events:
+            if event.kind == "text" and event.text:
+                yield _make_openai_shaped_chunk(event.text, model, include_role=first)
+                first = False
     yield _make_openai_shaped_chunk(None, model, finish_reason="stop", include_role=first)
 
 
