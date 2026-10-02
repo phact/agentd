@@ -76,6 +76,19 @@ def test_fnox_discovery_and_get(tmp_path):
         pol.fnox_get("MISSING", tmp_path)
 
 
+def test_secret_names_from_fnox_config(tmp_path, monkeypatch):
+    monkeypatch.delenv("FNOX_PROFILE", raising=False)
+    cfg = tmp_path / "fnox.toml"
+    cfg.write_text('[providers.plain]\ntype = "plain"\n[secrets]\n'
+                   'GH = { provider = "plain", value = "ghp_x", description = "GitHub PAT" }\n'
+                   'DB = { provider = "plain", value = "pw" }\n'
+                   '[profiles.work.secrets]\nWORK = { provider = "plain", value = "w", description = "work" }\n')
+    assert pol.load_secret_names([cfg]) == {"GH": "GitHub PAT", "DB": ""}
+    assert pol.load_secret_names([cfg], "work") == {"GH": "GitHub PAT", "DB": "", "WORK": "work"}
+    ph = pol.opaque_placeholder()
+    assert ph.startswith("agentd_ph_") and len(ph) == 34 and ph != pol.opaque_placeholder()
+
+
 def test_scrubber_across_chunks():
     s = Scrubber({b"SECRET": b"######"})
     out = b"".join(s.feed(c) for c in [b"xxSEC", b"RE", b"Tyy SE", b"CRET"]) + s.flush()

@@ -7,6 +7,7 @@ import asyncio
 import hashlib
 import hmac
 import json
+import shutil
 import tempfile
 from pathlib import Path
 
@@ -140,7 +141,11 @@ def test_proxy_holds_for_approvals(monkeypatch, tmp_path):
             writer.close()
             reader, writer = await guest.connect("localhost", port)
             head, body = await _request(reader, writer, "DELETE", "/ok/x", auth)
-            assert b"403" in head.split(b"\r\n")[0], "'once' was spent by the held request's approval"
+            assert b"200" in head.split(b"\r\n")[0], "'once' decided after the hold: the retry goes through"
+            writer.close()
+            reader, writer = await guest.connect("localhost", port)
+            head, body = await _request(reader, writer, "DELETE", "/ok/x", auth)
+            assert b"403" in head.split(b"\r\n")[0], "...once"
             writer.close()
 
             # Denied while held: the 403 says so (not pending, no retry).
@@ -240,6 +245,80 @@ def test_request_access_skill(tmp_path):
             assert a.items[r2["id"]].kind == "connect"
         finally:
             for name in ("request_access", "access_status"):
+                FUNCTION_REGISTRY.pop(name, None)
+                SCHEMA_REGISTRY.pop(name, None)
+    asyncio.run(main())
+
+
+@pytest.mark.skipif(shutil.which("fnox") is None, reason="needs fnox")
+def test_list_secrets_and_use_one_without_a_rule(tmp_path):
+    from agentd.egress import Egress, EgressSession
+    from agentd.egress import approvals as ap
+    from agentd.tool_decorator import FUNCTION_REGISTRY, SCHEMA_REGISTRY
+
+    (tmp_path / "fnox.toml").write_text(
+        '[providers.plain]\ntype = "plain"\n[secrets]\n'
+        'GH = { provider = "plain", value = "ghp_realgh0000000000", description = "GitHub, phact/agentd" }\n'
+        'DB = { provider = "plain", value = "db-real-password" }\n'
+        'HIDDEN = { provider = "plain", value = "hidden-value" }\n'
+        '[[proxy.rules]]\nsecret = "GH"\ndomain = "api.github.com"\nmethods = ["GET"]\n')
+    a = Approvals(hold=0.1, allow_file=tmp_path / "allow.toml")
+    sock = Path(tempfile.mkdtemp(dir="/tmp", prefix="ls-")) / "s.sock"
+
+    async def main():
+        s = EgressSession(Egress(approvals=a, audit=None, secrets=("GH", "DB")), tmp_path, sock, session="s1")
+        await s.start()
+        ap.enable_access_skill(a)
+        try:
+            listed = await FUNCTION_REGISTRY["list_secrets"]()
+            assert listed == [
+                {"name": "GH", "description": "GitHub, phact/agentd", "env": "GH",
+                 "rules": [{"host": "api.github.com", "header": "authorization", "methods": ["GET"],
+                            "paths": ["*"]}]},
+                {"name": "DB", "description": "", "env": "DB", "rules": []}]
+            env = s.sandbox_env()
+            assert {"GH", "DB"} <= set(env) and "HIDDEN" not in env, "only the secrets Egress(secrets=) exposes"
+            assert set(s.proxy.secrets) == {"GH"}, "DB isn't read from fnox until it may be sent"
+            assert "db-real-password" not in repr(listed) + repr(env) and "ghp_realgh" not in repr(env)
+
+            with pytest.raises(ValueError, match="list_secrets"):
+                await FUNCTION_REGISTRY["request_access"](host="db.example.com", reason="x", secret="HIDDEN")
+            ph = s.placeholders["DB"].encode()
+            auth = [(b"authorization", b"Basic " + ph)]
+            r = await FUNCTION_REGISTRY["request_access"](host="db.example.com", reason="run a query",
+                                                         secret="DB", method="post", path="/q")
+            a.decide(r["id"], "session")
+            assert (await FUNCTION_REGISTRY["list_secrets"]())[1]["rules"] == [
+                {"host": "db.example.com", "header": "authorization", "methods": ["POST"], "paths": ["/q"]}]
+            headers, used = await s.proxy.inject_or_ask("db.example.com", "POST", "/q", auth)
+            assert headers == [(b"authorization", b"Basic db-real-password")] and used == ["DB"]
+            assert s.proxy.masks[b"db-real-password"] == b"*" * 16, "responses are scrubbed of it now"
+            # Elsewhere it still needs an approval.
+            with pytest.raises(px.Refused) as e:
+                await s.proxy.inject_or_ask("evil.example.com", "POST", "/q", auth)
+            assert e.value.approval_status == "pending"
+
+            # Asked ahead and approved "once": the next matching request, and only that one.
+            r = await FUNCTION_REGISTRY["request_access"](host="db2.example.com", reason="one query",
+                                                         secret="DB", method="POST", path="/q")
+            a.decide(r["id"], "once")
+            assert s.policy.connect("db2.example.com", "", 443) == "intercept"
+            assert {"host": "db2.example.com", "header": "authorization", "methods": ["POST"], "paths": ["/q"],
+                    "once": True} in (await FUNCTION_REGISTRY["list_secrets"]())[1]["rules"]
+            headers, _ = await s.proxy.inject_or_ask("db2.example.com", "POST", "/q", auth)
+            assert headers == [(b"authorization", b"Basic db-real-password")]
+            with pytest.raises(px.Refused):
+                await s.proxy.inject_or_ask("db2.example.com", "POST", "/q", auth)
+            assert s.policy.connect("db2.example.com", "", 443) == "deny"
+
+            # A host asked for ahead, "once": one connection.
+            r = await FUNCTION_REGISTRY["request_access"](host="pypi.org", reason="install deps")
+            a.decide(r["id"], "once")
+            assert s.policy.connect("pypi.org", "", 443) == "pass"
+            assert s.policy.connect("pypi.org", "", 443) == "deny"
+        finally:
+            await s.stop()
+            for name in ("list_secrets", "request_access", "access_status"):
                 FUNCTION_REGISTRY.pop(name, None)
                 SCHEMA_REGISTRY.pop(name, None)
     asyncio.run(main())

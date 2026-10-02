@@ -125,6 +125,13 @@ decision. Never header values or bodies.
 
 - `request_access(what, reason, duration)` skill: the agent asks while
   planning, so most approvals happen before the request that needs them.
+- `list_secrets()` skill: what the agent can use or ask for. Every secret
+  in the workspace's fnox config (or the `Egress(secrets=[...])` subset)
+  with its fnox `description`, the env var holding its placeholder, and the
+  rules that let it be sent now; never values or providers (names come from
+  the config files, not `fnox list`, which prints provider keys). Secrets
+  without a rule get an opaque placeholder at start and are read from fnox
+  only when a rule or approval first lets them be sent.
 - A request not covered by a rule or grant is **held** for up to ~20-30 s
   (under most clients' timeouts) while the approver is notified. Approved
   in time: it proceeds. Otherwise the proxy answers 403 with
@@ -140,6 +147,8 @@ decision. Never header values or bodies.
   (`POST /v1/approvals/{id}`), so a phone app or another box can decide.
 - Grants: once, for the session, or always (writes a narrow rule); scoped to
   the workspace; optionally time-limited (a lease).
+  "Once" applies to the held request, or when none is held (asked ahead,
+  or the hold ran out) to the next matching request: a single-use rule.
 - Named rule presets ("github: read-only", "github: this repo, write") so
   rules are picked, not written.
 

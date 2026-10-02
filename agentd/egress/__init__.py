@@ -19,7 +19,7 @@ from typing import Any
 
 from agentd.egress.ca import SessionCA
 from agentd.egress.policy import (Allow, Policy, SecretRule, fnox_config_files, fnox_get, load_rules,
-                                  make_placeholder)
+                                  load_secret_names, make_placeholder, opaque_placeholder)
 from agentd.egress.proxy import EgressProxy
 from agentd.sandbox.base import DEFAULT_HOME
 
@@ -41,11 +41,14 @@ class Egress:
     ``allow``: hosts reachable as-is ("pypi.org" means ports 443 and 80;
     "github.com:22"; "*.example.com"; "10.0.2.58:8001"). ``fnox``: use fnox's
     ``[proxy.rules]`` (from the workspace's fnox config) to inject secrets.
-    ``approvals``: an :class:`agentd.egress.approvals.Approvals` to ask about
-    anything else instead of refusing it."""
+    ``secrets``: which of fnox's secrets the sandbox gets a placeholder for and
+    may ask to use (None: every secret in the fnox config; secrets with rules
+    always). ``approvals``: an :class:`agentd.egress.approvals.Approvals` to
+    ask about anything else instead of refusing it."""
 
     allow: tuple[str, ...] = ()
     fnox: bool = True
+    secrets: tuple[str, ...] | None = None
     fnox_profile: str | None = None
     fnox_bin: str = "fnox"
     audit: Path | None = DEFAULT_HOME / "egress" / "audit.jsonl"
@@ -53,6 +56,8 @@ class Egress:
 
     def __post_init__(self) -> None:
         object.__setattr__(self, "allow", tuple(self.allow))
+        if self.secrets is not None:
+            object.__setattr__(self, "secrets", tuple(self.secrets))
         for spec in self.allow:
             Allow.parse(spec)
 
@@ -67,6 +72,7 @@ class EgressSession:
         self.session = session
         self.ca = SessionCA()
         self.placeholders: dict[str, str] = {}
+        self.descriptions: dict[str, str] = {}   # secret name -> fnox's description
         self.proxy: EgressProxy | None = None
         self.config_files: list[Path] = []
 
@@ -85,17 +91,47 @@ class EgressSession:
                 except (RuntimeError, OSError) as err:
                     logger.warning("egress: %s (its rules are disabled)", err)
             rules = [r for r in rules if r.secret in secrets]
+            # Every other secret the sandbox may ask for gets a placeholder now; its
+            # value is read from fnox only once a rule or approval lets it be sent.
+            names = load_secret_names(self.config_files, e.fnox_profile)
+            for name in names if e.secrets is None else [n for n in e.secrets if n in names]:
+                self.descriptions[name] = names[name]
         for r in rules:
             if r.secret not in self.placeholders:
                 ph = r.placeholder or make_placeholder(secrets[r.secret])
                 self.placeholders[r.secret] = ph
+            self.descriptions.setdefault(r.secret, "")
+        for name in self.descriptions:
+            self.placeholders.setdefault(name, opaque_placeholder())
         policy = Policy(rules=rules, allows=[Allow.parse(a) for a in e.allow])
         ask = None
         if e.approvals is not None:
             ask = e.approvals.asker(self, policy)
         self.proxy = EgressProxy(self.socket_path, policy, secrets=secrets, placeholders=self.placeholders,
-                                 ca=self.ca, audit_path=e.audit, session=self.session, ask=ask)
+                                 ca=self.ca, audit_path=e.audit, session=self.session, ask=ask,
+                                 load=self._load if e.fnox else None)
         await self.proxy.start()
+
+    async def _load(self, name: str) -> None:
+        """Read a secret from fnox for the proxy, the first time it may be sent."""
+        e = self.egress
+        try:
+            value = await asyncio.to_thread(fnox_get, name, self.workspace, fnox=e.fnox_bin, profile=e.fnox_profile)
+        except (RuntimeError, OSError) as err:
+            logger.warning("egress: %s", err)
+            return
+        if self.proxy is not None:
+            self.proxy.add_secret(name, value)
+
+    def list_secrets(self) -> list[dict[str, Any]]:
+        """What the sandbox can use or ask for: names, descriptions, env vars and rules (never values)."""
+        policy = self.proxy.policy if self.proxy is not None else Policy()
+        rules = [(r, False) for r in policy.rules] + [(r, True) for r in policy.once_rules]
+        return [{"name": name, "description": desc, "env": name,
+                 "rules": [{"host": r.domain, "header": r.header, "methods": list(r.methods) or ["*"],
+                            "paths": list(r.paths) or ["*"], **({"once": True} if once else {})}
+                           for r, once in rules if r.secret == name]}
+                for name, desc in self.descriptions.items()]
 
     async def stop(self) -> None:
         if self.proxy is not None:

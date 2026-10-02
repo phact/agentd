@@ -11,7 +11,8 @@ seconds: approved in time, it goes through; otherwise the agent gets a 403
 saying the approval is pending (``id``, ``retry_after``) and retries later.
 
 Decisions (``agentd serve``: ``POST /v1/approvals/{id}``, or :meth:`decide`):
-``once`` (this request), ``session`` (until the sandbox stops), ``always``
+``once`` (the held request, or if none is held, the next matching one),
+``session`` (until the sandbox stops), ``always``
 (persisted: secret rules into the fnox config they came from, host
 allowances into ``~/.agentd/egress/allow.toml``), or ``deny``.
 """
@@ -67,6 +68,7 @@ class Approvals:
         self.allow_file = Path(allow_file)
         self.items: dict[str, Approval] = {}
         self._waiters: dict[str, asyncio.Future] = {}
+        self._holding: dict[str, int] = {}  # approval id -> requests held for it right now
         self._sessions: dict[str, tuple["EgressSession", Policy]] = {}
         self._dedupe: dict[tuple, str] = {}
 
@@ -106,10 +108,15 @@ class Approvals:
             if approval.status != "pending":
                 return approval.status != "deny", approval.id, approval.status
             fut = self._waiters.setdefault(approval.id, asyncio.get_running_loop().create_future())
+            self._holding[approval.id] = self._holding.get(approval.id, 0) + 1
             try:
                 status = await asyncio.wait_for(asyncio.shield(fut), self.hold)
             except asyncio.TimeoutError:
                 return False, approval.id, "pending"
+            finally:
+                self._holding[approval.id] -= 1
+                if not self._holding[approval.id]:
+                    del self._holding[approval.id]
             return status != "deny", approval.id, status
 
         return ask
@@ -146,19 +153,23 @@ class Approvals:
         approval.status, approval.decided_by, approval.decided = decision, by, time.time()
         if decision in ("session", "always"):
             self._grant(approval, persist=decision == "always")
+        elif decision == "once" and not self._holding.get(approval_id):
+            # Nothing is held for it (asked ahead with request_access, or the hold ran
+            # out): the next matching request may go through, once.
+            self._grant(approval, persist=False, once=True)
         fut = self._waiters.pop(approval_id, None)
         if fut is not None and not fut.done():
             fut.set_result(decision)
         return approval
 
-    def _grant(self, approval: Approval, *, persist: bool) -> None:
+    def _grant(self, approval: Approval, *, persist: bool, once: bool = False) -> None:
         d = approval.details
         targets = [self._sessions[approval.session]] if approval.session in self._sessions else \
             list(self._sessions.values())
         if approval.kind == "connect":
             spec = f"{d.get('host') or d.get('ip')}:{d['port']}"
             for _, policy in targets:
-                policy.allows.append(Allow.parse(spec))
+                (policy.once_allows if once else policy.allows).append(Allow.parse(spec))
             if persist:
                 self._save_allow(spec)
         elif approval.kind == "secret":
@@ -167,7 +178,7 @@ class Approvals:
                               paths=(d["path"].split("?", 1)[0],) if d.get("path") else ())
             for egress, policy in targets:
                 if rule.secret in egress.placeholders:
-                    policy.rules.append(rule)
+                    (policy.once_rules if once else policy.rules).append(rule)
                     if persist and egress.config_files:
                         add_rule_to_fnox(egress.config_files[-1], rule)
                         persist = False  # once
@@ -259,13 +270,30 @@ def register_request_tool(func, approvals: Approvals | None, *notes: str) -> Non
 
 
 def enable_access_skill(approvals: Approvals) -> None:
-    """Register ``request_access`` / ``access_status`` as skills for agents."""
+    """Register ``list_secrets`` / ``request_access`` / ``access_status`` as skills for agents."""
     global _ACTIVE
     from agentd.tool_decorator import tool
 
     _ACTIVE = approvals
+    tool(list_secrets)
     register_request_tool(request_access, approvals, approvals.hold_note())
     tool(access_status)
+
+
+def _current_egress():
+    sessions = list(_ACTIVE._sessions.values()) if _ACTIVE is not None else []
+    return sessions[-1][0] if sessions else None
+
+
+async def list_secrets() -> list:
+    """List the secrets this sandbox can use or ask for: name, description and the rules that let it be sent now. Never values.
+
+    Each one is in the environment as $NAME, holding a placeholder: put it where a rule says (e.g. the Authorization header for api.github.com) and agentd swaps in the real value on the host for that rule's host, methods and paths. Anywhere else, ask first with request_access(host, reason, secret=NAME, method=..., path=...).
+    """
+    if _ACTIVE is None:
+        raise RuntimeError("approvals aren't enabled")
+    egress = _current_egress()
+    return egress.list_secrets() if egress is not None else []
 
 
 async def request_access(host: str, reason: str, port: int = 443, secret: str = "", method: str = "",
@@ -275,7 +303,7 @@ async def request_access(host: str, reason: str, port: int = 443, secret: str = 
     host: the host name (e.g. api.github.com)
     reason: why the task needs it, for the human approving
     port: the port (default 443)
-    secret: a secret's name to use there (e.g. GITHUB_TOKEN), if any
+    secret: a secret's name to use there (one list_secrets shows, e.g. GITHUB_TOKEN), if any
     method: the HTTP method the secret is needed for (e.g. POST)
     path: the URL path the secret is needed for (e.g. /repos/me/app/pulls)
     """
@@ -283,6 +311,9 @@ async def request_access(host: str, reason: str, port: int = 443, secret: str = 
         raise RuntimeError("approvals aren't enabled")
     sessions = list(_ACTIVE._sessions)
     session = sessions[-1] if sessions else ""
+    egress = _current_egress()
+    if secret and egress is not None and secret not in egress.placeholders:
+        raise ValueError(f"no secret named {secret!r} here; list_secrets shows the ones you can ask for")
     if secret:
         details = {"secret": secret, "host": host.lower(), "method": method.upper(), "path": path,
                    "header": "authorization"}

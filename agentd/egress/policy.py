@@ -90,9 +90,20 @@ class Allow:
 class Policy:
     rules: list[SecretRule] = field(default_factory=list)
     allows: list[Allow] = field(default_factory=list)
+    # Single-use grants ("once" decided while nothing was held): gone once used.
+    once_rules: list[SecretRule] = field(default_factory=list)
+    once_allows: list[Allow] = field(default_factory=list)
 
     def rules_for(self, host: str | None, port: int | None = None) -> list[SecretRule]:
-        return [r for r in self.rules if host and r.domain == host.lower() and (port is None or r.port == port)]
+        return [r for r in self.rules + self.once_rules
+                if host and r.domain == host.lower() and (port is None or r.port == port)]
+
+    def use(self, rule: SecretRule) -> None:
+        """A rule was used to send its secret: a single-use one is spent."""
+        for i, r in enumerate(self.once_rules):
+            if r is rule:
+                del self.once_rules[i]
+                return
 
     def connect(self, host: str | None, ip: str, port: int) -> str:
         """"intercept" | "pass" | "deny" for a new connection."""
@@ -100,6 +111,10 @@ class Policy:
             return "intercept"
         if any(a.matches(host, ip, port) for a in self.allows):
             return "pass"
+        for i, a in enumerate(self.once_allows):
+            if a.matches(host, ip, port):
+                del self.once_allows[i]
+                return "pass"
         return "deny"
 
 
@@ -140,6 +155,25 @@ def load_rules(files: list[Path]) -> list[SecretRule]:
     return rules
 
 
+def load_secret_names(files: list[Path], profile: str | None = None) -> dict[str, str]:
+    """``{name: description}`` of the secrets fnox config files define (top-level
+    ``[secrets]`` plus the profile's), read from the files: no values, no providers."""
+    profiles = [p.strip() for p in (profile or os.environ.get("FNOX_PROFILE") or "").split(",") if p.strip()]
+    names: dict[str, str] = {}
+    for path in files:
+        try:
+            data = tomllib.loads(path.read_text())
+        except (OSError, ValueError):
+            continue
+        tables = [data.get("secrets") or {}]
+        tables += [((data.get("profiles") or {}).get(p) or {}).get("secrets") or {} for p in profiles]
+        for table in tables:
+            for name, spec in table.items():
+                desc = spec.get("description") if isinstance(spec, dict) else None
+                names[name] = str(desc or names.get(name) or "")
+    return names
+
+
 def fnox_get(name: str, cwd: Path, *, fnox: str = "fnox", profile: str | None = None) -> str:
     """One secret's value, from fnox on the host (no prompts)."""
     argv = [fnox, "--non-interactive"] + (["-P", profile] if profile else []) + ["get", name]
@@ -159,6 +193,12 @@ def make_placeholder(value: str) -> str:
     alphabet = string.ascii_letters + string.digits
     body = "".join(_secrets.choice(alphabet) for _ in range(max(len(value) - len(prefix), 8)))
     return (prefix + body)[: max(len(value), len(prefix) + 8)]
+
+
+def opaque_placeholder() -> str:
+    """A placeholder for a secret not read yet (its format unknown)."""
+    alphabet = string.ascii_letters + string.digits
+    return "agentd_ph_" + "".join(_secrets.choice(alphabet) for _ in range(24))
 
 
 def add_rule_to_fnox(config: Path, rule: SecretRule) -> None:

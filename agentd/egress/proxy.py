@@ -117,6 +117,7 @@ class EgressProxy:
         audit_path: Path | None = None,
         session: str = "",
         ask: Callable[..., Any] | None = None,
+        load: Callable[[str], Any] | None = None,
     ):
         self.socket_path = Path(socket_path)
         self.policy = policy
@@ -126,12 +127,20 @@ class EgressProxy:
         self.audit_path = audit_path
         self.session = session
         self.ask = ask                    # approvals hook: await ask(kind, **details) -> (approved, id, status)
-        masks = {}
+        self.load = load                  # await load(name): read a secret not read yet (add_secret)
+        self.masks: dict[bytes, bytes] = {}
         for name, value in secrets.items():
-            ph = placeholders.get(name, "")
-            masks[value.encode()] = ph.encode() if len(ph) == len(value) else b"*" * len(value)
-        self.masks = masks
+            self._mask(name, value)
         self._server: asyncio.base_events.Server | None = None
+
+    def _mask(self, name: str, value: str) -> None:
+        ph = self.placeholders.get(name, "")
+        self.masks[value.encode()] = ph.encode() if len(ph) == len(value) else b"*" * len(value)
+
+    def add_secret(self, name: str, value: str) -> None:
+        """A secret read after the session started (responses are scrubbed of it from now on)."""
+        self.secrets[name] = value
+        self._mask(name, value)
 
     # ------------------------------------------------------------------ #
 
@@ -290,13 +299,19 @@ class EgressProxy:
                     continue
                 rule = next((r for r in rules if r.secret == secret and r.header == lname
                              and r.matches(method, path)), None)
-                if (rule is None and secret not in once) or secret not in self.secrets:
+                if (rule is not None or secret in once) and secret not in self.secrets:
+                    raise Refused(f"agentd egress: {secret} couldn't be read from fnox on the host",
+                                  {"secret": secret, "host": host, "method": method, "path": path, "header": lname,
+                                   "unavailable": True})
+                if rule is None and secret not in once:
                     allowed = [r.describe() for r in rules if r.secret == secret] or ["none"]
                     raise Refused(f"agentd egress: {secret} may not be sent in {lname} with {method} {host}{path}",
                                   {"secret": secret, "host": host, "method": method, "path": path, "header": lname,
                                    "rules": allowed})
                 value = value.replace(bph, self.secrets[secret].encode())
                 used.append(secret)
+                if rule is not None:
+                    self.policy.use(rule)
             out.append((name, value))
         return out, used
 
@@ -305,18 +320,36 @@ class EgressProxy:
         message = str(e) + _approval(detail, getattr(e, "approval_id", None), getattr(e, "approval_status", None))
         return json.dumps({"error": {"type": "agentd_egress", "message": message, **detail}}).encode()
 
+    async def _load_needed(self, host: str, method: str, path: str, headers: list[tuple[bytes, bytes]],
+                           once: frozenset[str] = frozenset()) -> None:
+        """Read from fnox the secrets this request may send that weren't read yet."""
+        if self.load is None:
+            return
+        rules = self.policy.rules_for(host)
+        for name, value in headers:
+            lname = name.decode("latin-1").lower()
+            for secret, ph in list(self.placeholders.items()):
+                if secret in self.secrets or not ph or ph.encode() not in value:
+                    continue
+                if secret in once or any(r.secret == secret and r.header == lname and r.matches(method, path)
+                                         for r in rules):
+                    await self.load(secret)
+
     async def inject_or_ask(self, host: str, method: str, path: str, headers: list[tuple[bytes, bytes]]):
         """inject(), and when refused, hold for an approval: (headers, used) or Refused (with .approval_id
         and .approval_status)."""
+        await self._load_needed(host, method, path, headers)
         try:
             return self.inject(host, method, path, headers)
         except Refused as e:
-            if self.ask is None:
+            if self.ask is None or e.detail.get("unavailable"):
                 raise
             keys = ("secret", "host", "method", "path", "header")
             approved, approval_id, status = await self.ask("secret", **{k: e.detail.get(k) for k in keys})
             if approved:
-                return self.inject(host, method, path, headers, once=frozenset({e.detail["secret"]}))
+                once = frozenset({e.detail["secret"]})
+                await self._load_needed(host, method, path, headers, once)
+                return self.inject(host, method, path, headers, once=once)
             e.approval_id, e.approval_status = approval_id, status
             raise
 

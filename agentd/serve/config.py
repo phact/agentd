@@ -49,7 +49,7 @@ class ServeConfig:
     claude_projects: Path = field(default_factory=_claude_projects)
     transcripts_root: Path | None = None
     # Network access for sandboxes (libkrun only; see docs/egress-and-secrets.md):
-    # {"allow": ["pypi.org", ...], "fnox": true, "fnox_profile": null,
+    # {"allow": ["pypi.org", ...], "fnox": true, "fnox_profile": null, "secrets": null,
     #  "approvals": {"webhook": "https://...", "secret_env": "AGENTD_WEBHOOK_SECRET",
     #                "hold": 25, "answer_url": "https://<this box>"}}
     # None: sandboxes have no network.
@@ -162,8 +162,10 @@ class ServeConfig:
         from agentd.egress import Egress
 
         e = self.egress
+        secrets = e.get("secrets")
         return Egress(allow=tuple(e.get("allow", ())), fnox=bool(e.get("fnox", True)),
-                      fnox_profile=e.get("fnox_profile"), approvals=approvals)
+                      fnox_profile=e.get("fnox_profile"), approvals=approvals,
+                      secrets=None if secrets is None else tuple(secrets))
 
     def make_executor(self, workspace: Path, image: str | None = None, egress=None):
         """A sandbox executor for one workspace, per the ``sandbox`` settings."""
