@@ -14,6 +14,9 @@ dependencies = [
     "httpx>=0.27.0",
     "aiohttp>=3.9",
     "cryptography>=42",
+    "h11>=0.14",
+    "h2>=4.1",
+    "tomli>=2 ; python_full_version < '3.11'",
 ]
 
 [dependency-groups]
@@ -32,3 +35,4 @@ packages = ["agentd/"]
 
 [project.scripts]
 agentd = "agentd.app:main"
+agentd-sandbox = "agentd.sandbox.cli:main"

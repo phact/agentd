@@ -17,6 +17,7 @@ from pathlib import Path
 from typing import Any
 
 from aiohttp import web
+from agentd.secrets import scrub  # results to sandboxes never carry host secrets
 
 logger = logging.getLogger(__name__)
 
@@ -175,14 +176,14 @@ class MCPBridge:
                 if texts:
                     text = '\n'.join(texts) if len(texts) > 1 else texts[0]
                     try:
-                        return web.json_response(json.loads(text))
+                        return web.json_response(scrub(json.loads(text)))
                     except (json.JSONDecodeError, TypeError):
-                        return web.json_response(text)
-                return web.json_response(content)
+                        return web.json_response(scrub(text))
+                return web.json_response(scrub(content))
             except Exception as e:
                 logger.error(f"MCP tool call failed: {e}")
                 return web.json_response(
-                    {"error": str(e)},
+                    {"error": scrub(str(e))},
                     status=500
                 )
 
@@ -193,11 +194,11 @@ class MCPBridge:
                 result = func(**args)
                 if asyncio.iscoroutine(result):
                     result = await result
-                return web.json_response(result)
+                return web.json_response(scrub(result))
             except Exception as e:
                 logger.error(f"Local tool call failed: {e}")
                 return web.json_response(
-                    {"error": str(e)},
+                    {"error": scrub(str(e))},
                     status=500
                 )
 
