@@ -4,6 +4,47 @@ Status: implemented in agentd 0.9.0 (2026-10-01); see "Implementation" at the
 end. agentd and p2claw changes are owned by their maintainer; this doc
 records the agreed shape.
 
+## Using it
+
+`agentd serve` runs this box's sandboxed sessions as an HTTP API on two Unix sockets, never TCP:
+
+- `~/.agentd/serve/serve.sock` for local callers (the socket's permissions are the gate);
+- `~/.agentd/serve/peers.sock` for other boxes over a [p2claw](https://github.com/phact/p2claw-skill) private route; every request must carry the caller's `X-P2claw-Peer` identity.
+
+```bash
+agentd serve                                              # --config ~/.agentd/serve/config.json
+p2claw apps expose agentd --socket ~/.agentd/serve/peers.sock   # private: never public, no URL
+p2claw apps share agentd --with <peer>
+```
+
+Turns use the Responses API above (`harness`, `model`, `input`, `instructions`, `previous_response_id`, `stream`), plus:
+
+| | |
+|---|---|
+| `session_id` / `workspace` / `image` | continue a session, or start one in a workspace under an allowed root (default: a fresh directory) |
+| `background=true` | the turn runs server-side; reattach with `GET /v1/responses/{id}?stream=true&starting_after=N`, stop it with `POST /v1/responses/{id}/cancel` (otherwise a turn is tied to its request: hanging up cancels it) |
+| `/v1/sessions[/{id}[/transcript]]`, `DELETE /v1/sessions/{id}` | list, inspect, read (paged) and close sessions |
+| `/v1/schedules` | timed turns: `{"input": ..., "every": "0 9 * * 1-5", "timezone": "America/New_York", "session_id": ...}` or `"at"`, or `"every": "30m"`; persisted, never overlapping |
+| `/v1/legacy/claude-code[/{id}]` | Claude Code sessions run on the host outside agentd, read-only and paged |
+| `/v1/harnesses`, `/v1/models` | which harnesses are ready (and why not) with their default and available models; an OpenAI-style model list naming the harnesses for each |
+| `/v1/info` | box, version, harnesses (and which are ready), images |
+
+Sessions are durable; their sandboxes stop after `idle_timeout` (default 10 min) and the next turn resumes the native session in a fresh one. The peer that starts a session owns it: other peers can read it but only the owner (or peers listed in `drivers`) can run turns, cancel, close or schedule in it. Settings (`~/.agentd/serve/config.json`, all optional): `box_name`, `workspace_roots`, `idle_timeout`, `drivers`, `default_harness`, `sandbox` (`backend`, `image`, `cpus`, `mem_mib`, `mounts`), `harness_options` (e.g. a Codex `upstream`).
+
+**From code or agents** (`agentd.remote`; reaching other boxes needs `pip install p2claw-agent-client`):
+
+```python
+from agentd.remote import Fleet, enable_fleet_skills
+
+fleet = Fleet.from_config()   # ~/.agentd/fleet.json: {"boxes": {"sabik": {"peer": "<alias>", "drive": true}, ...}}
+r = await fleet.box("sabik").start("Fix the flaky test", workspace="app", background=True)
+
+enable_fleet_skills(fleet)    # fleet_boxes, fleet_sessions, fleet_read, fleet_start, fleet_send,
+                              # fleet_result, fleet_cancel, fleet_schedule, fleet_unschedule as skills
+```
+
+Fleet skills run on the host (through the MCP bridge), so the p2claw socket never enters a sandbox; boxes without `"drive": true` are read-only. 
+
 ## Summary
 
 Every box runs `agentd serve`: an API over that box's sandboxed agent sessions,

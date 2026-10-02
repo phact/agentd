@@ -4,6 +4,37 @@ Status: implemented, 2026-10-02 (see "Implementation" at the end). Builds on the
 network in the sandbox; one host-dialed connection per sandbox) and on
 [agentd serve](agentd-serve.md) for approvals.
 
+## Using it
+
+By default a sandbox has no network. `egress=` gives a libkrun sandbox a network card whose every connection goes through agentd on the host, and keeps secrets outside the sandbox:
+
+```python
+from agentd import KrunExecutor
+from agentd.egress import Egress
+from agentd.egress.approvals import Approvals
+
+executor = KrunExecutor(egress=Egress(
+    allow=["pypi.org", "files.pythonhosted.org", "github.com:22"],      # reachable as-is
+    approvals=Approvals(webhook="https://approver.example/hook"),       # optional: ask instead of refusing
+))
+```
+
+- **Everything goes through agentd.** `agentd-net` (Rust, `agentd/sandbox/net`) is the sandbox's network card: a user-space TCP/IP stack on the host that answers DNS with stand-in addresses (so every connection is known by name) and hands each connection to agentd's egress proxy. Every program is covered, whether or not it honors proxy settings.
+- **Secrets stay on the host.** Secret rules come from [fnox](https://fnox.jdx.dev) (`[proxy.rules]` in the workspace's `fnox.toml`). The sandbox gets placeholders (same length and prefix as the real value) in its environment; for a rule's host, agentd terminates TLS with a per-session CA the sandbox trusts, puts the real value into the rule's header only for the rule's methods and paths, and scrubs real values out of responses. HTTP/1.1 and HTTP/2, streaming, no size limits.
+- **Allowed hosts pass through untouched** (the server sees the client's own TLS); raw TCP by host and port (`github.com:22`). Everything else is refused: HTTPS and HTTP get a 403 explaining why.
+- **Approvals:** with `approvals=`, a blocked connection or a secret used outside its rule is announced to your webhook (signed, `X-Agentd-Signature`) and held ~25 s while an approver decides (`agentd serve`: `POST /v1/approvals/{id}` with `once`, `session`, `always` or `deny`). Not decided in time: the agent gets a 403 (`error.type` `agentd_egress`, `error.approval` with the id, `status: "pending"` and `retry_after`; `status: "deny"` if the human refused) and retries. Clients need a timeout of at least the hold + 15 s. `once` decided with nothing held (asked ahead with `request_access`, or after the hold ran out) lets the next matching request through, once. `always` writes the rule into fnox's config (host allowances into `~/.agentd/egress/allow.toml`). Agents can ask ahead with the `request_access` skill (`agentd.egress.approvals.enable_access_skill`), and see what they can ask for with `list_secrets`: every secret in the fnox config (or just `Egress(secrets=[...])`) by name and description, the env var holding its placeholder, and the rules that let it be sent now; never values. A secret with no rule is read from fnox only once a rule or approval lets it be sent. Requests nobody decides expire after `expire` seconds (default 1 h); the `request_access`, `request_phone` and `request_browser` descriptions tell the agent so, and `request_access`'s also gives the hold, that client timeout and what the 403 means.
+- **Audit log** of every decision: `~/.agentd/egress/audit.jsonl` (never header values or bodies).
+- **Docker sandboxes have no network** (`--network none`); egress is libkrun-only for now.
+
+Setup: `agentd/sandbox/build.sh` builds `agentd-net` (needs cargo); `agentd-sandbox colima setup` / `linux setup` build libkrun with networking.
+
+**Host-side tools that need secrets** get them from fnox on the host, never the sandbox: `agentd.secrets.secret("DATABASE_URL")` in `@tool` functions, `secret_env(["GITHUB_TOKEN"])` for an MCP server's environment. Everything the bridge returns to a sandbox is scrubbed of every secret resolved this way.
+
+**Phones and browsers** are host-side tools too (the sandbox never touches them), granted as time-limited leases through the same approvals:
+
+- `agentd.devices.android`: `Android(serial=..., apps={...})` + `enable_android_skills(...)`: screenshot (into the workspace), UI elements, tap, tap-by-text, type, keys, swipe, open app (allowlist), list apps; over adb.
+- `agentd.devices.browser`: `Browser(logins={...})` + `enable_browser_skills(...)`: a real headed Chrome with a fresh profile per lease (wiped at the end), driven over the DevTools Protocol through a pipe with no automation tells; `browser_login(site)` fills credentials and TOTP codes from fnox on the host (the agent never sees them); an optional host allowlist enforced on every request.
+
 ## Summary
 
 Agents need to call real services (GitHub, package registries, SaaS APIs),
