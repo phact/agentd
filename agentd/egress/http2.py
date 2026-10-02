@@ -126,7 +126,7 @@ async def bridge_h2(proxy: "EgressProxy", host: str, down_r, down_w, up_r, up_w)
                             approval_id = getattr(e, "approval_id", None)
                             proxy.audit(event="refused", host=host, method=method, path=path.split("?", 1)[0],
                                         secret=e.detail.get("secret"), http="2", approval=approval_id)
-                            body = proxy.refusal_body(e, approval_id)
+                            body = proxy.refusal_body(e)
                             down.conn.send_headers(ev.stream_id, [(b":status", b"403"),
                                                                   (b"content-type", b"application/json"),
                                                                   (b"content-length", str(len(body)).encode())])

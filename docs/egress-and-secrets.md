@@ -128,10 +128,13 @@ decision. Never header values or bodies.
 - A request not covered by a rule or grant is **held** for up to ~20-30 s
   (under most clients' timeouts) while the approver is notified. Approved
   in time: it proceeds. Otherwise the proxy answers 403 with
-  `{"approval": "pending", "id": ..., "retry_after": ...}` (or a waiting
-  page that continues by itself, for requests that want HTML). Nothing went
-  upstream, so retrying is safe; the agent is the retry loop. A held request
-  is only forwarded if its client is still connected.
+  `{"error": {"type": "agentd_egress", "approval": {"id": ..., "status":
+  "pending", "retry_after": 30}, ...}}` (`"status": "deny"` and no
+  `retry_after` when the human refused). Nothing went upstream, so retrying
+  is safe; the agent is the retry loop. A held request is only forwarded if
+  its client is still connected, so clients need a timeout of at least the
+  hold + 15 s; `request_access`'s description tells the agent the hold, that
+  timeout and what the 403 means.
 - **Approver: a webhook.** agentd POSTs a signed (HMAC) approval request to
   the configured URL(s); the decision comes back through `agentd serve`
   (`POST /v1/approvals/{id}`), so a phone app or another box can decide.

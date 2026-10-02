@@ -38,7 +38,19 @@ logger = logging.getLogger(__name__)
 
 _CHUNK = 64 * 1024
 _UPSTREAM_CA: str | None = None
+RETRY_AFTER = 30  # seconds, in a pending approval's 403
 ACCEPT = b"\x01"  # to agentd-net: let the guest's bytes flow (closing instead refuses)
+
+
+def _approval(detail: dict, approval_id: str | None, status: str | None) -> str:
+    """Add the approval behind a 403 to its detail; returns the note for its message."""
+    if not approval_id:
+        return ""
+    if status == "deny":
+        detail["approval"] = {"id": approval_id, "status": "deny"}
+        return " (the human denied this)"
+    detail["approval"] = {"id": approval_id, "status": "pending", "retry_after": RETRY_AFTER}
+    return " (an approval is pending; retry later)"
 
 
 def upstream_context(alpn: tuple[str, ...]) -> ssl.SSLContext:
@@ -113,7 +125,7 @@ class EgressProxy:
         self.ca = ca
         self.audit_path = audit_path
         self.session = session
-        self.ask = ask                    # approvals hook: await ask(kind, **details) -> bool
+        self.ask = ask                    # approvals hook: await ask(kind, **details) -> (approved, id, status)
         masks = {}
         for name, value in secrets.items():
             ph = placeholders.get(name, "")
@@ -154,9 +166,9 @@ class EgressProxy:
             header = json.loads(await asyncio.wait_for(reader.readline(), 10))
             host, ip, port = header.get("host"), header.get("dst", ""), int(header.get("port", 0))
             decision = self.policy.connect(host, ip, port)
-            approval_id = None
+            approval_id, approval_status = None, None
             if decision == "deny" and self.ask is not None:
-                approved, approval_id = await self.ask("connect", host=host, ip=ip, port=port)
+                approved, approval_id, approval_status = await self.ask("connect", host=host, ip=ip, port=port)
                 if approved:
                     decision = self.policy.connect(host, ip, port)  # a session/always grant is in the policy now
                     if decision == "deny":
@@ -167,7 +179,7 @@ class EgressProxy:
             elif decision == "intercept":
                 await self._intercept(reader, writer, host, port)
             else:
-                await self._explain(reader, writer, host, ip, port, approval_id)
+                await self._explain(reader, writer, host, ip, port, approval_id, approval_status)
         except (asyncio.TimeoutError, ValueError, ConnectionError, OSError) as e:
             logger.debug("egress stream ended: %s", e)
         except Exception:
@@ -178,7 +190,8 @@ class EgressProxy:
             except Exception:
                 pass
 
-    async def _explain(self, reader, writer, host: str | None, ip: str, port: int, approval_id: str | None) -> None:
+    async def _explain(self, reader, writer, host: str | None, ip: str, port: int, approval_id: str | None,
+                       approval_status: str | None = None) -> None:
         """A refused HTTP(S) connection gets a 403 saying why (and about the
         pending approval) instead of a bare reset; other protocols are reset."""
         if not host or port not in (443, 80):
@@ -198,11 +211,10 @@ class EgressProxy:
             if not isinstance(event, h11.Request):
                 return
             detail = {"host": host, "port": port}
-            if approval_id:
-                detail["approval"] = {"id": approval_id, "status": "pending", "retry_after": 30}
+            note = _approval(detail, approval_id, approval_status)
             body = json.dumps({"error": {"type": "agentd_egress", "message":
-                               f"agentd egress: {host}:{port} isn't allowed from this sandbox"
-                               + (" (an approval is pending; retry later)" if approval_id else ""), **detail}}).encode()
+                               f"agentd egress: {host}:{port} isn't allowed from this sandbox" + note,
+                               **detail}}).encode()
             writer.write(conn.send(h11.Response(status_code=403, headers=[
                 (b"content-type", b"application/json"), (b"content-length", str(len(body)).encode()),
                 (b"connection", b"close")])) + conn.send(h11.Data(data=body)) + conn.send(h11.EndOfMessage()))
@@ -288,26 +300,24 @@ class EgressProxy:
             out.append((name, value))
         return out, used
 
-    def refusal_body(self, e: Refused, approval_id: str | None = None) -> bytes:
+    def refusal_body(self, e: Refused) -> bytes:
         detail = dict(e.detail)
-        message = str(e)
-        if approval_id:
-            detail["approval"] = {"id": approval_id, "status": "pending", "retry_after": 30}
-            message += " (an approval is pending; retry later)"
+        message = str(e) + _approval(detail, getattr(e, "approval_id", None), getattr(e, "approval_status", None))
         return json.dumps({"error": {"type": "agentd_egress", "message": message, **detail}}).encode()
 
     async def inject_or_ask(self, host: str, method: str, path: str, headers: list[tuple[bytes, bytes]]):
-        """inject(), and when refused, hold for an approval: (headers, used) or Refused (with .approval_id)."""
+        """inject(), and when refused, hold for an approval: (headers, used) or Refused (with .approval_id
+        and .approval_status)."""
         try:
             return self.inject(host, method, path, headers)
         except Refused as e:
             if self.ask is None:
                 raise
             keys = ("secret", "host", "method", "path", "header")
-            approved, approval_id = await self.ask("secret", **{k: e.detail.get(k) for k in keys})
+            approved, approval_id, status = await self.ask("secret", **{k: e.detail.get(k) for k in keys})
             if approved:
                 return self.inject(host, method, path, headers, once=frozenset({e.detail["secret"]}))
-            e.approval_id = approval_id
+            e.approval_id, e.approval_status = approval_id, status
             raise
 
     async def _http1(self, host: str, reader, writer, up_reader, up_writer) -> None:
@@ -334,7 +344,7 @@ class EgressProxy:
                 approval_id = getattr(e, "approval_id", None)
                 self.audit(event="refused", host=host, method=method, path=path.split("?", 1)[0],
                            secret=e.detail.get("secret"), approval=approval_id)
-                body = self.refusal_body(e, approval_id)
+                body = self.refusal_body(e)
                 writer.write(down.send(h11.Response(status_code=403, headers=[
                     (b"content-type", b"application/json"), (b"content-length", str(len(body)).encode()),
                     (b"connection", b"close")])) + down.send(h11.Data(data=body)) + down.send(h11.EndOfMessage()))

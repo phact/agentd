@@ -97,20 +97,20 @@ class Approvals:
     # ------------------------------------------------------------------ #
 
     def asker(self, egress: "EgressSession", policy: Policy):
-        """The proxy's hook for one session: ``await ask(kind, **details) -> (approved, approval id)``."""
+        """The proxy's hook for one session: ``await ask(kind, **details) -> (approved, approval id, status)``."""
         self._sessions[egress.session] = (egress, policy)
         policy.allows.extend(Allow.parse(s) for s in self.saved_allows())
 
         async def ask(kind: str, **details: Any) -> tuple[bool, str]:
             approval = self.request(kind, egress.session, details)
             if approval.status != "pending":
-                return approval.status != "deny", approval.id
+                return approval.status != "deny", approval.id, approval.status
             fut = self._waiters.setdefault(approval.id, asyncio.get_running_loop().create_future())
             try:
                 status = await asyncio.wait_for(asyncio.shield(fut), self.hold)
             except asyncio.TimeoutError:
-                return False, approval.id
-            return status != "deny", approval.id
+                return False, approval.id, "pending"
+            return status != "deny", approval.id, status
 
         return ask
 
@@ -183,6 +183,16 @@ class Approvals:
         return (f"A request nobody decides within {_duration(self.expire)} expires (status expired); "
                 "ask again if it's still needed.")
 
+    def hold_note(self) -> str:
+        """For request_access's description: the hold, client timeouts, and what agentd's 403 means."""
+        return (f"A connection or secret that needs approval is held up to {_duration(self.hold)} while the human "
+                f"decides, so give network calls a timeout of at least {_duration(self.hold + 15)}. Not decided in "
+                'time, the call gets HTTP 403 with JSON error.type "agentd_egress" and error.approval '
+                '{id, status: "pending", retry_after}: it is waiting on a human, not denied; check '
+                "access_status(id) and retry after retry_after seconds; status \"deny\" means the human refused. "
+                "A 403 without error.approval means not "
+                "allowed and nothing is pending: call request_access. Non-HTTP connections are just reset.")
+
     def list(self, *, pending_only: bool = False) -> list[Approval]:
         self._expire_old()
         items = sorted(self.items.values(), key=lambda a: a.created, reverse=True)
@@ -237,15 +247,15 @@ def _duration(seconds: float) -> str:
     return f"{seconds / 3600:g} hours"
 
 
-def register_request_tool(func, approvals: Approvals | None) -> None:
-    """Register a request_* skill, its description saying when an undecided request expires."""
+def register_request_tool(func, approvals: Approvals | None, *notes: str) -> None:
+    """Register a request_* skill, its description saying when an undecided request expires (and ``notes``)."""
     from agentd.tool_decorator import SCHEMA_REGISTRY, tool
 
     tool(func)
     if approvals is not None:
         fn = SCHEMA_REGISTRY[func.__name__]["function"]
         first, _, rest = fn["description"].partition("\n")
-        fn["description"] = f"{first} {approvals.timeout_note()}\n{rest}"
+        fn["description"] = " ".join((first, approvals.timeout_note(), *notes)) + "\n" + rest
 
 
 def enable_access_skill(approvals: Approvals) -> None:
@@ -254,7 +264,7 @@ def enable_access_skill(approvals: Approvals) -> None:
     from agentd.tool_decorator import tool
 
     _ACTIVE = approvals
-    register_request_tool(request_access, approvals)
+    register_request_tool(request_access, approvals, approvals.hold_note())
     tool(access_status)
 
 

@@ -106,9 +106,10 @@ def test_proxy_holds_for_approvals(monkeypatch, tmp_path):
                             ask=a.asker(egress, policy), session="s1")
         await proxy.start()
 
-        async def approve_soon(kind, decision, delay=0.2):
+        async def approve_soon(kind, decision, delay=0.2, path=None):
             for _ in range(100):
-                pending = [x for x in a.list(pending_only=True) if x.kind == kind]
+                pending = [x for x in a.list(pending_only=True)
+                           if x.kind == kind and path in (None, x.details.get("path"))]
                 if pending:
                     await asyncio.sleep(delay)
                     a.decide(pending[0].id, decision)
@@ -140,6 +141,16 @@ def test_proxy_holds_for_approvals(monkeypatch, tmp_path):
             reader, writer = await guest.connect("localhost", port)
             head, body = await _request(reader, writer, "DELETE", "/ok/x", auth)
             assert b"403" in head.split(b"\r\n")[0], "'once' was spent by the held request's approval"
+            writer.close()
+
+            # Denied while held: the 403 says so (not pending, no retry).
+            reader, writer = await guest.connect("localhost", port)
+            approver = asyncio.ensure_future(approve_soon("secret", "deny", path="/ok/y"))
+            head, body = await _request(reader, writer, "PUT", "/ok/y", auth)
+            await approver
+            err = json.loads(body)["error"]
+            assert b"403" in head.split(b"\r\n")[0] and err["approval"]["status"] == "deny", err
+            assert "retry_after" not in err["approval"] and "denied" in err["message"]
             writer.close()
 
             # An unlisted host, approved once while held: the connection goes through.
@@ -211,8 +222,10 @@ def test_request_access_skill(tmp_path):
         try:
             schema = SCHEMA_REGISTRY["request_access"]["function"]
             assert schema["parameters"]["required"] == ["host", "reason"]
-            assert schema["description"].splitlines()[0].endswith(
-                "A request nobody decides within 60 minutes expires (status expired); ask again if it's still needed.")
+            first = schema["description"].splitlines()[0]
+            assert "A request nobody decides within 60 minutes expires (status expired)" in first
+            assert "held up to 25 seconds" in first and "timeout of at least 40 seconds" in first
+            assert '"agentd_egress"' in first and "retry_after" in first
             assert "host: the host name" in schema["description"]
             r = await FUNCTION_REGISTRY["request_access"](host="API.github.com", reason="open a PR", secret="GH",
                                                          method="post", path="/repos/me/app/pulls")
