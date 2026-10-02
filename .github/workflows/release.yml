@@ -1,0 +1,96 @@
+name: release
+
+on:
+  push:
+    tags: ["v*"]
+  workflow_dispatch:  # builds and tests the wheels without publishing
+
+jobs:
+  linux:
+    strategy:
+      matrix:
+        include:
+          - {runner: ubuntu-24.04, arch: x86_64}
+          - {runner: ubuntu-24.04-arm, arch: aarch64}
+    runs-on: ${{ matrix.runner }}
+    container: quay.io/pypa/manylinux_2_28_${{ matrix.arch }}
+    steps:
+      - uses: actions/checkout@v4
+      - run: scripts/build-binaries.sh
+      - uses: actions/upload-artifact@v4
+        with:
+          name: bin-linux-${{ matrix.arch }}
+          path: agentd/sandbox/bin/
+
+  macos:
+    runs-on: macos-14
+    steps:
+      - uses: actions/checkout@v4
+      - run: |
+          brew tap slp/krun
+          brew trust --formula slp/krun/libkrun slp/krun/libkrunfw slp/krun/virglrenderer-krun || true
+          brew install slp/krun/libkrun
+      - run: scripts/build-binaries.sh
+      - uses: actions/upload-artifact@v4
+        with:
+          name: bin-darwin
+          path: agentd/sandbox/bin/
+
+  wheels:
+    needs: [linux, macos]
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+      - uses: astral-sh/setup-uv@v6
+      - name: tag matches the version
+        if: startsWith(github.ref, 'refs/tags/v')
+        run: test "${GITHUB_REF_NAME#v}" = "$(sed -n 's/^version = "\(.*\)"$/\1/p' pyproject.toml)"
+      - uses: actions/download-artifact@v4
+        with:
+          pattern: bin-*
+          path: artifacts
+      - run: scripts/build-wheels.sh artifacts dist
+      - uses: actions/upload-artifact@v4
+        with:
+          name: dist
+          path: dist/
+
+  test:
+    needs: wheels
+    strategy:
+      matrix:
+        include:
+          - {runner: ubuntu-24.04, wheel: "*manylinux_2_28_x86_64.whl"}
+          - {runner: ubuntu-24.04-arm, wheel: "*manylinux_2_28_aarch64.whl"}
+          - {runner: macos-14, wheel: "*macosx_14_0_arm64.whl"}
+          - {runner: ubuntu-24.04, wheel: "*py3-none-any.whl"}
+    runs-on: ${{ matrix.runner }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          sparse-checkout: scripts
+      - uses: actions/download-artifact@v4
+        with:
+          name: dist
+          path: dist
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - run: |
+          python -m venv /tmp/venv
+          /tmp/venv/bin/pip install -q dist/${{ matrix.wheel }}
+          cd /tmp && /tmp/venv/bin/python "$GITHUB_WORKSPACE/scripts/check-wheel.py"
+
+  publish:
+    needs: [wheels, test]
+    if: startsWith(github.ref, 'refs/tags/v')
+    runs-on: ubuntu-24.04
+    environment: pypi
+    permissions:
+      id-token: write
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          name: dist
+          path: dist
+      - uses: pypa/gh-action-pypi-publish@release/v1

@@ -7,9 +7,11 @@ What a Linux box needs for ``KrunExecutor()``:
 
   * ``/dev/kvm`` that this user can open (``kvm`` group, plus an ACL so it
     works in the current login too);
-  * libkrunfw and libkrun (pinned versions, sha256-checked; libkrun built
-    from source), the same versions agentd uses inside Colima;
-  * the ``agentd-krun`` launcher (``agentd/sandbox/build.sh``);
+  * libkrunfw and libkrun (pinned versions, sha256-checked), the same
+    versions agentd uses inside Colima. libkrun comes prebuilt in agentd's
+    Linux wheels; from a checkout it's built from source;
+  * the ``agentd-krun`` launcher (prebuilt in wheels, else
+    ``agentd/sandbox/build.sh``);
   * a base image in ``~/.agentd/rootfs/NAME`` (built with Docker);
   * a hard open-files limit high enough for libkrun's file server (the
     launcher raises its soft limit to it).
@@ -33,6 +35,7 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Callable
 
+from agentd.sandbox import prebuilt
 from agentd.sandbox.base import DEFAULT_HOME, HERE
 from agentd.sandbox.colima import LIBKRUN_SHA256, LIBKRUN_URL, LIBKRUN_VERSION, LIBKRUNFW_VERSION, Step
 
@@ -142,6 +145,8 @@ def probe() -> dict:
         "libkrunfw": _lib_version("libkrunfw.so.5"),
         "launcher": _launcher().exists(),
         "launcher_sha": _state().get("launcher"),
+        "launcher_prebuilt": prebuilt.launcher(f"linux-{platform.machine()}") is not None,
+        "libkrun_prebuilt": prebuilt.libkrun(platform.machine()) is not None,
         "nofile_hard": resource.getrlimit(resource.RLIMIT_NOFILE)[1],
         "docker": shutil.which("docker") is not None,
         "cc": shutil.which("cc") is not None,
@@ -173,14 +178,17 @@ def status(image: str = "agents", image_dir: str | Path | None = None, *, facts:
         st.issues.append(f"the hard open-files limit is {p['nofile_hard']} (libkrun's file server needs "
                          f"{MIN_NOFILE}+)")
         st.needs.append("file_limits")
+    # Build tools only when something has to be compiled (a checkout without
+    # prebuilt binaries).
+    build = [] if p.get("libkrun_prebuilt") and p.get("launcher_prebuilt") else ["build_deps"]
     if p["libkrunfw"] != LIBKRUNFW_VERSION:
         st.issues.append(f"libkrunfw {LIBKRUNFW_VERSION} is not installed (found: {p['libkrunfw'] or 'none'})")
-        st.needs += ["build_deps", "libkrunfw"]
+        st.needs += build + ["libkrunfw"]
     if p["libkrun"] != LIBKRUN_VERSION or not p.get("libkrun_net", True):
         st.issues.append(f"libkrun {LIBKRUN_VERSION} with networking is not installed "
                          f"(found: {p['libkrun'] or 'none'}{'' if p.get('libkrun_net', True) else ', without networking'})")
-        st.needs += ["build_deps", "libkrun"]
-    if not p["launcher"] or p["launcher_sha"] != launcher_sha():
+        st.needs += ([] if p.get("libkrun_prebuilt") else ["build_deps"]) + ["libkrun"]
+    if not p.get("launcher_prebuilt") and (not p["launcher"] or p["launcher_sha"] != launcher_sha()):
         st.issues.append(f"the agentd-krun launcher ({_launcher()}) is missing or out of date")
         st.needs += ["build_deps", "launcher"]
     rootfs = DEFAULT_HOME / "rootfs" / image
@@ -233,13 +241,20 @@ def plan(st: Status, *, image: str = "agents", image_dir: str | Path | None = No
           "sudo ldconfig; rm -rf $t")
     steps["libkrunfw"] = Step("libkrunfw", f"Install libkrunfw {LIBKRUNFW_VERSION} for {arch} (prebuilt, sha256-pinned)",
                               [fw], run=_sh(fw, "installing libkrunfw"))
-    krun = (f"set -e; export PATH=$HOME/.cargo/bin:$PATH; t=$(mktemp -d); cd $t; "
-            f"curl -fsSL -o src.tgz {q(LIBKRUN_URL)}; echo '{LIBKRUN_SHA256}  src.tgz' | sha256sum -c -; "
-            f"tar -xzf src.tgz; cd libkrun-{LIBKRUN_VERSION}; make NET=1 -j$(nproc); sudo make install PREFIX=/usr/local; "
-            "echo /usr/local/lib64 | sudo tee /etc/ld.so.conf.d/agentd-libkrun.conf >/dev/null; sudo ldconfig; "
-            "rm -rf $t")
-    steps["libkrun"] = Step("libkrun", f"Build and install libkrun {LIBKRUN_VERSION} from source (sha256-pinned)",
-                            [krun], run=_sh(krun, "building libkrun"))
+    bundled = prebuilt.libkrun(arch)
+    if bundled is not None:
+        krun = prebuilt.install_libkrun_script(str(bundled), LIBKRUN_VERSION)
+        steps["libkrun"] = Step("libkrun", f"Install libkrun {LIBKRUN_VERSION} (prebuilt with networking, "
+                                "from agentd's wheel) into /usr/local/lib64", [krun], run=_sh(krun, "installing libkrun"))
+    else:
+        krun = (f"set -e; export PATH=$HOME/.cargo/bin:$PATH; t=$(mktemp -d); cd $t; "
+                f"curl -fsSL -o src.tgz {q(LIBKRUN_URL)}; echo '{LIBKRUN_SHA256}  src.tgz' | sha256sum -c -; "
+                f"tar -xzf src.tgz; cd libkrun-{LIBKRUN_VERSION}; make NET=1 -j$(nproc); "
+                "sudo make install PREFIX=/usr/local; "
+                "echo /usr/local/lib64 | sudo tee /etc/ld.so.conf.d/agentd-libkrun.conf >/dev/null; sudo ldconfig; "
+                "rm -rf $t")
+        steps["libkrun"] = Step("libkrun", f"Build and install libkrun {LIBKRUN_VERSION} from source (sha256-pinned)",
+                                [krun], run=_sh(krun, "building libkrun"))
     build = "PATH=$HOME/.cargo/bin:$PATH " + q(str(HERE / "build.sh"))  # also builds agentd-net
 
     def do_launcher() -> None:

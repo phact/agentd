@@ -48,6 +48,7 @@ MIN_DISK_GIB = 30
 VM_OVERHEAD_MIB = 1536  # Colima's own Linux + docker
 
 VM_LAUNCHER = "/opt/agentd/bin/agentd-krun"
+VM_ARCH = "aarch64"  # Colima with nested virtualization: Apple Silicon only
 VM_ROOTFS_ROOT = "/var/lib/agentd/rootfs"
 VM_STATE = "/var/lib/agentd/state.json"
 NOFILE = 1048576  # open files limit for sessions and services in the VM
@@ -358,7 +359,7 @@ def status(
     st.info.update(listing=listing, config={k: config.get(k) for k in ("vmType", "nestedVirtualization", "cpu", "memory", "disk")})
     if listing is None:
         st.issues.append(f"there is no Colima profile {profile!r}")
-        st.needs += ["create_vm", "kvm_access", "hugepages", "file_limits", "build_deps", "libkrunfw", "libkrun", "launcher"]
+        st.needs += ["create_vm", "kvm_access", "hugepages", "file_limits", *_installs()]
         issues, needs, info = _image_issues(image, image_dir, {}, None)
         st.issues += [i for i in issues if "missing or out of date" not in i]
         st.needs += needs
@@ -381,7 +382,7 @@ def status(
         st.issues.append(f"profile {profile!r} has a {disk_gib:.0f} GiB disk; at least {MIN_DISK_GIB} GiB is needed")
     if need_recreate:
         st.needs.append("recreate_vm")
-        st.needs += ["kvm_access", "hugepages", "file_limits", "build_deps", "libkrunfw", "libkrun", "launcher"]
+        st.needs += ["kvm_access", "hugepages", "file_limits", *_installs()]
         issues, needs, info = _image_issues(image, image_dir, {}, None)
         st.issues += [i for i in issues if "missing or out of date" not in i]
         st.needs += needs
@@ -393,7 +394,7 @@ def status(
         st.issues.append(f"profile {profile!r} is not running")
         if "resize_vm" not in st.needs:
             st.needs.append("start_vm")
-        st.needs += ["kvm_access", "hugepages", "file_limits", "build_deps", "libkrunfw", "libkrun", "launcher"]
+        st.needs += ["kvm_access", "hugepages", "file_limits", *_installs()]
         issues, needs, info = _image_issues(image, image_dir, {}, None)
         st.issues += [i for i in issues if "missing or out of date" not in i]
         st.needs += needs
@@ -430,12 +431,13 @@ def status(
     if probe["python3"] != "yes":
         st.issues.append("python3 is missing inside the VM")
         st.needs.append("build_deps")
+    build = [n for n in _installs() if n == "build_deps"]
     if probe["libkrunfw"] != "yes" or state.get("libkrunfw") != LIBKRUNFW_VERSION:
         st.issues.append(f"libkrunfw {LIBKRUNFW_VERSION} is not installed in the VM")
-        st.needs += ["build_deps", "libkrunfw"]
+        st.needs += build + ["libkrunfw"]
     if probe["libkrun"] != "yes" or state.get("libkrun") != LIBKRUN_BUILD:
         st.issues.append(f"libkrun {LIBKRUN_VERSION} (with networking) is not installed in the VM")
-        st.needs += ["build_deps", "libkrun"]
+        st.needs += build + ["libkrun"]
     if probe["launcher"] != "yes" or state.get("launcher") != launcher_sha():
         st.issues.append("the agentd-krun launcher in the VM is missing or out of date")
         st.needs.append("launcher")
@@ -448,6 +450,15 @@ def status(
             _IMAGE_PYTHON[(profile, name)] = rec["python"]
     st.needs = list(dict.fromkeys(st.needs))  # dedupe, keep order
     return st
+
+
+def _installs() -> list[str]:
+    """What a fresh VM needs installed: build tools only if libkrun or the
+    launcher must be compiled (no prebuilt ones for the VM's arch)."""
+    from agentd.sandbox import prebuilt
+
+    have = prebuilt.libkrun(VM_ARCH) is not None and prebuilt.launcher(f"linux-{VM_ARCH}") is not None
+    return ([] if have else ["build_deps"]) + ["libkrunfw", "libkrun", "launcher"]
 
 
 _READY: dict[tuple, bool] = {}
@@ -611,22 +622,45 @@ def plan(st: Status, *, cpus: int = DEFAULT_CPUS, memory_gib: int = DEFAULT_MEMO
             f"echo /usr/local/lib64 | sudo tee /etc/ld.so.conf.d/agentd-libkrun.conf >/dev/null; sudo ldconfig; "
             f"rm -rf /tmp/libkrun-build")
 
-    def do_krun():
-        in_vm(krun, "building libkrun")()
-        _install_state(p, {"libkrun": LIBKRUN_BUILD}, runner)
-    steps["libkrun"] = Step("libkrun", f"Build and install libkrun {LIBKRUN_VERSION} from source (sha256-pinned)",
-                            [vm(krun)], run=do_krun)
+    from agentd.sandbox import prebuilt
+
+    bundled_krun = prebuilt.libkrun(VM_ARCH)
+    if bundled_krun is not None:
+        krun = prebuilt.install_libkrun_script("-", LIBKRUN_VERSION)
+
+        def do_krun():
+            _check(_stream_file(p, krun, bundled_krun), "installing libkrun")
+            _install_state(p, {"libkrun": LIBKRUN_BUILD}, runner)
+        steps["libkrun"] = Step("libkrun", f"Install libkrun {LIBKRUN_VERSION} in the VM (prebuilt with networking, "
+                                "from agentd's wheel)", [vm(f"{krun} < {bundled_krun}")], run=do_krun)
+    else:
+        def do_krun():
+            in_vm(krun, "building libkrun")()
+            _install_state(p, {"libkrun": LIBKRUN_BUILD}, runner)
+        steps["libkrun"] = Step("libkrun", f"Build and install libkrun {LIBKRUN_VERSION} from source (sha256-pinned)",
+                                [vm(krun)], run=do_krun)
     launcher_src = HERE / "launcher.c"
     build_launcher = (f"set -e; sudo mkdir -p {q(str(Path(VM_LAUNCHER).parent))}; "
                       f"cc -O2 -Wall -o /tmp/agentd-krun {q(str(launcher_src))} -I/usr/local/include "
                       f"-L/usr/local/lib64 -lkrun -Wl,-rpath,/usr/local/lib64; "
                       f"sudo install -m 755 /tmp/agentd-krun {VM_LAUNCHER}; rm /tmp/agentd-krun")
 
-    def do_launcher():
-        in_vm(build_launcher, "building the launcher")()
-        _install_state(p, {"launcher": launcher_sha()}, runner)
-    steps["launcher"] = Step("launcher", f"Build the agentd-krun launcher in the VM ({VM_LAUNCHER})",
-                             [vm(build_launcher)], run=do_launcher)
+    bundled_launcher = prebuilt.launcher(f"linux-{VM_ARCH}")
+    if bundled_launcher is not None:
+        copy = (f"set -e; sudo mkdir -p {q(str(Path(VM_LAUNCHER).parent))}; sudo tee {VM_LAUNCHER} >/dev/null; "
+                f"sudo chmod 755 {VM_LAUNCHER}")
+
+        def do_launcher():
+            _check(_stream_file(p, copy, bundled_launcher), "installing the launcher")
+            _install_state(p, {"launcher": launcher_sha()}, runner)
+        steps["launcher"] = Step("launcher", f"Install the agentd-krun launcher in the VM ({VM_LAUNCHER}, prebuilt)",
+                                 [vm(f"{copy} < {bundled_launcher}")], run=do_launcher)
+    else:
+        def do_launcher():
+            in_vm(build_launcher, "building the launcher")()
+            _install_state(p, {"launcher": launcher_sha()}, runner)
+        steps["launcher"] = Step("launcher", f"Build the agentd-krun launcher in the VM ({VM_LAUNCHER})",
+                                 [vm(build_launcher)], run=do_launcher)
     images = st.info.get("images") or {}
     for need in st.needs:
         if need.startswith("rootfs:"):
@@ -671,6 +705,14 @@ def _stream_context(profile: str, script: str, src_dir: Path, timeout: float = 3
         err.seek(0)
         return subprocess.CompletedProcess(proc.args, code, out.read().decode(errors="replace"),
                                            err.read().decode(errors="replace"))
+
+
+def _stream_file(profile: str, script: str, path: Path, timeout: float = 600) -> subprocess.CompletedProcess:
+    """Run ``script`` in the VM with the file at ``path`` on its stdin."""
+    with open(path, "rb") as f:
+        r = subprocess.run(ssh_argv(profile, "sh", "-c", script), stdin=f, capture_output=True, timeout=timeout)
+    return subprocess.CompletedProcess(r.args, r.returncode, r.stdout.decode(errors="replace"),
+                                       r.stderr.decode(errors="replace"))
 
 
 def _image_step(profile: str, name: str, images: dict, runner: Runner | None, vm) -> Step:

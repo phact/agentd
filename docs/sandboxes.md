@@ -13,8 +13,8 @@ brew tap slp/krun
 brew trust --formula slp/krun/libkrun slp/krun/libkrunfw slp/krun/virglrenderer-krun
 brew install slp/krun/libkrun
 
-agentd/sandbox/build.sh                                               # build + sign the launcher
-python -m agentd.sandbox.rootfs build agentd/sandbox/images/agents agents   # base image
+agentd/sandbox/build.sh                       # from a checkout only: build + sign the launcher
+python -m agentd.sandbox.rootfs build agents  # base image
 
 # Linux (KVM): one command installs pinned, checksum-verified libkrunfw + libkrun,
 # grants /dev/kvm access, builds the launcher and the base image (it asks first; uses sudo)
@@ -31,7 +31,7 @@ Setup uses its own Colima profile (`agentd`, 4 CPUs / 8 GiB / 60 GiB by default)
 
 **Docker (a container per session)**
 ```bash
-python -m agentd.sandbox.rootfs build agentd/sandbox/images/agents agents   # also tags agentd-sandbox-agents
+python -m agentd.sandbox.rootfs build agents   # also tags agentd-sandbox-agents
 ```
 
 The `agents` image contains Python, git, ripgrep, Claude Code and Codex, with an `agent` user at your uid. On macOS with Docker Desktop or Colima, workspaces must be inside a directory shared with the Docker VM (`$HOME` by default); agentd checks this and tells you if not.
@@ -48,6 +48,10 @@ KrunExecutor(colima=True, image="rosey")
 The directory is streamed into the VM, so it doesn't need to be shared with it, and its `.dockerignore` applies. An image is rebuilt when its files, an agentd image it builds `FROM`, or the VM user changes. For native libkrun, `python -m agentd.sandbox.rootfs build DIR NAME` and `KrunExecutor(image=NAME)`.
 
 By default agentd uses native libkrun if it is set up, then libkrun in Colima, then Docker (`agentd-sandbox status` shows which are ready; `AGENTD_SANDBOX=krun|krun-colima|docker` picks one). Code never runs directly on the host.
+
+### Prebuilt binaries
+
+The macOS arm64 and Linux x86_64/aarch64 wheels carry the `agentd-krun` launcher (ad-hoc signed with the hypervisor entitlement on macOS), `agentd-net`, and libkrun built with networking for Linux (the macOS wheel also has the Linux aarch64 launcher and libkrun, for Colima). `linux setup` and `colima setup` install those instead of compiling, so they need no compiler, Rust or libclang; libkrunfw is still downloaded (pinned, sha256-checked). `bin/prebuilt.json` records the `launcher.c` and libkrun they were built from, and binaries that don't match the installed code are ignored, so a checkout with edited sources builds as before.
 
 ## Backends
 

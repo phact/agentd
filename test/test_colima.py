@@ -44,6 +44,14 @@ class FakeColima:
                 and not (c[1] and "kvm_rw" in c[1])]
 
 
+
+@pytest.fixture(autouse=True)
+def _no_prebuilt(tmp_path, monkeypatch):
+    """Plans as from a checkout without prebuilt binaries (test_prebuilt covers those)."""
+    from agentd.sandbox import prebuilt
+
+    monkeypatch.setattr(prebuilt, "MANIFEST", tmp_path / "no-prebuilt.json")
+
 def _ready_probe():
     return {"kvm": "yes", "kvm_rw": "yes", "in_kvm_group": "no", "libkrun": "yes", "libkrunfw": "yes",
             "python3": "yes", "launcher": "yes", "uid": 501, "gid": 1000, "thp": "always", "nofile": str(colima.NOFILE),

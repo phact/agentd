@@ -1,5 +1,6 @@
 """Build sandbox base images.
 
+    python -m agentd.sandbox.rootfs build agents                # agentd's own image
     python -m agentd.sandbox.rootfs build DOCKERFILE_DIR NAME   # docker build + export
     python -m agentd.sandbox.rootfs export IMAGE NAME           # export an existing image
 
@@ -133,6 +134,8 @@ def build_image(context: Path, name: str, home: Path = DEFAULT_HOME) -> Path:
 
 
 def main() -> None:
+    if sys.argv[1:2] == ["build"] and len(sys.argv) == 3:  # one of agentd's images, by name
+        sys.argv[2:] = [str(Path(__file__).parent / "images" / sys.argv[2]), sys.argv[2]]
     if len(sys.argv) != 4 or sys.argv[1] not in ("build", "export"):
         sys.exit(__doc__)
     cmd, src, name = sys.argv[1:]

@@ -14,15 +14,14 @@ Run agents behind the OpenAI client API, sandboxed.
 uv add agentd
 ```
 
-Then set up a sandbox (from a checkout of this repo):
+Then set up a sandbox:
 
 ```bash
 # macOS (Apple Silicon)
 brew tap slp/krun
 brew trust --formula slp/krun/libkrun slp/krun/libkrunfw slp/krun/virglrenderer-krun
 brew install slp/krun/libkrun
-agentd/sandbox/build.sh
-python -m agentd.sandbox.rootfs build agentd/sandbox/images/agents agents
+python -m agentd.sandbox.rootfs build agents    # base image (needs Docker)
 
 # Linux (KVM)
 agentd-sandbox linux setup
@@ -31,8 +30,10 @@ agentd-sandbox linux setup
 agentd-sandbox colima setup
 
 # or Docker
-python -m agentd.sandbox.rootfs build agentd/sandbox/images/agents agents
+python -m agentd.sandbox.rootfs build agents
 ```
+
+Wheels for macOS arm64 and Linux x86_64/aarch64 include the launcher, `agentd-net` and (for Linux and Colima) libkrun, so nothing gets compiled. From a checkout, run `agentd/sandbox/build.sh` first.
 
 `agentd-sandbox status` shows what's ready. Details, custom images and mounts: [docs/sandboxes.md](docs/sandboxes.md).
 

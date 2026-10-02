@@ -32,6 +32,11 @@ build-backend = "hatchling.build"
 [tool.hatch.build.targets.wheel]
 packages = ["agentd/"]
 
+[tool.hatch.build.hooks.custom]
+
+[tool.hatch.build.targets.sdist]
+exclude = ["agentd/sandbox/bin", "logs", ".github"]
+
 
 [project.scripts]
 agentd = "agentd.app:main"
