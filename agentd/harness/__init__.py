@@ -6,6 +6,13 @@ loop, tools and all — inside the same :class:`~agentd.sandbox.session.SandboxS
 
   * ``"claude-code"``  Claude Code CLI via ``claude -p --output-format stream-json``
   * ``"codex"``        OpenAI Codex CLI via ``codex exec --json``
+  * ``"opencode"``     OpenCode via ``opencode run --format json``
+  * ``"omp"``          oh-my-pi via ``omp -p --mode json``
+
+OpenCode and omp work with any model: a ``claude-*`` model through agentd's
+Anthropic endpoint, an OpenAI model when the host has ``OPENAI_API_KEY``, or
+any OpenAI-compatible server through ``upstream=ModelUpstream(...)`` (see
+:mod:`agentd.harness.routes`).
 
 Every harness gets the same workspace, skills (MCP tools via the skills CLI)
 and model proxy. Its session transcripts are kept on the host and synced to
@@ -19,7 +26,7 @@ from agentd.harness import transcripts
 from agentd.harness.transcripts import claude_project_dirname  # noqa: F401  (public helper)
 from agentd.sandbox.session import TranscriptMount
 
-HARNESSES = ("ptc", "claude-code", "codex")
+HARNESSES = ("ptc", "claude-code", "codex", "opencode", "omp")
 
 
 def default_transcript_mounts(workspace: Path, root: Path | None = None) -> dict[str, TranscriptMount]:
@@ -45,4 +52,12 @@ def get_harness(name: str):
         from agentd.harness.codex import CodexHarness
 
         return CodexHarness
+    if name == "opencode":
+        from agentd.harness.opencode import OpenCodeHarness
+
+        return OpenCodeHarness
+    if name == "omp":
+        from agentd.harness.omp import OmpHarness
+
+        return OmpHarness
     raise ValueError(f"unknown harness {name!r}; expected one of {HARNESSES}")

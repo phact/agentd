@@ -6,8 +6,12 @@ Every harness gets the same setup:
     host, mounted into the sandbox at the harness's own location. The sandbox
     sees only this workspace's transcripts, never the rest of your history.
   * **native** where the CLI keeps sessions on the host:
-    ``~/.claude/projects/<encoded workspace>/`` (``$CLAUDE_CONFIG_DIR``) and
-    ``~/.codex/sessions/`` (``$CODEX_HOME``).
+    ``~/.claude/projects/<encoded workspace>/`` (``$CLAUDE_CONFIG_DIR``),
+    ``~/.codex/sessions/`` (``$CODEX_HOME``) and
+    ``~/.omp/agent/sessions/--<workspace>--/``. OpenCode keeps sessions in a
+    SQLite database, so its store holds one ``opencode export`` JSON file per
+    session instead, with no native copy (``opencode import FILE`` on the
+    host brings one in).
 
 After each turn (and when the session stops) new or changed store files are
 copied to the native path, so ``claude --resume`` / ``codex resume`` on the
@@ -25,12 +29,17 @@ from pathlib import Path
 from agentd.sandbox.base import DEFAULT_HOME
 from agentd.sandbox.session import SANDBOX_HOME
 
-HARNESS_NAMES = ("claude-code", "codex")
+HARNESS_NAMES = ("claude-code", "codex", "opencode", "omp")
 
 
 def claude_project_dirname(cwd: str | Path) -> str:
     """The folder name Claude Code files a cwd's sessions under."""
     return re.sub(r"[^A-Za-z0-9]", "-", str(cwd))
+
+
+def omp_dirname(cwd: str | Path) -> str:
+    """The folder name omp files a cwd's sessions under."""
+    return "--" + str(cwd).strip("/").replace("/", "-") + "--"
 
 
 def store_dir(harness: str, workspace: str | Path, root: Path | None = None) -> Path:
@@ -44,16 +53,24 @@ def sandbox_dir(harness: str, workspace: str | Path) -> str:
         return f"{SANDBOX_HOME}/.claude/projects/{claude_project_dirname(workspace)}"
     if harness == "codex":
         return f"{SANDBOX_HOME}/.codex/sessions"
+    if harness == "omp":
+        return f"{SANDBOX_HOME}/.omp/agent/sessions/{omp_dirname(workspace)}"
+    if harness == "opencode":
+        return f"{SANDBOX_HOME}/.agentd/opencode-sessions"
     raise ValueError(f"no transcripts for harness {harness!r}")
 
 
-def native_dir(harness: str, workspace: str | Path) -> Path:
-    """Where the CLI keeps these sessions on the host."""
+def native_dir(harness: str, workspace: str | Path) -> Path | None:
+    """Where the CLI keeps these sessions on the host (None: no file-based copy)."""
     if harness == "claude-code":
         config = Path(os.environ.get("CLAUDE_CONFIG_DIR", Path.home() / ".claude"))
         return config / "projects" / claude_project_dirname(workspace)
     if harness == "codex":
         return Path(os.environ.get("CODEX_HOME", Path.home() / ".codex")) / "sessions"
+    if harness == "omp":
+        return Path.home() / ".omp" / "agent" / "sessions" / omp_dirname(workspace)
+    if harness == "opencode":
+        return None
     raise ValueError(f"no transcripts for harness {harness!r}")
 
 
@@ -74,7 +91,8 @@ def _copy_if_newer(src: Path, dst: Path) -> bool:
 
 
 def _files(root: Path) -> list[Path]:
-    return [p for p in root.rglob("*") if p.is_file() and not p.name.endswith(".agentd-tmp")] if root.is_dir() else []
+    # Dotfiles are locks and temporaries (ours, omp's), never transcripts.
+    return [p for p in root.rglob("*") if p.is_file() and not p.name.startswith(".")] if root.is_dir() else []
 
 
 def sync_out(store: Path, native: Path) -> list[Path]:
@@ -96,12 +114,18 @@ def session_files(harness: str, root: Path, session_id: str) -> list[Path]:
         return files + _files(root / session_id)  # per-session subdir (e.g. subagents)
     if harness == "codex":
         return [p for p in root.rglob(f"rollout-*{session_id}.jsonl") if p.is_file()]
+    if harness == "omp":
+        return [p for p in root.glob(f"*_{session_id}.jsonl") if p.is_file()]
+    if harness == "opencode":
+        return [root / f"{session_id}.json"] if (root / f"{session_id}.json").is_file() else []
     return []
 
 
-def pull_in(harness: str, store: Path, native: Path, session_id: str) -> list[Path]:
+def pull_in(harness: str, store: Path, native: Path | None, session_id: str) -> list[Path]:
     """Bring one session's files from the native path into the store if newer there."""
     copied = []
+    if native is None:  # no file-based native copy (OpenCode)
+        return copied
     for src in session_files(harness, native, session_id):
         dst = store / src.relative_to(native)
         if _copy_if_newer(src, dst):

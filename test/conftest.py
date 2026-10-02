@@ -18,13 +18,18 @@ def _test_state_root():
 
 @pytest.fixture(autouse=True)
 def _keep_test_state_out_of_real_dirs(monkeypatch, _test_state_root):
-    """Tests never write to the real ~/.claude/projects, ~/.codex/sessions,
+    """Tests never write to the real ~/.claude/projects, ~/.codex/sessions, ~/.omp,
     ~/.agentd/transcripts or ~/.agentd/responses."""
     from agentd.harness import responses, transcripts
 
     root = _test_state_root
     original_native = transcripts.native_dir
-    monkeypatch.setattr(transcripts, "native_dir",
-                        lambda harness, workspace: root / "native" / original_native(harness, workspace).name)
+    def native(harness, workspace):
+        real = original_native(harness, workspace)
+        return None if real is None else root / "native" / harness / real.name
+    monkeypatch.setattr(transcripts, "native_dir", native)
     monkeypatch.setattr(transcripts, "DEFAULT_HOME", root)
+    from agentd.harness import chat
+
+    monkeypatch.setattr(chat, "SESSIONS_DIR", root / "harness-sessions")
     monkeypatch.setattr(responses, "RESPONSES_DIR", root / "responses")
