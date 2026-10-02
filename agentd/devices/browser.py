@@ -444,11 +444,15 @@ _BROWSER: Browser | None = None
 
 def enable_browser_skills(browser: Browser) -> None:
     global _BROWSER
+    from agentd.egress.approvals import register_request_tool
     from agentd.tool_decorator import tool
 
     _BROWSER = browser
     for func in TOOLS:
-        tool(func)
+        if func is request_browser:
+            register_request_tool(func, browser.approvals if not browser.allowed else None)
+        else:
+            tool(func)
 
 
 def _b() -> Browser:

@@ -229,11 +229,15 @@ _PHONE: Android | None = None
 def enable_android_skills(phone: Android) -> None:
     """Register the phone_* tools (host-side, behind agentd's bridge) for ``phone``."""
     global _PHONE
+    from agentd.egress.approvals import register_request_tool
     from agentd.tool_decorator import tool
 
     _PHONE = phone
     for func in TOOLS:
-        tool(func)
+        if func is request_phone:
+            register_request_tool(func, phone.approvals if not phone.allowed else None)
+        else:
+            tool(func)
 
 
 def _phone() -> Android:

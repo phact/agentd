@@ -178,6 +178,11 @@ class Approvals:
             if a.status == "pending" and now - a.created > self.expire:
                 a.status = "expired"
 
+    def timeout_note(self) -> str:
+        """For request tools' descriptions: how long a request waits for a decision."""
+        return (f"A request nobody decides within {_duration(self.expire)} expires (status expired); "
+                "ask again if it's still needed.")
+
     def list(self, *, pending_only: bool = False) -> list[Approval]:
         self._expire_old()
         items = sorted(self.items.values(), key=lambda a: a.created, reverse=True)
@@ -224,13 +229,32 @@ class Approvals:
 _ACTIVE: Approvals | None = None
 
 
+def _duration(seconds: float) -> str:
+    if seconds < 120:
+        return f"{seconds:g} seconds"
+    if seconds < 7200:
+        return f"{seconds / 60:g} minutes"
+    return f"{seconds / 3600:g} hours"
+
+
+def register_request_tool(func, approvals: Approvals | None) -> None:
+    """Register a request_* skill, its description saying when an undecided request expires."""
+    from agentd.tool_decorator import SCHEMA_REGISTRY, tool
+
+    tool(func)
+    if approvals is not None:
+        fn = SCHEMA_REGISTRY[func.__name__]["function"]
+        first, _, rest = fn["description"].partition("\n")
+        fn["description"] = f"{first} {approvals.timeout_note()}\n{rest}"
+
+
 def enable_access_skill(approvals: Approvals) -> None:
     """Register ``request_access`` / ``access_status`` as skills for agents."""
     global _ACTIVE
     from agentd.tool_decorator import tool
 
     _ACTIVE = approvals
-    tool(request_access)
+    register_request_tool(request_access, approvals)
     tool(access_status)
 
 

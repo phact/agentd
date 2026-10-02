@@ -209,7 +209,11 @@ def test_request_access_skill(tmp_path):
         a.asker(FakeEgress("s1", {"GH": "ph"}), policy)
         ap.enable_access_skill(a)
         try:
-            assert SCHEMA_REGISTRY["request_access"]["function"]["parameters"]["required"] == ["host", "reason"]
+            schema = SCHEMA_REGISTRY["request_access"]["function"]
+            assert schema["parameters"]["required"] == ["host", "reason"]
+            assert schema["description"].splitlines()[0].endswith(
+                "A request nobody decides within 60 minutes expires (status expired); ask again if it's still needed.")
+            assert "host: the host name" in schema["description"]
             r = await FUNCTION_REGISTRY["request_access"](host="API.github.com", reason="open a PR", secret="GH",
                                                          method="post", path="/repos/me/app/pulls")
             assert r["status"] == "pending"

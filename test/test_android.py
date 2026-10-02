@@ -113,6 +113,10 @@ def test_skills_registration(fake_adb, tmp_path):
         assert {"phone_screenshot", "phone_tap_text", "request_phone"} <= set(FUNCTION_REGISTRY)
         assert SCHEMA_REGISTRY["phone_tap"]["function"]["parameters"]["properties"]["x"]["type"] == "integer"
         assert FUNCTION_REGISTRY["phone_ui"]()[0]["text"] == "Inbox"
+        assert "expires" not in SCHEMA_REGISTRY["request_phone"]["function"]["description"]  # no approver
+        an.enable_android_skills(an.Android(serial="SER", workspace=tmp_path, adb=adb,
+                                            approvals=Approvals(allow_file=tmp_path / "a.toml", expire=900)))
+        assert "within 15 minutes expires" in SCHEMA_REGISTRY["request_phone"]["function"]["description"]
     finally:
         for f in an.TOOLS:
             FUNCTION_REGISTRY.pop(f.__name__, None)
