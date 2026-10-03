@@ -15,9 +15,9 @@ jobs:
     runs-on: ${{ matrix.runner }}
     container: quay.io/pypa/manylinux_2_28_${{ matrix.arch }}
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
       - run: scripts/build-binaries.sh
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@v7
         with:
           name: bin-linux-${{ matrix.arch }}
           path: agentd/sandbox/bin/
@@ -25,13 +25,13 @@ jobs:
   macos:
     runs-on: macos-14
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
       - run: |
           brew tap slp/krun
           brew trust --formula slp/krun/libkrun slp/krun/libkrunfw slp/krun/virglrenderer-krun || true
           brew install slp/krun/libkrun
       - run: scripts/build-binaries.sh
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@v7
         with:
           name: bin-darwin
           path: agentd/sandbox/bin/
@@ -40,17 +40,17 @@ jobs:
     needs: [linux, macos]
     runs-on: ubuntu-24.04
     steps:
-      - uses: actions/checkout@v4
-      - uses: astral-sh/setup-uv@v6
+      - uses: actions/checkout@v7
+      - uses: astral-sh/setup-uv@v10.2.0
       - name: tag matches the version
         if: startsWith(github.ref, 'refs/tags/v')
         run: test "${GITHUB_REF_NAME#v}" = "$(sed -n 's/^version = "\(.*\)"$/\1/p' pyproject.toml)"
-      - uses: actions/download-artifact@v4
+      - uses: actions/download-artifact@v8
         with:
           pattern: bin-*
           path: artifacts
       - run: scripts/build-wheels.sh artifacts dist
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@v7
         with:
           name: dist
           path: dist/
@@ -66,14 +66,14 @@ jobs:
           - {runner: ubuntu-24.04, wheel: "*py3-none-any.whl"}
     runs-on: ${{ matrix.runner }}
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
         with:
           sparse-checkout: scripts
-      - uses: actions/download-artifact@v4
+      - uses: actions/download-artifact@v8
         with:
           name: dist
           path: dist
-      - uses: actions/setup-python@v5
+      - uses: actions/setup-python@v7
         with:
           python-version: "3.12"
       - run: |
@@ -89,7 +89,7 @@ jobs:
     permissions:
       id-token: write
     steps:
-      - uses: actions/download-artifact@v4
+      - uses: actions/download-artifact@v8
         with:
           name: dist
           path: dist
