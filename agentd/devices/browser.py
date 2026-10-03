@@ -16,10 +16,15 @@
   with human-like timing.
 * Access is a lease (``request_browser``, approved through the same webhook
   as egress); when it ends, or on ``browser_close``, Chrome quits and its
-  profile (every cookie) is deleted.
-* ``browser_login(site)`` fills credentials from fnox (and TOTP codes from a
-  seed in fnox) on the host: the agent never sees them, password fields are
-  never read back, and tool output is scrubbed of every secret.
+  profile (every cookie) is deleted. The lease is for browsing only: no
+  credentials.
+* Each site's login needs its own approval (``request_login(site, reason)``:
+  once, for this browser session, or always). ``browser_login(site)`` then
+  fills credentials from fnox (and TOTP codes from a seed in fnox) on the
+  host, and only into a page on that login's hosts (its ``url``'s host, or
+  ``hosts``), so they can't be steered onto another site. The agent never
+  sees them, password fields are never read back, and tool output is
+  scrubbed of every secret.
 * Optional ``allow`` (host patterns) and the approvals hook police every
   request the browser makes (CDP ``Fetch``), the same way as sandbox egress.
 """
@@ -172,9 +177,11 @@ class _Pipe:
 @dataclass
 class Browser:
     workspace: str | Path | None = None
-    logins: dict[str, dict[str, str]] = field(default_factory=dict)  # site -> url/username/password/totp (fnox names)
+    # site -> url, hosts (patterns; default: the url's host), username/password/totp (fnox names)
+    logins: dict[str, dict[str, Any]] = field(default_factory=dict)
     allow: list[str] | None = None        # host patterns the browser may reach (None: any)
-    allowed: bool = False                 # skip the lease
+    allowed: bool = False                 # skip the lease (logins still need their own approval)
+    logins_allowed: bool | set[str] = False  # sites whose logins need no approval (host code decided)
     approvals: Any = None
     chrome: str | None = None
     fnox_cwd: str | Path | None = None    # where fnox finds the login secrets
@@ -184,6 +191,8 @@ class Browser:
     _session: str | None = field(default=None, repr=False)
     _profile: Path | None = field(default=None, repr=False)
     _pending: str | None = field(default=None, repr=False)
+    _login_pending: dict[str, str] = field(default_factory=dict, repr=False)   # site -> approval id
+    _login_grants: set[str] = field(default_factory=set, repr=False)          # sites approved for this session
     _elements: list[int] = field(default_factory=list, repr=False)   # ref -> backendNodeId
     _lock: asyncio.Lock | None = field(default=None, repr=False)
 
@@ -218,6 +227,59 @@ class Browser:
         await self.close()  # an ended lease wipes the session
         raise BrowserAccessError("no access to the browser right now: call request_browser(minutes, reason) "
                                  "and wait for a human to approve it")
+
+    def _login_hosts(self, site: str) -> list[str]:
+        conf = self.logins.get(site)
+        if conf is None:
+            raise LookupError(f"no login configured for {site!r} (have: {sorted(self.logins)})")
+        hosts = list(conf.get("hosts") or ([urlsplit(conf["url"]).hostname] if conf.get("url") else []))
+        if not hosts:
+            raise ValueError(f"login {site!r} needs a url or hosts (where its credentials may be typed)")
+        return [h.lower() for h in hosts]
+
+    def _login_granted(self, site: str) -> bool:
+        """Allowed by host code, for this session, or "always"."""
+        hosts = self._login_hosts(site)
+        if self.logins_allowed is True or site in (self.logins_allowed or ()) or site in self._login_grants:
+            return True
+        return self.approvals is not None and f"{site}@{hosts[0]}" in self.approvals.saved_logins()
+
+    def request_login(self, site: str, reason: str) -> dict[str, Any]:
+        hosts = self._login_hosts(site)
+        if self._login_granted(site):
+            return {"status": "allowed"}
+        if self.approvals is None:
+            raise BrowserAccessError("logins need an approver (none is configured)")
+        conf = self.logins[site]
+        approval = self.approvals.request("browser_login", "", {
+            "site": site, "host": hosts[0], "hosts": hosts,
+            "secrets": [conf[k] for k in ("username", "password", "totp") if conf.get(k)]}, reason)
+        self._login_pending[site] = approval.id
+        return {"id": approval.id, "status": approval.status}
+
+    def _use_login(self, site: str) -> None:
+        """Raise unless ``site``'s login is approved; a 'once' approval is spent here."""
+        if self._login_granted(site):
+            return
+        if self.approvals is not None:
+            a = self.approvals.items.get(self._login_pending.get(site, ""))
+            if a is not None and a.status in ("once", "session", "always"):
+                del self._login_pending[site]
+                if a.status != "once":
+                    self._login_grants.add(site)
+                return
+            if a is not None and a.status == "deny":
+                del self._login_pending[site]
+                raise BrowserAccessError(f"the human denied logging in to {site}")
+        raise BrowserAccessError(f"logging in to {site} needs approval: call request_login({site!r}, reason) "
+                                 "and wait for a human to approve it")
+
+    async def _on_login_host(self, site: str) -> None:
+        url = (await self._send("Page.getFrameTree"))["frameTree"]["frame"].get("url", "")  # Chrome's, not the page's
+        host = (urlsplit(url).hostname or "").lower()
+        if not any(fnmatch.fnmatchcase(host, h) for h in self._login_hosts(site)):
+            raise BrowserAccessError(f"the page is on {host or url!r}, not {site}'s login hosts "
+                                     f"{self._login_hosts(site)}: its credentials are only typed there")
 
     async def _ensure(self) -> None:
         if self._lock is None:
@@ -297,6 +359,7 @@ class Browser:
             shutil.rmtree(self._profile, ignore_errors=True)
             self._profile = None
         self._elements = []
+        self._login_grants.clear()  # "session" login approvals end with the session
         return {"closed": True}
 
     # ------------------------------------------------------------------ #
@@ -404,14 +467,14 @@ class Browser:
         return {"path": str(path)}
 
     async def login(self, site: str) -> dict[str, Any]:
-        """Fill and submit a site's login form from fnox, on the host."""
+        """Fill and submit a site's login form from fnox, on the host (only on its login hosts)."""
         await self._ready()
-        conf = self.logins.get(site)
-        if conf is None:
-            raise LookupError(f"no login configured for {site!r} (have: {sorted(self.logins)})")
+        self._use_login(site)
+        conf = self.logins[site]
         kw = {"cwd": self.fnox_cwd} if self.fnox_cwd else {}
         if conf.get("url"):
             await self.open(conf["url"])
+        await self._on_login_host(site)
         page = await self.snapshot()
         elements = page["elements"]
         password = next((e["ref"] for e in elements if e.get("password")), None)
@@ -421,10 +484,12 @@ class Browser:
                      and e.get("type") in (None, "text", "email", "tel")), None)
         if user is not None and conf.get("username"):
             await self._type_into(user, host_secrets.secret(conf["username"], **kw))
+        await self._on_login_host(site)  # still there, right before the password
         await self._type_into(password, host_secrets.secret(conf["password"], **kw))
         await self._press_enter()
         await asyncio.sleep(1.5)
         if conf.get("totp"):  # a second-factor page: fill the first text/number field
+            await self._on_login_host(site)
             page = await self.snapshot()
             code_field = next((e["ref"] for e in page["elements"] if e.get("tag") == "input"
                                and e.get("type") in (None, "text", "number", "tel")), None)
@@ -451,6 +516,8 @@ def enable_browser_skills(browser: Browser) -> None:
     for func in TOOLS:
         if func is request_browser:
             register_request_tool(func, browser.approvals if not browser.allowed else None)
+        elif func is request_login:
+            register_request_tool(func, browser.approvals if browser.logins_allowed is not True else None)
         else:
             tool(func)
 
@@ -468,6 +535,15 @@ def request_browser(minutes: int, reason: str) -> dict:
     reason: what for, for the human approving
     """
     return _b().request(minutes, reason)
+
+
+def request_login(site: str, reason: str) -> dict:
+    """Ask the human to let you log in to one configured site (browser_login). Each site needs its own approval; returns an approval id.
+
+    site: a configured site name
+    reason: why the task needs to be logged in there, for the human approving
+    """
+    return _b().request_login(site, reason)
 
 
 async def browser_open(url: str) -> dict:
@@ -507,7 +583,7 @@ async def browser_screenshot() -> dict:
 
 
 async def browser_login(site: str) -> dict:
-    """Log in to a configured site with credentials the human stored (you never see them).
+    """Log in to a configured site with credentials the human stored (you never see them). Needs request_login(site) approved first.
 
     site: a configured site name
     """
@@ -519,5 +595,5 @@ async def browser_close() -> dict:
     return await _b().close()
 
 
-TOOLS = (request_browser, browser_open, browser_snapshot, browser_click, browser_type, browser_screenshot,
+TOOLS = (request_browser, request_login, browser_open, browser_snapshot, browser_click, browser_type, browser_screenshot,
          browser_login, browser_close)

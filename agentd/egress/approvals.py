@@ -14,7 +14,7 @@ Decisions (``agentd serve``: ``POST /v1/approvals/{id}``, or :meth:`decide`):
 ``once`` (the held request, or if none is held, the next matching one),
 ``session`` (until the sandbox stops), ``always``
 (persisted: secret rules into the fnox config they came from, host
-allowances into ``~/.agentd/egress/allow.toml``), or ``deny``.
+allowances and browser logins into ``~/.agentd/egress/allow.toml``), or ``deny``.
 """
 from __future__ import annotations
 
@@ -76,23 +76,35 @@ class Approvals:
     # Persistent allowances (host grants that fnox can't hold)
     # ------------------------------------------------------------------ #
 
-    def saved_allows(self) -> list[str]:
+    def _saved(self) -> dict[str, list[str]]:
         try:
             import tomllib
         except ModuleNotFoundError:
             import tomli as tomllib  # type: ignore[no-redef]
         try:
-            return list(tomllib.loads(self.allow_file.read_text()).get("allow", []))
+            data = tomllib.loads(self.allow_file.read_text())
         except (OSError, ValueError):
-            return []
+            return {}
+        return {k: list(v) for k, v in data.items() if isinstance(v, list)}
+
+    def saved_allows(self) -> list[str]:
+        return self._saved().get("allow", [])
+
+    def saved_logins(self) -> list[str]:
+        """Browser logins approved "always", as ``site@host``."""
+        return self._saved().get("browser_logins", [])
+
+    def _save(self, key: str, value: str) -> None:
+        saved = self._saved()
+        if value in saved.get(key, []):
+            return
+        saved.setdefault(key, []).append(value)
+        self.allow_file.parent.mkdir(parents=True, exist_ok=True)
+        self.allow_file.write_text("".join(f"{k} = [" + ", ".join(json.dumps(s) for s in v) + "]\n"
+                                           for k, v in saved.items()))
 
     def _save_allow(self, spec: str) -> None:
-        specs = self.saved_allows()
-        if spec in specs:
-            return
-        specs.append(spec)
-        self.allow_file.parent.mkdir(parents=True, exist_ok=True)
-        self.allow_file.write_text("allow = [" + ", ".join(json.dumps(s) for s in specs) + "]\n")
+        self._save("allow", spec)
 
     # ------------------------------------------------------------------ #
     # Sessions
@@ -166,6 +178,10 @@ class Approvals:
         d = approval.details
         targets = [self._sessions[approval.session]] if approval.session in self._sessions else \
             list(self._sessions.values())
+        if approval.kind == "browser_login":
+            if persist:
+                self._save("browser_logins", f"{d['site']}@{d['host']}")
+            return
         if approval.kind == "connect":
             spec = f"{d.get('host') or d.get('ip')}:{d['port']}"
             for _, policy in targets:

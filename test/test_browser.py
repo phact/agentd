@@ -95,18 +95,31 @@ def test_live_browser_login_click_and_wipe(tmp_path):
     async def main():
         state = {}
         runner, port = await _site(state)
-        b = br.Browser(workspace=tmp_path, allowed=True, allow=["127.0.0.1"], fnox_cwd=tmp_path,
+        from agentd.egress.approvals import Approvals
+
+        approvals = Approvals(allow_file=tmp_path / "allow.toml")
+        b = br.Browser(workspace=tmp_path, allowed=True, allow=["127.0.0.1"], fnox_cwd=tmp_path, approvals=approvals,
                        logins={"local": {"url": f"http://127.0.0.1:{port}/login", "username": "SITE_USER",
-                                         "password": "SITE_PASS", "totp": "SITE_TOTP"}})
+                                         "password": "SITE_PASS", "totp": "SITE_TOTP"},
+                               "elsewhere": {"hosts": ["example.org"], "password": "SITE_PASS"}})
         outputs = []
         try:
             page = await b.open(f"http://127.0.0.1:{port}/login")
             outputs.append(page)
             assert page["title"] == "Sign in" and any(e.get("password") for e in page["elements"])
+            with pytest.raises(br.BrowserAccessError, match="request_login"):
+                await b.login("local")  # the lease alone gives no credentials
+            approvals.decide(b.request_login("elsewhere", "x")["id"], "session")
+            with pytest.raises(br.BrowserAccessError, match="login hosts"):
+                await b.login("elsewhere")  # approved, but this page isn't on its hosts
+            assert "login" not in state, "nothing was typed"
+            approvals.decide(b.request_login("local", "sign in to check the clicks")["id"], "once")
             page = await b.login("local")
             outputs.append(page)
             assert state["login"] == ("alice@example.com", "s3cret-pass-1234"), "credentials filled from fnox"
             assert page["title"] == "Home" and "Welcome alice" in page["text"], page
+            with pytest.raises(br.BrowserAccessError, match="request_login"):
+                await b.login("local")  # "once" is spent
             button = next(e["ref"] for e in page["elements"] if e.get("text") == "Click me")
             page = await b.click(button)
             outputs.append(page)
@@ -126,6 +139,60 @@ def test_live_browser_login_click_and_wipe(tmp_path):
             await runner.cleanup()
 
     asyncio.run(main())
+
+
+def test_logins_need_approval_per_site(tmp_path):
+    from agentd.egress.approvals import Approvals
+
+    approvals = Approvals(allow_file=tmp_path / "allow.toml")
+    logins = {"gh": {"url": "https://github.com/login", "username": "GH_USER", "password": "GH_PASS",
+                     "totp": "GH_TOTP"},
+              "bank": {"hosts": ["*.bank.example"], "password": "BANK_PASS"},
+              "bad": {"password": "X"}}
+    b = br.Browser(chrome="/bin/true", allowed=True, approvals=approvals, logins=logins)
+
+    with pytest.raises(LookupError):
+        b.request_login("nope", "x")
+    with pytest.raises(ValueError, match="url or hosts"):
+        b.request_login("bad", "x")
+    with pytest.raises(br.BrowserAccessError, match="request_login"):
+        b._use_login("gh")
+
+    req = b.request_login("gh", "open a PR")
+    a = approvals.items[req["id"]]
+    assert a.kind == "browser_login" and a.details == {
+        "site": "gh", "host": "github.com", "hosts": ["github.com"], "secrets": ["GH_USER", "GH_PASS", "GH_TOTP"]}
+    with pytest.raises(br.BrowserAccessError):
+        b._use_login("gh")  # still pending
+    approvals.decide(req["id"], "once")
+    b._use_login("gh")
+    with pytest.raises(br.BrowserAccessError, match="request_login"):
+        b._use_login("gh")  # spent
+    with pytest.raises(br.BrowserAccessError):
+        b._use_login("bank")  # gh's approval says nothing about bank
+
+    approvals.decide(b.request_login("bank", "pay a bill")["id"], "session")
+    b._use_login("bank")
+    b._use_login("bank")
+    asyncio.run(b.close())
+    with pytest.raises(br.BrowserAccessError):
+        b._use_login("bank")  # session approvals end with the browser session
+
+    approvals.decide(b.request_login("bank", "again")["id"], "deny")
+    with pytest.raises(br.BrowserAccessError, match="denied"):
+        b._use_login("bank")
+
+    approvals.decide(b.request_login("gh", "every day")["id"], "always")
+    assert approvals.saved_logins() == ["gh@github.com"]
+    fresh = br.Browser(chrome="/bin/true", allowed=True, approvals=Approvals(allow_file=tmp_path / "allow.toml"),
+                       logins=logins)
+    fresh._use_login("gh")  # remembered
+    assert b.request_login("gh", "x") == {"status": "allowed"}
+
+    pre = br.Browser(chrome="/bin/true", logins=logins, logins_allowed={"bank"})
+    pre._use_login("bank")
+    with pytest.raises(br.BrowserAccessError):
+        pre._use_login("gh")
 
 
 def test_lease_needs_approval(tmp_path):

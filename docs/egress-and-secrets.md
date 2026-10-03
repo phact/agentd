@@ -33,7 +33,7 @@ Setup: `agentd/sandbox/build.sh` builds `agentd-net` (needs cargo); `agentd-sand
 **Phones and browsers** are host-side tools too (the sandbox never touches them), granted as time-limited leases through the same approvals:
 
 - `agentd.devices.android`: `Android(serial=..., apps={...})` + `enable_android_skills(...)`: screenshot (into the workspace), UI elements, tap, tap-by-text, type, keys, swipe, open app (allowlist), list apps; over adb.
-- `agentd.devices.browser`: `Browser(logins={...})` + `enable_browser_skills(...)`: a real headed Chrome with a fresh profile per lease (wiped at the end), driven over the DevTools Protocol through a pipe with no automation tells; `browser_login(site)` fills credentials and TOTP codes from fnox on the host (the agent never sees them); an optional host allowlist enforced on every request.
+- `agentd.devices.browser`: `Browser(logins={...})` + `enable_browser_skills(...)`: a real headed Chrome with a fresh profile per lease (wiped at the end), driven over the DevTools Protocol through a pipe with no automation tells; `browser_login(site)` fills credentials and TOTP codes from fnox on the host (the agent never sees them); an optional host allowlist enforced on every request. The lease is for browsing only: each site's login needs its own approval (`request_login(site, reason)`; the approver sees the site, its hosts and the fnox secret names; `once`, `session` until the browser closes, or `always`, saved as `site@host` in `allow.toml`), and credentials are only typed into a page on that login's hosts (its `url`'s host, or `hosts=[...]`), checked from Chrome's own frame URL before the username, password and TOTP code.
 
 ## Summary
 
@@ -223,9 +223,12 @@ logged into (a dedicated backup phone), and you watching (scrcpy). iOS
   child process: otherwise macOS attributes Chrome's file access to agentd's
   own process (the spike triggered a Documents-folder privacy prompt that
   way). Use `--remote-debugging-pipe` rather than a port in the real tool.
-- Logins: you type them in that window, or (approved) a host-side tool fills
-  credentials from fnox, generates TOTP codes from a seed in fnox, or
-  injects saved session cookies. The agent never sees passwords or cookies.
+- Logins: you type them in that window, or a host-side tool fills
+  credentials from fnox and generates TOTP codes from a seed in fnox. The
+  agent never sees passwords or cookies. Each site's login is approved on
+  its own (a browser lease grants no credentials), and credentials are only
+  typed into pages on that site's login hosts, so an agent (or a page
+  steering it) can't send them to another site.
 - Sessions are leases: the profile is wiped when the task ends or the lease
   expires.
 - The browser's traffic goes through the same egress proxy; sites without
