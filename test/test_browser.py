@@ -38,6 +38,18 @@ async def _site(state):
             '<form method="post" action="/login"><label>Email <input name="user" type="email"></label>'
             '<label>Password <input name="pw" type="password"></label><button>Sign in</button></form>')))
 
+    async def old_login(request):
+        raise web.HTTPFound("/login-js")
+
+    async def login_js(request):
+        script = ("setTimeout(() => { document.body.innerHTML = `<form method='post' action='/login'>"
+                  "<label>Email <input name='user' type='email'></label><label>Password "
+                  "<input name='pw' type='password'></label><button>Sign in</button></form>`; }, 1500)")
+        return web.Response(content_type="text/html", text=page.format(t="Sign in", b=f"Loading...<script>{script}</script>"))
+
+    async def nothing(request):
+        return web.Response(content_type="text/html", text=page.format(t="Empty", b="no form here"))
+
     async def login(request):
         form = await request.post()
         state["login"] = (form.get("user"), form.get("pw"))
@@ -70,6 +82,9 @@ async def _site(state):
 
     app = web.Application()
     app.router.add_get("/login", login_form)
+    app.router.add_get("/old-login", old_login)
+    app.router.add_get("/login-js", login_js)
+    app.router.add_get("/nothing", nothing)
     app.router.add_post("/login", login)
     app.router.add_get("/2fa", twofa_form)
     app.router.add_post("/2fa", twofa)
@@ -84,7 +99,7 @@ async def _site(state):
 
 @pytest.mark.skipif(not os.environ.get("AGENTD_LIVE") or br.find_chrome() is None or shutil.which("fnox") is None,
                     reason="set AGENTD_LIVE=1 (needs Chrome and fnox; opens a browser window)")
-def test_live_browser_login_click_and_wipe(tmp_path):
+def test_live_browser_login_click_and_wipe(tmp_path, monkeypatch):
     (tmp_path / "fnox.toml").write_text(
         '[providers.plain]\ntype = "plain"\n[secrets]\n'
         'SITE_USER = { provider = "plain", value = "alice@example.com" }\n'
@@ -99,8 +114,9 @@ def test_live_browser_login_click_and_wipe(tmp_path):
 
         approvals = Approvals(allow_file=tmp_path / "allow.toml")
         b = br.Browser(workspace=tmp_path, allowed=True, allow=["127.0.0.1"], fnox_cwd=tmp_path, approvals=approvals,
-                       logins={"local": {"url": f"http://127.0.0.1:{port}/login", "username": "SITE_USER",
+                       logins={"local": {"url": f"http://127.0.0.1:{port}/old-login", "username": "SITE_USER",
                                          "password": "SITE_PASS", "totp": "SITE_TOTP"},
+                               "empty": {"url": f"http://127.0.0.1:{port}/nothing", "password": "SITE_PASS"},
                                "elsewhere": {"hosts": ["example.org"], "password": "SITE_PASS"}})
         outputs = []
         try:
@@ -113,6 +129,16 @@ def test_live_browser_login_click_and_wipe(tmp_path):
             with pytest.raises(br.BrowserAccessError, match="login hosts"):
                 await b.login("elsewhere")  # approved, but this page isn't on its hosts
             assert "login" not in state, "nothing was typed"
+            # A login page with no form fails, and doesn't spend the 'once'.
+            monkeypatch.setattr(br, "LOGIN_FORM_WAIT", 1.0)
+            approvals.decide(b.request_login("empty", "x")["id"], "once")
+            await b.open(f"http://127.0.0.1:{port}/home")  # on the site, but not on a login form
+            with pytest.raises(LookupError, match="no password field"):
+                await b.login("empty")
+            with pytest.raises(LookupError):
+                await b.login("empty")  # still approved
+            monkeypatch.setattr(br, "LOGIN_FORM_WAIT", 10.0)
+            # The saved URL redirects, and the form appears 1.5 s after the page loads.
             approvals.decide(b.request_login("local", "sign in to check the clicks")["id"], "once")
             page = await b.login("local")
             outputs.append(page)
@@ -161,10 +187,13 @@ def test_logins_need_approval_per_site(tmp_path):
     req = b.request_login("gh", "open a PR")
     a = approvals.items[req["id"]]
     assert a.kind == "browser_login" and a.details == {
-        "site": "gh", "host": "github.com", "hosts": ["github.com"], "secrets": ["GH_USER", "GH_PASS", "GH_TOTP"]}
+        "site": "gh", "host": "github.com", "hosts": ["github.com", "*.github.com"],
+        "secrets": ["GH_USER", "GH_PASS", "GH_TOTP"]}
     with pytest.raises(br.BrowserAccessError):
         b._use_login("gh")  # still pending
     approvals.decide(req["id"], "once")
+    b._use_login("gh", spend=False)
+    b._use_login("gh", spend=False)  # checked, not spent (e.g. no form on the page yet)
     b._use_login("gh")
     with pytest.raises(br.BrowserAccessError, match="request_login"):
         b._use_login("gh")  # spent
@@ -193,6 +222,34 @@ def test_logins_need_approval_per_site(tmp_path):
     pre._use_login("bank")
     with pytest.raises(br.BrowserAccessError):
         pre._use_login("gh")
+
+
+def test_request_tools_wait_for_the_answer(tmp_path):
+    from agentd.egress.approvals import Approvals
+
+    approvals = Approvals(hold=5, allow_file=tmp_path / "allow.toml")
+    b = br.Browser(chrome="/bin/true", approvals=approvals,
+                   logins={"gh": {"url": "https://github.com/login", "password": "P"}})
+    br.enable_browser_skills(b)
+    from agentd.tool_decorator import FUNCTION_REGISTRY, SCHEMA_REGISTRY
+
+    async def main():
+        async def approve_soon():
+            await asyncio.sleep(0.3)
+            approvals.decide(next(iter(approvals.items)), "session")
+        t0 = time.monotonic()
+        r, _ = await asyncio.gather(FUNCTION_REGISTRY["request_login"](site="gh", reason="x"), approve_soon())
+        assert r["status"] == "session" and time.monotonic() - t0 < 2, "returned as soon as it was decided"
+        approvals.hold = 0.3
+        r = await FUNCTION_REGISTRY["request_browser"](minutes=5, reason="y")
+        assert r["status"] == "pending", "undecided: back after the hold"
+    try:
+        assert "waits up to 5 seconds" in SCHEMA_REGISTRY["request_login"]["function"]["description"]
+        asyncio.run(main())
+    finally:
+        for f in br.TOOLS:
+            FUNCTION_REGISTRY.pop(f.__name__, None)
+            SCHEMA_REGISTRY.pop(f.__name__, None)
 
 
 def test_lease_needs_approval(tmp_path):

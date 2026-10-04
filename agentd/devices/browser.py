@@ -56,8 +56,14 @@ CHROME_PATHS = (
     "/Applications/Google Chrome.app/Contents/MacOS/Google Chrome",
     "/usr/bin/google-chrome", "/usr/bin/google-chrome-stable", "/usr/bin/chromium", "/usr/bin/chromium-browser",
 )
-STEALTH_FLAGS = ("--disable-blink-features=AutomationControlled", "--no-first-run", "--no-default-browser-check",
-                 "--disable-features=Translate", "--window-size=1280,900")
+# AutomationControlled keeps navigator.webdriver false (it's true when driven over the
+# pipe), at the cost of Chrome's "unsupported command-line flag" bar. Don't add
+# --test-type to hide the bar: it also stops Chrome's component extensions, so the
+# "Google ..." speech voices vanish from speechSynthesis.getVoices() (any site can see
+# that) and Google's own pages can't reach the Hangouts services extension.
+STEALTH_FLAGS = ("--disable-blink-features=AutomationControlled", "--no-first-run",
+                 "--no-default-browser-check", "--disable-features=Translate", "--window-size=1280,900")
+LOGIN_FORM_WAIT = 10.0  # seconds browser_login waits for a password field to appear
 
 # Read the page from an isolated world: interactive elements with what a person sees.
 _SNAPSHOT_JS = r"""
@@ -232,10 +238,14 @@ class Browser:
         conf = self.logins.get(site)
         if conf is None:
             raise LookupError(f"no login configured for {site!r} (have: {sorted(self.logins)})")
-        hosts = list(conf.get("hosts") or ([urlsplit(conf["url"]).hostname] if conf.get("url") else []))
-        if not hosts:
+        if conf.get("hosts"):
+            return [h.lower() for h in conf["hosts"]]
+        host = (urlsplit(conf["url"]).hostname or "").lower() if conf.get("url") else ""
+        if not host:
             raise ValueError(f"login {site!r} needs a url or hosts (where its credentials may be typed)")
-        return [h.lower() for h in hosts]
+        # The url's site and its subdomains: delta.com/custlogin redirects to www.delta.com/skymiles/login.
+        base = host[4:] if host.startswith("www.") else host
+        return [base, f"*.{base}"]
 
     def _login_granted(self, site: str) -> bool:
         """Allowed by host code, for this session, or "always"."""
@@ -257,16 +267,18 @@ class Browser:
         self._login_pending[site] = approval.id
         return {"id": approval.id, "status": approval.status}
 
-    def _use_login(self, site: str) -> None:
-        """Raise unless ``site``'s login is approved; a 'once' approval is spent here."""
+    def _use_login(self, site: str, spend: bool = True) -> None:
+        """Raise unless ``site``'s login is approved; a 'once' approval is spent here (with ``spend``)."""
         if self._login_granted(site):
             return
         if self.approvals is not None:
             a = self.approvals.items.get(self._login_pending.get(site, ""))
             if a is not None and a.status in ("once", "session", "always"):
-                del self._login_pending[site]
                 if a.status != "once":
                     self._login_grants.add(site)
+                    del self._login_pending[site]
+                elif spend:
+                    del self._login_pending[site]
                 return
             if a is not None and a.status == "deny":
                 del self._login_pending[site]
@@ -274,11 +286,15 @@ class Browser:
         raise BrowserAccessError(f"logging in to {site} needs approval: call request_login({site!r}, reason) "
                                  "and wait for a human to approve it")
 
-    async def _on_login_host(self, site: str) -> None:
+    async def _login_host_ok(self, site: str) -> tuple[bool, str]:
         url = (await self._send("Page.getFrameTree"))["frameTree"]["frame"].get("url", "")  # Chrome's, not the page's
         host = (urlsplit(url).hostname or "").lower()
-        if not any(fnmatch.fnmatchcase(host, h) for h in self._login_hosts(site)):
-            raise BrowserAccessError(f"the page is on {host or url!r}, not {site}'s login hosts "
+        return any(fnmatch.fnmatchcase(host, h) for h in self._login_hosts(site)), host or url
+
+    async def _on_login_host(self, site: str) -> None:
+        ok, host = await self._login_host_ok(site)
+        if not ok:
+            raise BrowserAccessError(f"the page is on {host!r}, not {site}'s login hosts "
                                      f"{self._login_hosts(site)}: its credentials are only typed there")
 
     async def _ensure(self) -> None:
@@ -469,23 +485,33 @@ class Browser:
     async def login(self, site: str) -> dict[str, Any]:
         """Fill and submit a site's login form from fnox, on the host (only on its login hosts)."""
         await self._ready()
-        self._use_login(site)
+        self._use_login(site, spend=False)  # a 'once' is spent only when credentials are typed
         conf = self.logins[site]
         kw = {"cwd": self.fnox_cwd} if self.fnox_cwd else {}
-        if conf.get("url"):
+        # Already on the site's login form (the agent got there itself): stay. Otherwise
+        # go to the saved URL, which may redirect (old addresses) within the site.
+        if conf.get("url") and not ((await self._login_host_ok(site))[0]
+                                    and any(e.get("password") for e in (await self.snapshot())["elements"])):
             await self.open(conf["url"])
         await self._on_login_host(site)
-        page = await self.snapshot()
-        elements = page["elements"]
-        password = next((e["ref"] for e in elements if e.get("password")), None)
+        # Many login pages build the form with JavaScript after the load: wait for it.
+        deadline = time.monotonic() + LOGIN_FORM_WAIT
+        while True:
+            page = await self.snapshot()
+            elements = page["elements"]
+            password = next((e["ref"] for e in elements if e.get("password")), None)
+            if password is not None or time.monotonic() >= deadline:
+                break
+            await asyncio.sleep(0.5)
         if password is None:
-            raise LookupError("no password field on the page")
+            raise LookupError(f"no password field on {page.get('url')} after {LOGIN_FORM_WAIT:g} s")
         user = next((e["ref"] for e in reversed(elements[:password]) if e.get("tag") == "input"
                      and e.get("type") in (None, "text", "email", "tel")), None)
         if user is not None and conf.get("username"):
             await self._type_into(user, host_secrets.secret(conf["username"], **kw))
         await self._on_login_host(site)  # still there, right before the password
         await self._type_into(password, host_secrets.secret(conf["password"], **kw))
+        self._use_login(site)  # credentials typed: a 'once' approval is now used
         await self._press_enter()
         await asyncio.sleep(1.5)
         if conf.get("totp"):  # a second-factor page: fill the first text/number field
@@ -515,9 +541,11 @@ def enable_browser_skills(browser: Browser) -> None:
     _BROWSER = browser
     for func in TOOLS:
         if func is request_browser:
-            register_request_tool(func, browser.approvals if not browser.allowed else None)
+            a = browser.approvals if not browser.allowed else None
+            register_request_tool(func, a, *([a.wait_note()] if a else []))
         elif func is request_login:
-            register_request_tool(func, browser.approvals if browser.logins_allowed is not True else None)
+            a = browser.approvals if browser.logins_allowed is not True else None
+            register_request_tool(func, a, *([a.wait_note()] if a else []))
         else:
             tool(func)
 
@@ -528,22 +556,29 @@ def _b() -> Browser:
     return _BROWSER
 
 
-def request_browser(minutes: int, reason: str) -> dict:
-    """Ask the human for a browser session for some minutes. Returns an approval id; browser tools work once approved.
+async def _answer(r: dict) -> dict:
+    b = _b()
+    if r.get("status") == "pending" and b.approvals is not None:
+        r["status"] = await b.approvals.wait(r["id"])
+    return r
+
+
+async def request_browser(minutes: int, reason: str) -> dict:
+    """Ask the human for a browser session for some minutes. Returns an approval id and its status; browser tools work once approved.
 
     minutes: how long the task needs the browser
     reason: what for, for the human approving
     """
-    return _b().request(minutes, reason)
+    return await _answer(_b().request(minutes, reason))
 
 
-def request_login(site: str, reason: str) -> dict:
-    """Ask the human to let you log in to one configured site (browser_login). Each site needs its own approval; returns an approval id.
+async def request_login(site: str, reason: str) -> dict:
+    """Ask the human to let you log in to one configured site (browser_login). Each site needs its own approval; returns an approval id and its status.
 
     site: a configured site name
     reason: why the task needs to be logged in there, for the human approving
     """
-    return _b().request_login(site, reason)
+    return await _answer(_b().request_login(site, reason))
 
 
 async def browser_open(url: str) -> dict:

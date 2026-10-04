@@ -224,6 +224,7 @@ def test_request_access_skill(tmp_path):
         policy = Policy()
         a.asker(FakeEgress("s1", {"GH": "ph"}), policy)
         ap.enable_access_skill(a)
+        a.hold = 0.1  # request_access waits up to the hold for an answer
         try:
             schema = SCHEMA_REGISTRY["request_access"]["function"]
             assert schema["parameters"]["required"] == ["host", "reason"]

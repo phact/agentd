@@ -205,6 +205,22 @@ class Approvals:
             if a.status == "pending" and now - a.created > self.expire:
                 a.status = "expired"
 
+    async def wait(self, approval_id: str, timeout: float | None = None) -> str:
+        """An approval's status once decided, or after ``timeout`` (default: the hold) if it's still pending.
+
+        Polls rather than awaiting a future: request tools run on the bridge's
+        loop, decisions arrive on agentd serve's."""
+        deadline = time.monotonic() + (self.hold if timeout is None else timeout)
+        while True:
+            a = self.items.get(approval_id)
+            if a is None or a.status != "pending" or time.monotonic() >= deadline:
+                return a.status if a else "unknown"
+            await asyncio.sleep(0.2)
+
+    def wait_note(self) -> str:
+        return (f"It waits up to {_duration(self.hold)} for the human's answer; if it's still pending then, "
+                "check again later (approvals arrive while you do other work).")
+
     def timeout_note(self) -> str:
         """For request tools' descriptions: how long a request waits for a decision."""
         return (f"A request nobody decides within {_duration(self.expire)} expires (status expired); "
@@ -292,7 +308,7 @@ def enable_access_skill(approvals: Approvals) -> None:
 
     _ACTIVE = approvals
     tool(list_secrets)
-    register_request_tool(request_access, approvals, approvals.hold_note())
+    register_request_tool(request_access, approvals, approvals.wait_note(), approvals.hold_note())
     tool(access_status)
 
 
@@ -336,7 +352,7 @@ async def request_access(host: str, reason: str, port: int = 443, secret: str = 
         approval = _ACTIVE.request("secret", session, details, reason)
     else:
         approval = _ACTIVE.request("connect", session, {"host": host.lower(), "ip": "", "port": port}, reason)
-    return {"id": approval.id, "status": approval.status}
+    return {"id": approval.id, "status": await _ACTIVE.wait(approval.id)}
 
 
 async def access_status(approval_id: str) -> dict:
