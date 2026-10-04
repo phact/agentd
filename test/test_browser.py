@@ -18,6 +18,38 @@ from agentd.devices import browser as br
 SEED = "JBSWY3DPEHPK3PXP"
 
 
+@pytest.mark.skipif(not os.environ.get("AGENTD_LIVE") or br.find_chrome() is None or shutil.which("fnox") is None,
+                    reason="set AGENTD_LIVE=1 (needs Chrome and fnox; opens a browser window)")
+def test_live_login_survives_banners_and_focus_theft(tmp_path):
+    (tmp_path / "fnox.toml").write_text(
+        '[providers.plain]\ntype = "plain"\n[secrets]\n'
+        'SITE_USER = { provider = "plain", value = "alice@example.com" }\n'
+        'SITE_PASS = { provider = "plain", value = "s3cret-pass-1234" }\n')
+    secrets.forget()
+
+    async def main():
+        state = {}
+        runner, port = await _site(state)
+        base = f"http://127.0.0.1:{port}"
+        b = br.Browser(workspace=tmp_path, allowed=True, fnox_cwd=tmp_path, logins_allowed=True,
+                       logins={"hostile": {"url": f"{base}/login-hostile", "username": "SITE_USER",
+                                           "password": "SITE_PASS"},
+                               "short": {"url": f"{base}/login-short", "password": "SITE_PASS"}})
+        try:
+            await b.login("hostile")
+            assert state.get("consent") == 1, "the consent banner was accepted"
+            assert state["login"] == ("alice@example.com", "s3cret-pass-1234"), \
+                "the prefilled username was replaced and no keystroke went to the chat widget"
+            del state["login"]
+            with pytest.raises(br.BrowserAccessError, match="took focus"):
+                await b.login("short")  # the box can't take the whole password
+            assert "login" not in state, "not submitted"
+        finally:
+            await b.close()
+            await runner.cleanup()
+    asyncio.run(main())
+
+
 def test_totp_matches_rfc6238():
     # RFC 6238 test vector (SHA-1, 8 digits) for the ASCII seed "12345678901234567890"
     import base64
@@ -46,6 +78,35 @@ async def _site(state):
                   "<label>Email <input name='user' type='email'></label><label>Password "
                   "<input name='pw' type='password'></label><button>Sign in</button></form>`; }, 1500)")
         return web.Response(content_type="text/html", text=page.format(t="Sign in", b=f"Loading...<script>{script}</script>"))
+
+    async def login_hostile(request):
+        # A prefilled username, a OneTrust banner that covers the page after 0.8 s, and a chat
+        # widget that grabs focus twice while the password is typed.
+        body = ("<form method='post' action='/login'><label>Email <input name='user' type='email' "
+                "value='old@example.com'></label><label>Password <input id='pw' name='pw' type='password'>"
+                "</label><button>Sign in</button></form>"
+                "<script>setTimeout(() => { const b = document.createElement('div'); b.id = 'onetrust-banner-sdk';"
+                "b.style = 'position:fixed;inset:0;background:#fff;z-index:9';"
+                "b.innerHTML = `<button id='onetrust-accept-btn-handler'>I understand</button>`;"
+                "document.body.appendChild(b); b.querySelector('button').onclick = () => { fetch('/consent');"
+                "b.remove(); }; }, 800);"
+                "let steals = 0; document.getElementById('pw').addEventListener('input', () => {"
+                "if (steals++ < 2) { const c = document.createElement('textarea'); document.body.appendChild(c);"
+                "c.focus(); } });</script>")
+        return web.Response(content_type="text/html", text=page.format(t="Sign in", b=body))
+
+    async def consent(request):
+        state["consent"] = state.get("consent", 0) + 1
+        return web.Response(text="ok")
+
+    async def login_short(request):
+        return web.Response(content_type="text/html", text=page.format(t="Sign in", b=(
+            "<form method='post' action='/login'><input name='pw' type='password' maxlength='4'>"
+            "<button>Sign in</button></form>")))
+
+    async def popup(request):
+        return web.Response(content_type="text/html", text=page.format(t="Links", b=(
+            "<a href='https://example.org/' target='_blank'>Open elsewhere</a>")))
 
     async def nothing(request):
         return web.Response(content_type="text/html", text=page.format(t="Empty", b="no form here"))
@@ -85,6 +146,10 @@ async def _site(state):
     app.router.add_get("/old-login", old_login)
     app.router.add_get("/login-js", login_js)
     app.router.add_get("/nothing", nothing)
+    app.router.add_get("/popup", popup)
+    app.router.add_get("/login-hostile", login_hostile)
+    app.router.add_get("/consent", consent)
+    app.router.add_get("/login-short", login_short)
     app.router.add_post("/login", login)
     app.router.add_get("/2fa", twofa_form)
     app.router.add_post("/2fa", twofa)
@@ -150,6 +215,17 @@ def test_live_browser_login_click_and_wipe(tmp_path, monkeypatch):
             page = await b.click(button)
             outputs.append(page)
             assert state["clicks"] == 1 and "clicks: 1" in page["text"]
+            assert br.totp(SEED) in secrets.known_values() or br.totp(SEED, at=time.time() - 30) in \
+                secrets.known_values(), "the typed TOTP code is scrubbed from what the agent sees"
+            # A link that opens a new tab is policed like the page: the allowlist holds.
+            page = await b.open(f"http://127.0.0.1:{port}/popup")
+            await b.click(next(e["ref"] for e in page["elements"] if e.get("text") == "Open elsewhere"))
+            await asyncio.sleep(2)
+            tabs = (await b._pipe.send("Target.getTargets"))["targetInfos"]
+            popup = next(t for t in tabs if t["type"] == "page" and "example.org" in t["url"])
+            sid = (await b._pipe.send("Target.attachToTarget", {"targetId": popup["targetId"], "flatten": True}))["sessionId"]
+            frame = (await b._pipe.send("Page.getFrameTree", {}, sid))["frameTree"]["frame"]
+            assert frame.get("unreachableUrl") == "https://example.org/", frame
             shot = await b.screenshot()
             assert Path(shot["path"]).stat().st_size > 1000
             blocked = await b.open("https://example.com/")

@@ -65,6 +65,34 @@ CHROME_PATHS = (
 STEALTH_FLAGS = ("--disable-blink-features=AutomationControlled", "--no-first-run",
                  "--no-default-browser-check", "--disable-features=Translate", "--window-size=1280,900")
 LOGIN_FORM_WAIT = 10.0  # seconds browser_login waits for a password field to appear
+_AUTO_ATTACH = {"autoAttach": True, "waitForDebuggerOnStart": True, "flatten": True}
+_POLICED_TARGETS = ("page", "iframe", "worker", "shared_worker", "service_worker")
+
+# "Accept" buttons of common cookie-consent banners, clicked when a page opens and before
+# a login (they steal focus and cover forms). Accepting is fine: every session's profile,
+# cookies included, is deleted when it ends.
+CONSENT_ACCEPT = (
+    "#onetrust-accept-btn-handler",                                  # OneTrust ("I understand", "Accept all")
+    "#CybotCookiebotDialogBodyLevelButtonLevelOptinAllowAll",        # Cookiebot
+    "#CybotCookiebotDialogBodyButtonAccept",
+    "#truste-consent-button",                                        # TrustArc
+    "#didomi-notice-agree-button",                                   # Didomi
+    ".osano-cm-accept-all",                                          # Osano
+    ".cky-btn-accept",                                               # CookieYes
+    ".cmplz-btn.cmplz-accept",                                       # Complianz
+    "[data-testid='uc-accept-all-button']",                          # Usercentrics
+    ".fc-cta-consent",                                               # Google consent (Funding Choices)
+    ".cc-window .cc-allow, .cc-window .cc-dismiss",                  # Insites Cookie Consent
+)
+_CONSENT_JS = """(() => {
+  const roots = [document, ...[...document.querySelectorAll('*')].filter(e => e.shadowRoot).map(e => e.shadowRoot)];
+  for (const sel of %s) for (const root of roots) for (const el of root.querySelectorAll(sel)) {
+    const r = el.getBoundingClientRect(), st = getComputedStyle(el);
+    if (r.width > 2 && r.height > 2 && st.visibility !== 'hidden' && st.display !== 'none')
+      return {x: r.left + r.width / 2, y: r.top + r.height / 2, sel};
+  }
+  return null;
+})()""" % json.dumps(list(CONSENT_ACCEPT))
 
 # Read the page from an isolated world: interactive elements with what a person sees.
 _SNAPSHOT_JS = r"""
@@ -198,6 +226,7 @@ class Browser:
     _session: str | None = field(default=None, repr=False)
     _profile: Path | None = field(default=None, repr=False)
     _pending: str | None = field(default=None, repr=False)
+    _page_target: str | None = field(default=None, repr=False)
     _login_pending: dict[str, str] = field(default_factory=dict, repr=False)   # site -> approval id
     _login_grants: set[str] = field(default_factory=set, repr=False)          # sites approved for this session
     _elements: list[int] = field(default_factory=list, repr=False)   # ref -> backendNodeId
@@ -244,7 +273,8 @@ class Browser:
         host = (urlsplit(conf["url"]).hostname or "").lower() if conf.get("url") else ""
         if not host:
             raise ValueError(f"login {site!r} needs a url or hosts (where its credentials may be typed)")
-        # The url's site and its subdomains: delta.com/custlogin redirects to www.delta.com/skymiles/login.
+        # The url's site and its subdomains, so a saved example.com/login that redirects to
+        # www.example.com/signin still counts.
         base = host[4:] if host.startswith("www.") else host
         return [base, f"*.{base}"]
 
@@ -362,11 +392,34 @@ class Browser:
         page = next((t for t in targets if t["type"] == "page"), None)
         if page is None:
             page = {"targetId": (await self._pipe.send("Target.createTarget", {"url": "about:blank"}))["targetId"]}
+        self._page_target = page["targetId"]
         self._session = (await self._pipe.send("Target.attachToTarget",
                                                {"targetId": page["targetId"], "flatten": True}))["sessionId"]
         await self._send("Page.enable")  # lifecycle only; never Runtime.enable
-        await self._send("Fetch.enable", {"patterns": [{"urlPattern": "*", "requestStage": "Request"}]})
         self._pipe.handlers["Fetch.requestPaused"] = self._on_request
+        self._pipe.handlers["Target.attachedToTarget"] = self._on_attached
+        await self._send("Fetch.enable", {"patterns": [{"urlPattern": "*", "requestStage": "Request"}]})
+        # Every other target (new tabs and popups, iframes in their own process, workers) is held
+        # at start until its requests are intercepted too, so none gets past the allowlist.
+        await self._pipe.send("Target.setAutoAttach", _AUTO_ATTACH)
+        await self._send("Target.setAutoAttach", _AUTO_ATTACH)
+
+    async def _on_attached(self, params: dict, session: str | None) -> None:
+        info, child = params.get("targetInfo", {}), params.get("sessionId")
+        try:
+            if info.get("targetId") != self._page_target and info.get("type") in _POLICED_TARGETS:
+                await self._pipe.send("Fetch.enable", {"patterns": [{"urlPattern": "*", "requestStage": "Request"}]},
+                                      child)
+                if info.get("type") in ("page", "iframe"):
+                    await self._pipe.send("Target.setAutoAttach", _AUTO_ATTACH, child)
+        except (RuntimeError, ConnectionError, asyncio.TimeoutError):
+            pass
+        finally:
+            if params.get("waitingForDebugger"):
+                try:
+                    await self._pipe.send("Runtime.runIfWaitingForDebugger", {}, child)
+                except (RuntimeError, ConnectionError, asyncio.TimeoutError):
+                    pass
 
     async def _send(self, method: str, params: dict | None = None, timeout: float = 30) -> dict:
         assert self._pipe is not None
@@ -440,7 +493,31 @@ class Browser:
             if state.get("result", {}).get("value") == "complete":
                 break
             await asyncio.sleep(0.25)
+        await self._dismiss_consent()
         return await self.snapshot()
+
+    async def _dismiss_consent(self, rounds: int = 2) -> list[str]:
+        """Click a known cookie-consent banner's accept button (real mouse events), up to ``rounds``
+        times for two-step banners. Returns the selectors clicked."""
+        clicked = []
+        for _ in range(rounds):
+            hit = (await self._isolated(_CONSENT_JS))["result"].get("value")
+            if not hit:
+                break
+            await self._click_at(hit["x"], hit["y"])
+            clicked.append(hit["sel"])
+            await asyncio.sleep(0.6)
+        return clicked
+
+    async def _click_at(self, x: float, y: float) -> None:
+        x += random.uniform(-2, 2)
+        y += random.uniform(-2, 2)
+        await self._send("Input.dispatchMouseEvent", {"type": "mouseMoved", "x": x, "y": y})
+        await asyncio.sleep(random.uniform(0.05, 0.15))
+        for kind in ("mousePressed", "mouseReleased"):
+            await self._send("Input.dispatchMouseEvent", {"type": kind, "x": x, "y": y, "button": "left",
+                                                          "clickCount": 1})
+            await asyncio.sleep(random.uniform(0.04, 0.12))
 
     async def snapshot(self) -> dict[str, Any]:
         """The page: URL, title, visible text (trimmed) and numbered interactive elements."""
@@ -474,24 +551,54 @@ class Browser:
 
     async def click(self, ref: int) -> dict[str, Any]:
         await self._ready()
-        x, y = await self._center(ref)
-        x += random.uniform(-2, 2)
-        y += random.uniform(-2, 2)
-        await self._send("Input.dispatchMouseEvent", {"type": "mouseMoved", "x": x, "y": y})
-        await asyncio.sleep(random.uniform(0.05, 0.15))
-        for kind in ("mousePressed", "mouseReleased"):
-            await self._send("Input.dispatchMouseEvent", {"type": kind, "x": x, "y": y, "button": "left",
-                                                          "clickCount": 1})
-            await asyncio.sleep(random.uniform(0.04, 0.12))
+        await self._click_at(*await self._center(ref))
         await asyncio.sleep(0.5)
         return await self.snapshot()
 
-    async def _type_into(self, ref: int, text: str) -> None:
+    async def _node(self, ref: int) -> str:
+        """A handle on element ``ref`` in agentd's isolated world (the page's scripts can't see our calls)."""
+        tree = await self._send("Page.getFrameTree")
+        world = await self._send("Page.createIsolatedWorld", {"frameId": tree["frameTree"]["frame"]["id"],
+                                                              "worldName": "agentd"})
+        obj = await self._send("DOM.resolveNode", {"backendNodeId": self._elements[ref],
+                                                   "executionContextId": world["executionContextId"]})
+        return obj["object"]["objectId"]
+
+    async def _on(self, handle: str, function: str) -> Any:
+        r = await self._send("Runtime.callFunctionOn", {"objectId": handle, "functionDeclaration": function,
+                                                        "returnByValue": True})
+        return r.get("result", {}).get("value")
+
+    async def _type_into(self, ref: int, text: str, *, clear: bool = False) -> None:
+        """Type ``text`` into element ``ref``. Before each character, focus goes back to it if
+        the page moved it (a cookie banner, a chat widget), so no keystroke lands elsewhere."""
         node = self._elements[ref]
+        handle = await self._node(ref)
+        focused = "function() { const r = this.getRootNode(); return (r.activeElement || document.activeElement) === this; }"
         await self._send("DOM.focus", {"backendNodeId": node})
+        if clear:  # select what's there and delete it with a real key press (frameworks see the change)
+            await self._on(handle, "function() { if (this.select) this.select(); else document.execCommand('selectAll'); }")
+            for kind in ("keyDown", "keyUp"):
+                await self._send("Input.dispatchKeyEvent", {"type": kind, "key": "Backspace", "code": "Backspace",
+                                                            "windowsVirtualKeyCode": 8})
         for ch in text:
+            if not await self._on(handle, focused):
+                await self._send("DOM.focus", {"backendNodeId": node})
             await self._send("Input.dispatchKeyEvent", {"type": "char", "text": ch})
             await asyncio.sleep(random.uniform(0.03, 0.09))
+
+    async def _fill_field(self, ref: int, text: str) -> None:
+        """Type a credential into ``ref``, verify the box got every character (by length only: the
+        value is never read back), retype once if not, else fail rather than submit."""
+        await self._dismiss_consent(rounds=1)  # banners often appear while the form is being filled
+        handle = await self._node(ref)
+        length = "function() { return (this.value !== undefined ? this.value : this.textContent || '').length; }"
+        for attempt in range(2):
+            await self._type_into(ref, text, clear=True)
+            if (await self._on(handle, length) or 0) >= len(text):  # >=: some fields format what's typed
+                return
+        raise BrowserAccessError("the page took focus while typing (or the field doesn't take the whole "
+                                 "credential): not submitting")
 
     async def type(self, ref: int, text: str, submit: bool = False) -> dict[str, Any]:
         await self._ready()
@@ -530,9 +637,11 @@ class Browser:
                                     and any(e.get("password") for e in (await self.snapshot())["elements"])):
             await self.open(conf["url"])
         await self._on_login_host(site)
-        # Many login pages build the form with JavaScript after the load: wait for it.
+        # Many login pages build the form with JavaScript after the load: wait for it. Consent
+        # banners (which cover the form or grab focus mid-typing) often load late too.
         deadline = time.monotonic() + LOGIN_FORM_WAIT
         while True:
+            await self._dismiss_consent(rounds=1)
             page = await self.snapshot()
             elements = page["elements"]
             password = next((e["ref"] for e in elements if e.get("password")), None)
@@ -544,9 +653,9 @@ class Browser:
         user = next((e["ref"] for e in reversed(elements[:password]) if e.get("tag") == "input"
                      and e.get("type") in (None, "text", "email", "tel")), None)
         if user is not None and conf.get("username"):
-            await self._type_into(user, host_secrets.secret(conf["username"], **kw))
+            await self._fill_field(user, host_secrets.secret(conf["username"], **kw))
         await self._on_login_host(site)  # still there, right before the password
-        await self._type_into(password, host_secrets.secret(conf["password"], **kw))
+        await self._fill_field(password, host_secrets.secret(conf["password"], **kw))
         self._use_login(site)  # credentials typed: a 'once' approval is now used
         await self._press_enter()
         await asyncio.sleep(1.5)
@@ -556,7 +665,9 @@ class Browser:
             code_field = next((e["ref"] for e in page["elements"] if e.get("tag") == "input"
                                and e.get("type") in (None, "text", "number", "tel")), None)
             if code_field is not None:
-                await self._type_into(code_field, totp(host_secrets.secret(conf["totp"], **kw)))
+                code = totp(host_secrets.secret(conf["totp"], **kw))
+                host_secrets.remember(code)  # derived, not read from fnox: scrub it from snapshots too
+                await self._fill_field(code_field, code)
                 await self._press_enter()
                 await asyncio.sleep(1.5)
         return await self.snapshot()
