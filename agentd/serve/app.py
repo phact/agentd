@@ -451,10 +451,24 @@ class Server:
             raise HTTPError(403, "only local callers and configured approvers can decide approvals",
                             "permission_error")
         body = await request.json()
+        approvals, approval_id, decision = self._approvals(), request.match_info["id"], str(body.get("decision"))
+        # The master password unlocks the approval's locked secrets in fnox; never stored or logged.
+        password = body.pop("password", None)
+        password = bytearray(password.encode()) if isinstance(password, str) else None
         try:
-            a = self._approvals().decide(request.match_info["id"], str(body.get("decision")), by=who)
+            a = approvals.items.get(approval_id)
+            if a is not None and decision != "deny" and a.details.get("unlock") and password is not None:
+                await asyncio.to_thread(approvals.unlock, approval_id, password)  # slow: a key derivation per secret
+            a = approvals.decide(approval_id, decision, by=who, password=password)
         except KeyError:
-            raise HTTPError(404, f"no approval {request.match_info['id']}", "not_found_error") from None
+            raise HTTPError(404, f"no approval {approval_id}", "not_found_error") from None
+        except ValueError as e:
+            raise HTTPError(400, str(e), "invalid_request_error") from None
+        except RuntimeError as e:  # fnox: e.g. its daemon is off, so unlocking can't stick
+            raise HTTPError(409, str(e), "unlock_error") from None
+        finally:
+            if password is not None:
+                password[:] = bytes(len(password))
         return web.json_response(a.public())
 
     # Legacy Claude Code sessions -------------------------------------------

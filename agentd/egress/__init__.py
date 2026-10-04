@@ -17,10 +17,12 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
 
+from agentd import fnox
 from agentd.egress.ca import SessionCA
 from agentd.egress.policy import (Allow, Policy, SecretRule, fnox_config_files, fnox_get, load_rules,
                                   load_secret_names, make_placeholder, opaque_placeholder)
 from agentd.egress.proxy import EgressProxy
+from agentd.fnox import SecretMissing
 from agentd.sandbox.base import DEFAULT_HOME
 
 logger = logging.getLogger(__name__)
@@ -84,13 +86,18 @@ class EgressSession:
             self.config_files = await asyncio.to_thread(
                 fnox_config_files, self.workspace, fnox=e.fnox_bin, profile=e.fnox_profile)
             rules = load_rules(self.config_files)
+            locked: set[str] = set()
             for name in dict.fromkeys(r.secret for r in rules):
+                # Read now only what fnox has unlocked (for format-preserving placeholders);
+                # a locked secret is read, or unlocked, when a request first needs it.
                 try:
                     secrets[name] = await asyncio.to_thread(
                         fnox_get, name, self.workspace, fnox=e.fnox_bin, profile=e.fnox_profile)
+                except SecretMissing:
+                    locked.add(name)
                 except (RuntimeError, OSError) as err:
                     logger.warning("egress: %s (its rules are disabled)", err)
-            rules = [r for r in rules if r.secret in secrets]
+            rules = [r for r in rules if r.secret in secrets or r.secret in locked]
             # Every other secret the sandbox may ask for gets a placeholder now; its
             # value is read from fnox only once a rule or approval lets it be sent.
             names = load_secret_names(self.config_files, e.fnox_profile)
@@ -98,7 +105,8 @@ class EgressSession:
                 self.descriptions[name] = names[name]
         for r in rules:
             if r.secret not in self.placeholders:
-                ph = r.placeholder or make_placeholder(secrets[r.secret])
+                ph = r.placeholder or (make_placeholder(secrets[r.secret]) if r.secret in secrets
+                                       else opaque_placeholder())
                 self.placeholders[r.secret] = ph
             self.descriptions.setdefault(r.secret, "")
         for name in self.descriptions:
@@ -113,7 +121,8 @@ class EgressSession:
         await self.proxy.start()
 
     async def _load(self, name: str) -> None:
-        """Read a secret from fnox for the proxy, the first time it may be sent."""
+        """Read a secret from fnox for the proxy, the first time it may be sent
+        (:class:`SecretMissing` if it's locked in fnox)."""
         e = self.egress
         try:
             value = await asyncio.to_thread(fnox_get, name, self.workspace, fnox=e.fnox_bin, profile=e.fnox_profile)
@@ -122,6 +131,19 @@ class EgressSession:
             return
         if self.proxy is not None:
             self.proxy.add_secret(name, value)
+
+    def loaded(self, name: str) -> bool:
+        return self.proxy is not None and name in self.proxy.secrets
+
+    def uncached(self, names: list[str]) -> list[str]:
+        """Which of ``names`` fnox can't read without an unlock (blocking)."""
+        e = self.egress
+        return fnox.uncached(names, self.workspace, fnox=e.fnox_bin, profile=e.fnox_profile) if e.fnox else []
+
+    def fill(self, names: list[str], password: bytearray) -> dict[str, str]:
+        """Unlock ``names`` in fnox with the master password (blocking; zeroes it)."""
+        e = self.egress
+        return fnox.fill(names, password, cwd=self.workspace, fnox=e.fnox_bin, profile=e.fnox_profile)
 
     def list_secrets(self) -> list[dict[str, Any]]:
         """What the sandbox can use or ask for: names, descriptions, env vars and rules (never values)."""

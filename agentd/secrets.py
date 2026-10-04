@@ -13,10 +13,12 @@ sometimes needs a credential the sandbox must never see:
     MCPServerStdio(params={"command": "github-mcp-server", "args": ["stdio"],
                            "env": secret_env(["GITHUB_TOKEN"])})
 
-Values come from fnox (``fnox get``, non-interactive) and stay in this
-process's memory. Everything the bridge returns to a sandbox is scrubbed of
-every value resolved here (:func:`scrub`), so a tool that echoes its own
-credential can't leak it.
+Values come from fnox on every call (``fnox get``, non-interactive), so fnox's
+daemon is the only cache and a value changed in the vault is picked up at
+once. A secret whose vault is locked raises :class:`agentd.fnox.SecretMissing`
+(see :mod:`agentd.fnox` for unlocking). Everything the bridge returns to a
+sandbox is scrubbed of every value read here (:func:`scrub`), so a tool that
+echoes its own credential can't leak it.
 """
 from __future__ import annotations
 
@@ -25,21 +27,17 @@ import threading
 from pathlib import Path
 from typing import Any
 
-from agentd.egress.policy import fnox_get
+from agentd import fnox as _fnox
+from agentd.fnox import SecretMissing  # noqa: F401  (raised by secret())
 
 _lock = threading.Lock()
-_values: dict[tuple[str, str, str | None], str] = {}
+_seen: set[str] = set()  # values read in this process, only for scrubbing
 
 
 def secret(name: str, *, cwd: str | Path | None = None, profile: str | None = None, fnox: str = "fnox") -> str:
-    """One secret's value from fnox (cached for this process)."""
-    key = (name, str(Path(cwd or os.getcwd()).resolve()), profile)
-    with _lock:
-        if key in _values:
-            return _values[key]
-    value = fnox_get(name, Path(key[1]), fnox=fnox, profile=profile)
-    with _lock:
-        _values[key] = value
+    """One secret's value from fnox, read now (:class:`SecretMissing` if its vault is locked)."""
+    value = _fnox.get(name, Path(cwd or os.getcwd()).resolve(), fnox=fnox, profile=profile)
+    remember(value)
     return value
 
 
@@ -52,12 +50,12 @@ def remember(value: str) -> None:
     """Treat ``value`` as a secret for scrubbing (e.g. one obtained elsewhere)."""
     if value:
         with _lock:
-            _values[("_remembered", value[:8], None)] = value
+            _seen.add(value)
 
 
 def known_values() -> list[str]:
     with _lock:
-        return sorted({v for v in _values.values() if len(v) >= 4}, key=len, reverse=True)
+        return sorted({v for v in _seen if len(v) >= 4}, key=len, reverse=True)
 
 
 def scrub(obj: Any) -> Any:
@@ -84,6 +82,6 @@ def scrub(obj: Any) -> Any:
 
 
 def forget() -> None:
-    """Drop every cached value (e.g. in tests)."""
+    """Forget every value read so far (e.g. in tests)."""
     with _lock:
-        _values.clear()
+        _seen.clear()

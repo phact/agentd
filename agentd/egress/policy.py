@@ -124,14 +124,9 @@ class Policy:
 
 def fnox_config_files(cwd: Path, *, fnox: str = "fnox", profile: str | None = None) -> list[Path]:
     """The config files fnox would load from ``cwd`` (its own discovery)."""
-    argv = [fnox] + (["-P", profile] if profile else []) + ["config-files"]
-    try:
-        r = subprocess.run(argv, cwd=cwd, capture_output=True, text=True, timeout=30)
-    except (OSError, subprocess.SubprocessError):
-        return []
-    if r.returncode != 0:
-        return []
-    return [Path(line.strip()) for line in r.stdout.splitlines() if line.strip().endswith(".toml")]
+    from agentd import fnox as _fnox
+
+    return _fnox.config_files(cwd, fnox=fnox, profile=profile)
 
 
 def load_rules(files: list[Path]) -> list[SecretRule]:
@@ -175,13 +170,10 @@ def load_secret_names(files: list[Path], profile: str | None = None) -> dict[str
 
 
 def fnox_get(name: str, cwd: Path, *, fnox: str = "fnox", profile: str | None = None) -> str:
-    """One secret's value, from fnox on the host (no prompts)."""
-    argv = [fnox, "--non-interactive"] + (["-P", profile] if profile else []) + ["get", name]
-    r = subprocess.run(argv, cwd=cwd, capture_output=True, text=True, timeout=60,
-                       env={**os.environ, "FNOX_NON_INTERACTIVE": "1"})
-    if r.returncode != 0:
-        raise RuntimeError(f"fnox couldn't get {name}: {(r.stderr or r.stdout).strip()[:300]}")
-    return r.stdout.rstrip("\n")
+    """One secret's value, from fnox on the host (no prompts; :class:`agentd.fnox.SecretMissing` if locked)."""
+    from agentd import fnox as _fnox
+
+    return _fnox.get(name, cwd, fnox=fnox, profile=profile)
 
 
 def make_placeholder(value: str) -> str:

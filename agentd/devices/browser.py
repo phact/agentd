@@ -50,6 +50,7 @@ from pathlib import Path
 from typing import Any
 from urllib.parse import urlsplit
 
+from agentd import fnox
 from agentd import secrets as host_secrets
 
 CHROME_PATHS = (
@@ -260,12 +261,46 @@ class Browser:
             return {"status": "allowed"}
         if self.approvals is None:
             raise BrowserAccessError("logins need an approver (none is configured)")
-        conf = self.logins[site]
+        names = self._login_secrets(site)
+        missing = self._uncached(names)  # locked in fnox: approving will need the master password
         approval = self.approvals.request("browser_login", "", {
-            "site": site, "host": hosts[0], "hosts": hosts,
-            "secrets": [conf[k] for k in ("username", "password", "totp") if conf.get(k)]}, reason)
+            "site": site, "host": hosts[0], "hosts": hosts, "secrets": names}, reason,
+            unlock=(missing, self._fill) if missing else None)
         self._login_pending[site] = approval.id
         return {"id": approval.id, "status": approval.status}
+
+    def _login_secrets(self, site: str) -> list[str]:
+        conf = self.logins[site]
+        return [conf[k] for k in ("username", "password", "totp") if conf.get(k)]
+
+    def _fnox_dir(self) -> Path:
+        return Path(self.fnox_cwd or os.getcwd()).resolve()
+
+    def _uncached(self, names: list[str]) -> list[str]:
+        return fnox.uncached(names, self._fnox_dir())
+
+    def _fill(self, names: list[str], password: bytearray) -> dict[str, str]:
+        return fnox.fill(names, password, cwd=self._fnox_dir())
+
+    async def _ensure_unlocked(self, site: str) -> None:
+        """A login approved earlier (always, session, by host code) whose secrets are locked in
+        fnox asks for an unlock (the human's master password) and waits for it."""
+        missing = await asyncio.to_thread(self._uncached, self._login_secrets(site))
+        if not missing:
+            return
+        if self.approvals is None:
+            raise BrowserAccessError(f"{site}'s credentials ({', '.join(missing)}) are locked in fnox, "
+                                     "and no approver is configured to unlock them")
+        approval = self.approvals.request("unlock", "", {"site": site, "host": self._login_hosts(site)[0],
+                                                         "secrets": missing}, f"log in to {site}",
+                                          unlock=(missing, self._fill))
+        status = await self.approvals.wait(approval.id)
+        if status not in ("once", "session", "always"):
+            raise BrowserAccessError(f"{site}'s credentials are locked in fnox: unlock approval {approval.id} is "
+                                     f"{status}" + ("" if status == "deny" else "; call browser_login again once "
+                                                    "it's approved"))
+        if await asyncio.to_thread(self._uncached, missing):
+            raise BrowserAccessError(f"{site}'s credentials are still locked in fnox")
 
     def _use_login(self, site: str, spend: bool = True) -> None:
         """Raise unless ``site``'s login is approved; a 'once' approval is spent here (with ``spend``)."""
@@ -486,6 +521,7 @@ class Browser:
         """Fill and submit a site's login form from fnox, on the host (only on its login hosts)."""
         await self._ready()
         self._use_login(site, spend=False)  # a 'once' is spent only when credentials are typed
+        await self._ensure_unlocked(site)
         conf = self.logins[site]
         kw = {"cwd": self.fnox_cwd} if self.fnox_cwd else {}
         # Already on the site's login form (the agent got there itself): stay. Otherwise

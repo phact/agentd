@@ -10,6 +10,13 @@ sha256=<HMAC of the body>``). The proxy holds the request for ``hold``
 seconds: approved in time, it goes through; otherwise the agent gets a 403
 saying the approval is pending (``id``, ``retry_after``) and retries later.
 
+Secrets locked in fnox (a vault whose master password fnox's daemon doesn't
+have yet) are listed in the approval's ``details["unlock"]``; allowing it then
+needs the master password (``{"decision": ..., "password": ...}``), which
+unlocks them (:func:`agentd.fnox.fill`) before the decision applies. A wrong
+password leaves the approval pending. A pre-approved use that finds its secret
+locked asks with an approval of kind ``unlock``.
+
 Decisions (``agentd serve``: ``POST /v1/approvals/{id}``, or :meth:`decide`):
 ``once`` (the held request, or if none is held, the next matching one),
 ``session`` (until the sandbox stops), ``always``
@@ -27,8 +34,9 @@ import os
 import time
 from dataclasses import asdict, dataclass, field
 from pathlib import Path
-from typing import TYPE_CHECKING, Any
+from typing import TYPE_CHECKING, Any, Callable
 
+from agentd import fnox
 from agentd.egress.policy import Allow, Policy, SecretRule, add_rule_to_fnox
 from agentd.sandbox.base import DEFAULT_HOME
 
@@ -44,7 +52,7 @@ DECISIONS = ("once", "session", "always", "deny")
 @dataclass
 class Approval:
     id: str
-    kind: str                         # "connect" | "secret"
+    kind: str                         # connect | secret | unlock | browser | browser_login | device
     session: str
     details: dict[str, Any]
     reason: str = ""
@@ -71,6 +79,7 @@ class Approvals:
         self._holding: dict[str, int] = {}  # approval id -> requests held for it right now
         self._sessions: dict[str, tuple["EgressSession", Policy]] = {}
         self._dedupe: dict[tuple, str] = {}
+        self._fillers: dict[str, Callable[[list[str], bytearray], dict[str, str]]] = {}  # approval id -> unlock
 
     # ------------------------------------------------------------------ #
     # Persistent allowances (host grants that fnox can't hold)
@@ -116,7 +125,15 @@ class Approvals:
         policy.allows.extend(Allow.parse(s) for s in self.saved_allows())
 
         async def ask(kind: str, **details: Any) -> tuple[bool, str]:
-            approval = self.request(kind, egress.session, details)
+            names = details.get("secrets") if kind == "unlock" else \
+                [details["secret"]] if kind == "secret" and details.get("secret") else []
+            unlock = None
+            if names:
+                missing = await asyncio.to_thread(egress.uncached, [n for n in names if not egress.loaded(n)])
+                if kind == "unlock" and not missing:
+                    return True, "", "unlocked"  # unlocked meanwhile: nothing to ask
+                unlock = (missing, egress.fill) if missing else None
+            approval = self.request(kind, egress.session, details, unlock=unlock)
             if approval.status != "pending":
                 return approval.status != "deny", approval.id, approval.status
             fut = self._waiters.setdefault(approval.id, asyncio.get_running_loop().create_future())
@@ -140,9 +157,15 @@ class Approvals:
     # Requests and decisions
     # ------------------------------------------------------------------ #
 
-    def request(self, kind: str, session: str, details: dict[str, Any], reason: str = "") -> Approval:
-        """A pending approval (an identical pending one is reused) announced to the webhook."""
+    def request(self, kind: str, session: str, details: dict[str, Any], reason: str = "",
+                unlock: tuple[list[str], Callable[[list[str], bytearray], dict[str, str]]] | None = None) -> Approval:
+        """A pending approval (an identical pending one is reused) announced to the webhook.
+
+        ``unlock``: (secret names locked in fnox, a function that unlocks them with
+        the master password); allowing the approval will need that password."""
         self._expire_old()
+        if unlock and unlock[0]:
+            details = {**details, "unlock": list(unlock[0])}
         key = (kind, session, json.dumps(details, sort_keys=True))
         existing = self._dedupe.get(key)
         if existing and existing in self.items and self.items[existing].status == "pending":
@@ -151,10 +174,43 @@ class Approvals:
                             reason=reason)
         self.items[approval.id] = approval
         self._dedupe[key] = approval.id
+        if unlock and unlock[0]:
+            self._fillers[approval.id] = unlock[1]
         self._notify(approval)
         return approval
 
-    def decide(self, approval_id: str, decision: str, by: str = "local") -> Approval:
+    def unlock(self, approval_id: str, password: bytearray | str) -> None:
+        """Unlock the approval's locked secrets with the master password (zeroed afterwards).
+
+        The approval stays pending if it fails: :class:`agentd.fnox.WrongPassword` (a
+        ValueError: ask again) or :class:`agentd.fnox.UnlockFailed` (unlocked, but fnox
+        couldn't read a secret: fix the vault or the fnox config, or deny). Blocking:
+        fnox derives the vault key per secret; agentd serve runs it in a thread."""
+        pw = password if isinstance(password, bytearray) else bytearray(str(password).encode())
+        try:
+            approval = self.items.get(approval_id)
+            if approval is None:
+                raise KeyError(approval_id)
+            names = approval.details.get("unlock") or []
+            if not names:
+                return
+            failed = self._fillers[approval_id](names, pw)
+            if any(why == fnox.WRONG_PASSWORD for why in failed.values()):
+                raise fnox.WrongPassword("master password didn't unlock the vault")
+            if failed:
+                raise fnox.UnlockFailed("the vault unlocked, but fnox couldn't read "
+                                        + "; ".join(f"{name}: {why}" for name, why in failed.items())
+                                        + " (renamed or deleted in the vault? fix it there or in the fnox config, "
+                                        "or deny)")
+            approval.details["unlock"] = []
+            self._fillers.pop(approval_id, None)
+        finally:
+            for i in range(len(pw)):
+                pw[i] = 0
+
+    def decide(self, approval_id: str, decision: str, by: str = "local",
+               password: bytearray | str | None = None) -> Approval:
+        """Decide an approval. One that lists secrets to unlock needs ``password`` to be allowed."""
         if decision not in DECISIONS:
             raise ValueError(f"decision must be one of {DECISIONS}")
         approval = self.items.get(approval_id)
@@ -162,6 +218,13 @@ class Approvals:
             raise KeyError(approval_id)
         if approval.status != "pending":
             return approval
+        if decision != "deny" and approval.details.get("unlock"):
+            if password is None:
+                raise ValueError(f"approving this unlocks {', '.join(approval.details['unlock'])} in fnox: "
+                                 "it needs the master password")
+            self.unlock(approval_id, password)
+        elif isinstance(password, bytearray):
+            password[:] = bytes(len(password))
         approval.status, approval.decided_by, approval.decided = decision, by, time.time()
         if decision in ("session", "always"):
             self._grant(approval, persist=decision == "always")
@@ -349,7 +412,11 @@ async def request_access(host: str, reason: str, port: int = 443, secret: str = 
     if secret:
         details = {"secret": secret, "host": host.lower(), "method": method.upper(), "path": path,
                    "header": "authorization"}
-        approval = _ACTIVE.request("secret", session, details, reason)
+        unlock = None
+        if egress is not None and not egress.loaded(secret):
+            missing = await asyncio.to_thread(egress.uncached, [secret])
+            unlock = (missing, egress.fill) if missing else None
+        approval = _ACTIVE.request("secret", session, details, reason, unlock=unlock)
     else:
         approval = _ACTIVE.request("connect", session, {"host": host.lower(), "ip": "", "port": port}, reason)
     return {"id": approval.id, "status": await _ACTIVE.wait(approval.id)}

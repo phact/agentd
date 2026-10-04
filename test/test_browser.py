@@ -167,7 +167,13 @@ def test_live_browser_login_click_and_wipe(tmp_path, monkeypatch):
     asyncio.run(main())
 
 
-def test_logins_need_approval_per_site(tmp_path):
+@pytest.fixture
+def unlocked(monkeypatch):
+    """fnox has every login secret (locked vaults: test_unlock_* below)."""
+    monkeypatch.setattr(br.Browser, "_uncached", lambda self, names: [])
+
+
+def test_logins_need_approval_per_site(tmp_path, unlocked):
     from agentd.egress.approvals import Approvals
 
     approvals = Approvals(allow_file=tmp_path / "allow.toml")
@@ -224,7 +230,7 @@ def test_logins_need_approval_per_site(tmp_path):
         pre._use_login("gh")
 
 
-def test_request_tools_wait_for_the_answer(tmp_path):
+def test_request_tools_wait_for_the_answer(tmp_path, unlocked):
     from agentd.egress.approvals import Approvals
 
     approvals = Approvals(hold=5, allow_file=tmp_path / "allow.toml")

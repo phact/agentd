@@ -131,11 +131,30 @@ class EgressProxy:
         self.masks: dict[bytes, bytes] = {}
         for name, value in secrets.items():
             self._mask(name, value)
+        self._loop: asyncio.AbstractEventLoop | None = None
+        if load is not None:
+            from agentd import fnox
+
+            fnox.on_clear(self)  # a vault changed: read again (or unlock) on next use
         self._server: asyncio.base_events.Server | None = None
 
     def _mask(self, name: str, value: str) -> None:
         ph = self.placeholders.get(name, "")
         self.masks[value.encode()] = ph.encode() if len(ph) == len(value) else b"*" * len(value)
+
+    def forget_secrets(self) -> None:
+        """Drop the values read so far (fnox.clear(): the vault changed). Masks stay, so
+        responses are still scrubbed of old values."""
+        loop = self._loop
+        if loop is not None and loop.is_running():
+            try:
+                running = asyncio.get_running_loop()
+            except RuntimeError:
+                running = None
+            if running is not loop:
+                loop.call_soon_threadsafe(self.secrets.clear)
+                return
+        self.secrets.clear()
 
     def add_secret(self, name: str, value: str) -> None:
         """A secret read after the session started (responses are scrubbed of it from now on)."""
@@ -147,6 +166,7 @@ class EgressProxy:
     async def start(self) -> None:
         self.socket_path.parent.mkdir(parents=True, exist_ok=True)
         self.socket_path.unlink(missing_ok=True)
+        self._loop = asyncio.get_running_loop()
         self._server = await asyncio.start_unix_server(self._on_stream, path=str(self.socket_path))
         self.socket_path.chmod(0o600)
 
@@ -322,7 +342,10 @@ class EgressProxy:
 
     async def _load_needed(self, host: str, method: str, path: str, headers: list[tuple[bytes, bytes]],
                            once: frozenset[str] = frozenset()) -> None:
-        """Read from fnox the secrets this request may send that weren't read yet."""
+        """Read from fnox the secrets this request may send that weren't read yet. One locked in
+        fnox is asked about (an ``unlock`` approval: the human's master password unlocks it)."""
+        from agentd.fnox import SecretMissing
+
         if self.load is None:
             return
         rules = self.policy.rules_for(host)
@@ -331,9 +354,29 @@ class EgressProxy:
             for secret, ph in list(self.placeholders.items()):
                 if secret in self.secrets or not ph or ph.encode() not in value:
                     continue
-                if secret in once or any(r.secret == secret and r.header == lname and r.matches(method, path)
-                                         for r in rules):
+                if not (secret in once or any(r.secret == secret and r.header == lname and r.matches(method, path)
+                                              for r in rules)):
+                    continue
+                try:
                     await self.load(secret)
+                    continue
+                except SecretMissing:
+                    pass
+                detail = {"secret": secret, "host": host, "method": method, "path": path, "header": lname,
+                          "locked": True}
+                message = f"agentd egress: {secret} is locked in fnox"
+                if self.ask is None:
+                    raise Refused(message + " (and no approver is configured to unlock it)", detail)
+                approved, approval_id, status = await self.ask("unlock", secrets=[secret], host=host)
+                if approved:
+                    try:
+                        await self.load(secret)
+                        continue
+                    except SecretMissing:
+                        pass
+                e = Refused(message, detail)
+                e.approval_id, e.approval_status = approval_id, status
+                raise e
 
     async def inject_or_ask(self, host: str, method: str, path: str, headers: list[tuple[bytes, bytes]]):
         """inject(), and when refused, hold for an approval: (headers, used) or Refused (with .approval_id

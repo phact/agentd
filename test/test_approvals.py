@@ -27,6 +27,15 @@ class FakeEgress:
     def __init__(self, session, placeholders, config_files=()):
         self.session, self.placeholders, self.config_files = session, placeholders, list(config_files)
 
+    def loaded(self, name):
+        return True  # the proxy holds its values: nothing to unlock
+
+    def uncached(self, names):
+        return []
+
+    def fill(self, names, password):
+        return {}
+
 
 def test_requests_decisions_and_grants(tmp_path):
     async def main():
