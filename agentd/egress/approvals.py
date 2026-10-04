@@ -20,8 +20,9 @@ locked asks with an approval of kind ``unlock``.
 Decisions (``agentd serve``: ``POST /v1/approvals/{id}``, or :meth:`decide`):
 ``once`` (the held request, or if none is held, the next matching one),
 ``session`` (until the sandbox stops), ``always``
-(persisted: secret rules into the fnox config they came from, host
-allowances and browser logins into ``~/.agentd/egress/allow.toml``), or ``deny``.
+(persisted in ``~/.agentd/egress/allow.toml``: host allowances, secret rules
+and browser logins; not in the fnox config, whose contents are part of fnox's
+cache key, so editing it would re-lock every unlocked secret), or ``deny``.
 """
 from __future__ import annotations
 
@@ -37,7 +38,7 @@ from pathlib import Path
 from typing import TYPE_CHECKING, Any, Callable
 
 from agentd import fnox
-from agentd.egress.policy import Allow, Policy, SecretRule, add_rule_to_fnox
+from agentd.egress.policy import Allow, Policy, SecretRule
 from agentd.sandbox.base import DEFAULT_HOME
 
 if TYPE_CHECKING:
@@ -82,10 +83,10 @@ class Approvals:
         self._fillers: dict[str, Callable[[list[str], bytearray], dict[str, str]]] = {}  # approval id -> unlock
 
     # ------------------------------------------------------------------ #
-    # Persistent allowances (host grants that fnox can't hold)
+    # Persistent grants ("always")
     # ------------------------------------------------------------------ #
 
-    def _saved(self) -> dict[str, list[str]]:
+    def _saved(self) -> dict[str, list]:
         try:
             import tomllib
         except ModuleNotFoundError:
@@ -103,14 +104,27 @@ class Approvals:
         """Browser logins approved "always", as ``site@host``."""
         return self._saved().get("browser_logins", [])
 
-    def _save(self, key: str, value: str) -> None:
+    def saved_rules(self) -> list[SecretRule]:
+        """Secret rules approved "always" (``[[secret_rules]]``: secret, domain, header, methods, paths)."""
+        rules = []
+        for r in self._saved().get("secret_rules", []):
+            if isinstance(r, dict) and r.get("secret") and r.get("domain"):
+                rules.append(SecretRule(secret=r["secret"], domain=str(r["domain"]).lower(),
+                                        header=str(r.get("header", "authorization")).lower(),
+                                        methods=tuple(r.get("methods") or ()), paths=tuple(r.get("paths") or ())))
+        return rules
+
+    def _save(self, key: str, value: str | dict) -> None:
         saved = self._saved()
         if value in saved.get(key, []):
             return
         saved.setdefault(key, []).append(value)
+        lists = [f"{k} = [" + ", ".join(json.dumps(s) for s in v) + "]\n"
+                 for k, v in saved.items() if all(isinstance(s, str) for s in v)]
+        tables = [f"\n[[{k}]]\n" + "".join(f"{f} = {json.dumps(x)}\n" for f, x in t.items())
+                  for k, v in saved.items() if not all(isinstance(s, str) for s in v) for t in v]
         self.allow_file.parent.mkdir(parents=True, exist_ok=True)
-        self.allow_file.write_text("".join(f"{k} = [" + ", ".join(json.dumps(s) for s in v) + "]\n"
-                                           for k, v in saved.items()))
+        self.allow_file.write_text("".join(lists + tables))
 
     def _save_allow(self, spec: str) -> None:
         self._save("allow", spec)
@@ -123,6 +137,7 @@ class Approvals:
         """The proxy's hook for one session: ``await ask(kind, **details) -> (approved, approval id, status)``."""
         self._sessions[egress.session] = (egress, policy)
         policy.allows.extend(Allow.parse(s) for s in self.saved_allows())
+        policy.rules.extend(r for r in self.saved_rules() if r.secret in egress.placeholders)
 
         async def ask(kind: str, **details: Any) -> tuple[bool, str]:
             names = details.get("secrets") if kind == "unlock" else \
@@ -258,9 +273,9 @@ class Approvals:
             for egress, policy in targets:
                 if rule.secret in egress.placeholders:
                     (policy.once_rules if once else policy.rules).append(rule)
-                    if persist and egress.config_files:
-                        add_rule_to_fnox(egress.config_files[-1], rule)
-                        persist = False  # once
+            if persist:
+                self._save("secret_rules", {"secret": rule.secret, "domain": rule.domain, "header": rule.header,
+                                            "methods": list(rule.methods), "paths": list(rule.paths)})
 
     def _expire_old(self) -> None:
         now = time.time()

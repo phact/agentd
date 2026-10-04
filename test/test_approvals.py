@@ -56,7 +56,12 @@ def test_requests_decisions_and_grants(tmp_path):
         a.decide(r3.id, "always", by="peer-9")
         assert policy.rules[-1] == SecretRule("GH", "api.github.com", "authorization", ("POST",),
                                               ("/repos/me/app/pulls",))
-        assert pol.load_rules([fnox_cfg]) == [policy.rules[-1]], "always grants go into the fnox config"
+        assert fnox_cfg.read_text() == "", "the fnox config is never edited (its contents key fnox's cache)"
+        assert a.saved_rules() == [policy.rules[-1]] and a.saved_allows() == ["npmjs.org:443"]
+        fresh_policy = Policy()
+        Approvals(allow_file=tmp_path / "allow.toml").asker(FakeEgress("s2", {"GH": "ph", "X": "p"}), fresh_policy)
+        assert fresh_policy.rules == [policy.rules[-1]] and fresh_policy.connect("npmjs.org", "", 443) == "pass", \
+            "always grants apply to later sessions"
         assert a.items[r3.id].decided_by == "peer-9"
         with pytest.raises(ValueError):
             a.decide(r3.id, "maybe")

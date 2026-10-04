@@ -193,23 +193,6 @@ def opaque_placeholder() -> str:
     return "agentd_ph_" + "".join(_secrets.choice(alphabet) for _ in range(24))
 
 
-def add_rule_to_fnox(config: Path, rule: SecretRule) -> None:
-    """Append a rule to a fnox config ("always" grants live in fnox's config)."""
-    def q(s: str) -> str:
-        return '"' + s.replace("\\", "\\\\").replace('"', '\\"') + '"'
-
-    lines = ["", "[[proxy.rules]]", f"secret = {q(rule.secret)}", f"domain = {q(rule.domain)}",
-             f"header = {q(rule.header)}"]
-    if rule.methods:
-        lines.append("methods = [" + ", ".join(q(m) for m in rule.methods) + "]")
-    if rule.paths:
-        lines.append("paths = [" + ", ".join(q(p) for p in rule.paths) + "]")
-    if rule.placeholder:
-        lines.append(f"placeholder = {q(rule.placeholder)}")
-    with open(config, "a") as f:
-        f.write("\n".join(lines) + "\n")
-
-
 def rules_summary(rules: list[SecretRule]) -> list[dict[str, Any]]:
     return [{"secret": r.secret, "domain": r.domain, "header": r.header, "methods": list(r.methods) or ["*"],
              "paths": list(r.paths) or ["*"]} for r in rules]

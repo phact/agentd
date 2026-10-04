@@ -53,9 +53,6 @@ def test_fnox_rules_and_grants(tmp_path):
     rules = pol.load_rules([cfg])
     assert rules[0] == SecretRule("GH", "api.github.com", "authorization", ("GET",), ())
     assert rules[1].header == "authorization" and rules[1].methods == ()
-    pol.add_rule_to_fnox(cfg, SecretRule("GH", "api.github.com", methods=("POST",), paths=("/repos/me/app/pulls",)))
-    assert pol.load_rules([cfg])[-1] == SecretRule("GH", "api.github.com", "authorization", ("POST",),
-                                                    ("/repos/me/app/pulls",))
 
 
 def test_placeholders():
