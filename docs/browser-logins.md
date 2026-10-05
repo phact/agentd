@@ -1,7 +1,7 @@
 # Browser logins: profile clones per agent, gated long-lived sessions
 
-Status: agreed design (2026-10-04), not implemented. agentd is owned by its
-maintainer; this doc records the agreed shape and why.
+Status: implemented (2026-10-04); see "Implementation" at the end. agentd is
+owned by its maintainer; this doc records the agreed shape and why.
 
 ## Why
 
@@ -257,3 +257,54 @@ Rosey:
 - Google accounts: Device Bound Session Credentials tie a sign-in to keys held
   by that browser. Unverified whether a cloned profile keeps them working; test
   before relying on cloned Google sign-ins.
+
+## Implementation
+
+`agentd/devices/browser_profile.py` (base profile, clones, merge, journal,
+encrypted image), `agentd/devices/browser_proxy.py` (policy proxy) and
+`agentd/devices/browser.py`. Use: `Browser(profile=BaseProfile(key="AGENTD_BROWSER_KEY"), logins=..., gated=[...])`;
+without `profile`, a throwaway profile as before.
+
+Tools: `request_browser`, `request_login`, `request_site`, `browser_open`,
+`browser_snapshot`, `browser_click`, `browser_type`, `browser_screenshot`,
+`browser_fill_login` (replaces `browser_login`), `browser_tabs`,
+`browser_new_tab`, `browser_switch_tab`, `browser_close_tab`, `browser_close`.
+
+Found while building it, and how it's handled:
+
+- **WebSockets bypass request interception** (CDP `Fetch` never sees them; so
+  did the old allowlist). Gated sites' WebSockets are blocked with
+  `Network.setBlockedURLs`; the newer allow/block `urlPatterns` didn't block
+  WebSockets in Chrome 155. For everything else, including an allowlist's "all
+  but these hosts", Chrome is pointed at a local **policy proxy**
+  (`--proxy-server`, loopback included) that refuses `CONNECT` and absolute-URI
+  requests to hosts the allowlist or the gate refuses, one request per
+  connection. Interception stays in front (it raises approvals and gives clean
+  errors).
+- **A target held at start answers `Network.enable` only once released**, so
+  per-tab setup is sent first and awaited after `Runtime.runIfWaitingForDebugger`.
+- **Session cookies** (no expiry; many sites sign you in with them) are dropped
+  by Chrome at startup unless it restores the last session: clones run with
+  `--restore-last-session` and "continue where you left off"; they never carry
+  saved tabs, so nothing reopens.
+- A login approval grants its sites for the whole session, so a `once` spent by
+  the password fill doesn't close the gate before the form posts; the TOTP step
+  within 10 minutes of the password fill is part of the same login.
+- Cookie values use `--use-mock-keychain` (macOS) / `--password-store=basic`
+  (Linux); the encrypted image is the protection at rest.
+- Grants: `browser_site` once and session both last the browser session;
+  always is saved as `browser_sites` in `allow.toml`.
+- The attempt cap counts unjudged fills against the site; a fill is judged
+  after the next click (or Enter, or navigation): failed if the page is still on
+  the login's hosts showing a password step.
+
+Not done yet: merging `Local Storage`; verifying a logout worked (sensitive
+sites are cleared from the base regardless); gocryptfs on Linux is implemented
+but untested (macOS sparse bundle is tested).
+
+Tests: `test/test_browser_profile.py` (merge on Chrome's real schema, recovery,
+expiry, the encrypted image), `test/test_browser_proxy.py`, and live
+`test/test_browser.py` (gate incl. WebSockets, fill by structure, two-step and
+TOTP, refusals, attempt cap, banners, popups, tabs, sessions kept across
+sessions and sensitive ones cleared).
+

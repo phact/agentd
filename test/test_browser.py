@@ -1,10 +1,14 @@
 """
-The browser tools (agentd.devices.browser): TOTP, and with AGENTD_LIVE=1 a
-real headed Chrome against a local test site: snapshot, click, a login with
-two factors filled from fnox (the agent never sees them), the allowlist, and
-the session wiped on close.
+The browser tools (agentd.devices.browser). Without Chrome: TOTP, login and
+site approvals, the gate's logic, the attempt cap. With AGENTD_LIVE=1, a real
+headed Chrome against a local test site (localhost stands for a site with a
+signed-in session, 127.0.0.1 for any other): the gate (pages, WebSockets),
+filling logins by structure (the agent navigates and submits), two-step and
+TOTP steps, refusals, the attempt cap, banners and focus theft, popups, tabs,
+and a persistent base profile across sessions.
 """
 import asyncio
+import json
 import os
 import shutil
 import time
@@ -14,40 +18,29 @@ import pytest
 
 from agentd import secrets
 from agentd.devices import browser as br
+from agentd.egress.approvals import Approvals
 
 SEED = "JBSWY3DPEHPK3PXP"
+LIVE = pytest.mark.skipif(not os.environ.get("AGENTD_LIVE") or br.find_chrome() is None or shutil.which("fnox") is None,
+                          reason="set AGENTD_LIVE=1 (needs Chrome and fnox; opens a browser window)")
 
 
-@pytest.mark.skipif(not os.environ.get("AGENTD_LIVE") or br.find_chrome() is None or shutil.which("fnox") is None,
-                    reason="set AGENTD_LIVE=1 (needs Chrome and fnox; opens a browser window)")
-def test_live_login_survives_banners_and_focus_theft(tmp_path):
+def _fnox(tmp_path):
     (tmp_path / "fnox.toml").write_text(
         '[providers.plain]\ntype = "plain"\n[secrets]\n'
         'SITE_USER = { provider = "plain", value = "alice@example.com" }\n'
-        'SITE_PASS = { provider = "plain", value = "s3cret-pass-1234" }\n')
+        'SITE_PASS = { provider = "plain", value = "s3cret-pass-1234" }\n'
+        f'SITE_TOTP = {{ provider = "plain", value = "{SEED}" }}\n')
     secrets.forget()
 
-    async def main():
-        state = {}
-        runner, port = await _site(state)
-        base = f"http://127.0.0.1:{port}"
-        b = br.Browser(workspace=tmp_path, allowed=True, fnox_cwd=tmp_path, logins_allowed=True,
-                       logins={"hostile": {"url": f"{base}/login-hostile", "username": "SITE_USER",
-                                           "password": "SITE_PASS"},
-                               "short": {"url": f"{base}/login-short", "password": "SITE_PASS"}})
-        try:
-            await b.login("hostile")
-            assert state.get("consent") == 1, "the consent banner was accepted"
-            assert state["login"] == ("alice@example.com", "s3cret-pass-1234"), \
-                "the prefilled username was replaced and no keystroke went to the chat widget"
-            del state["login"]
-            with pytest.raises(br.BrowserAccessError, match="took focus"):
-                await b.login("short")  # the box can't take the whole password
-            assert "login" not in state, "not submitted"
-        finally:
-            await b.close()
-            await runner.cleanup()
-    asyncio.run(main())
+
+def _login(port, path="/login", **more):
+    return {"url": f"http://localhost:{port}{path}", "hosts": ["localhost"], "username": "SITE_USER",
+            "password": "SITE_PASS", "totp": "SITE_TOTP", **more}
+
+
+def _ref(page, text):
+    return next(e["ref"] for e in page["elements"] if e.get("text") == text)
 
 
 def test_totp_matches_rfc6238():
@@ -141,6 +134,47 @@ async def _site(state):
         state["clicks"] = state.get("clicks", 0) + 1
         raise web.HTTPFound("/home")
 
+    async def signup(request):
+        return web.Response(content_type="text/html", text=page.format(t="Sign up", b=(
+            "<form method='post' action='/login'><input name='user' type='email'>"
+            "<input name='pw' type='password'><input name='pw2' type='password'><button>Create</button></form>")))
+
+    async def step1(request):
+        return web.Response(content_type="text/html", text=page.format(t="Sign in", b=(
+            "<form method='post' action='/step1'><input name='user' type='email' autocomplete='username'>"
+            "<button>Next</button></form>")))
+
+    async def step1_post(request):
+        state["step_user"] = (await request.post()).get("user")
+        raise web.HTTPFound("/step2")
+
+    async def step2(request):
+        return web.Response(content_type="text/html", text=page.format(t="Password", b=(
+            "<form method='post' action='/step2'><input name='pw' type='password'><button>Sign in</button></form>")))
+
+    async def step2_post(request):
+        state["step_pw"] = (await request.post()).get("pw")
+        raise web.HTTPFound("/home")
+
+    async def whoami(request):
+        return web.Response(content_type="text/html", text=page.format(
+            t="Who", b=f"session={request.cookies.get('session', 'none')}"))
+
+    async def ws_page(request):
+        target = request.query["to"]
+        return web.Response(content_type="text/html", text=page.format(t="WS", b=(
+            f"<script>const w = new WebSocket('ws://{target}/ws'); w.onopen = () => fetch('/wsok');</script>")))
+
+    async def ws(request):
+        w = web.WebSocketResponse()
+        await w.prepare(request)
+        state["ws"] = state.get("ws", 0) + 1
+        await asyncio.sleep(1)
+        return w
+
+    async def wsok(request):
+        return web.Response(text="ok")
+
     app = web.Application()
     app.router.add_get("/login", login_form)
     app.router.add_get("/old-login", old_login)
@@ -155,6 +189,15 @@ async def _site(state):
     app.router.add_post("/2fa", twofa)
     app.router.add_get("/home", home)
     app.router.add_post("/click", click)
+    app.router.add_get("/signup", signup)
+    app.router.add_get("/step1", step1)
+    app.router.add_post("/step1", step1_post)
+    app.router.add_get("/step2", step2)
+    app.router.add_post("/step2", step2_post)
+    app.router.add_get("/whoami", whoami)
+    app.router.add_get("/ws-page", ws_page)
+    app.router.add_get("/ws", ws)
+    app.router.add_get("/wsok", wsok)
     runner = web.AppRunner(app)
     await runner.setup()
     site = web.TCPSite(runner, "127.0.0.1", 0)
@@ -162,84 +205,240 @@ async def _site(state):
     return runner, site._server.sockets[0].getsockname()[1]
 
 
-@pytest.mark.skipif(not os.environ.get("AGENTD_LIVE") or br.find_chrome() is None or shutil.which("fnox") is None,
-                    reason="set AGENTD_LIVE=1 (needs Chrome and fnox; opens a browser window)")
-def test_live_browser_login_click_and_wipe(tmp_path, monkeypatch):
-    (tmp_path / "fnox.toml").write_text(
-        '[providers.plain]\ntype = "plain"\n[secrets]\n'
-        'SITE_USER = { provider = "plain", value = "alice@example.com" }\n'
-        'SITE_PASS = { provider = "plain", value = "s3cret-pass-1234" }\n'
-        f'SITE_TOTP = {{ provider = "plain", value = "{SEED}" }}\n')
-    secrets.forget()
+@LIVE
+def test_live_login_flow_gate_tabs_and_popups(tmp_path):
+    _fnox(tmp_path)
 
     async def main():
         state = {}
         runner, port = await _site(state)
-        from agentd.egress.approvals import Approvals
-
-        approvals = Approvals(allow_file=tmp_path / "allow.toml")
-        b = br.Browser(workspace=tmp_path, allowed=True, allow=["127.0.0.1"], fnox_cwd=tmp_path, approvals=approvals,
-                       logins={"local": {"url": f"http://127.0.0.1:{port}/old-login", "username": "SITE_USER",
-                                         "password": "SITE_PASS", "totp": "SITE_TOTP"},
-                               "empty": {"url": f"http://127.0.0.1:{port}/nothing", "password": "SITE_PASS"},
-                               "elsewhere": {"hosts": ["example.org"], "password": "SITE_PASS"}})
+        approvals = Approvals(allow_file=tmp_path / "allow.toml", hold=0.2)
+        b = br.Browser(workspace=tmp_path, allowed=True, fnox_cwd=tmp_path, approvals=approvals,
+                       logins={"local": _login(port)})
         outputs = []
         try:
-            page = await b.open(f"http://127.0.0.1:{port}/login")
-            outputs.append(page)
-            assert page["title"] == "Sign in" and any(e.get("password") for e in page["elements"])
+            # localhost holds a signed-in session: closed until this session gets a grant.
+            page = await b.open(f"http://localhost:{port}/login")
+            assert "request_site('localhost'" in page["error"] and "request_login" in page["error"], page
+            ok = await b.open(f"http://127.0.0.1:{port}/home")
+            assert ok["title"] == "Home", "other sites are open"
             with pytest.raises(br.BrowserAccessError, match="request_login"):
-                await b.login("local")  # the lease alone gives no credentials
-            approvals.decide(b.request_login("elsewhere", "x")["id"], "session")
-            with pytest.raises(br.BrowserAccessError, match="login hosts"):
-                await b.login("elsewhere")  # approved, but this page isn't on its hosts
-            assert "login" not in state, "nothing was typed"
-            # A login page with no form fails, and doesn't spend the 'once'.
-            monkeypatch.setattr(br, "LOGIN_FORM_WAIT", 1.0)
-            approvals.decide(b.request_login("empty", "x")["id"], "once")
-            await b.open(f"http://127.0.0.1:{port}/home")  # on the site, but not on a login form
-            with pytest.raises(LookupError, match="no password field"):
-                await b.login("empty")
-            with pytest.raises(LookupError):
-                await b.login("empty")  # still approved
-            monkeypatch.setattr(br, "LOGIN_FORM_WAIT", 10.0)
-            # The saved URL redirects, and the form appears 1.5 s after the page loads.
-            approvals.decide(b.request_login("local", "sign in to check the clicks")["id"], "once")
-            page = await b.login("local")
+                await b.fill_login("local")
+            approvals.decide(b.request_login("local", "check the clicks")["id"], "once")
+            page = await b.open(f"http://localhost:{port}/login")  # the login approval opens its site
             outputs.append(page)
-            assert state["login"] == ("alice@example.com", "s3cret-pass-1234"), "credentials filled from fnox"
-            assert page["title"] == "Home" and "Welcome alice" in page["text"], page
+            assert page["title"] == "Sign in"
+
+            r = await b.fill_login("local")
+            outputs.append(r)
+            assert r["filled"] == ["username", "password"] and "login" not in state, "filled, not submitted"
+            page = await b.click(_ref(r, "Sign in"))
+            outputs.append(page)
+            assert state["login"] == ("alice@example.com", "s3cret-pass-1234") and page["title"] == "Code"
+            r = await b.fill_login("local")  # the TOTP step, right after the password
+            outputs.append(r)
+            assert r["filled"] == ["totp"]
+            page = await b.click(_ref(r, "Verify"))
+            outputs.append(page)
+            assert page["title"] == "Home" and state["code"] in (br.totp(SEED), br.totp(SEED, at=time.time() - 30))
+            assert state["code"] in secrets.known_values(), "the typed code is scrubbed from what the agent sees"
+            flat = json.dumps(outputs)
+            assert "s3cret-pass-1234" not in flat and SEED not in flat and "alice@example.com" not in flat
+            await b.open(f"http://localhost:{port}/login")
             with pytest.raises(br.BrowserAccessError, match="request_login"):
-                await b.login("local")  # "once" is spent
-            button = next(e["ref"] for e in page["elements"] if e.get("text") == "Click me")
-            page = await b.click(button)
-            outputs.append(page)
-            assert state["clicks"] == 1 and "clicks: 1" in page["text"]
-            assert br.totp(SEED) in secrets.known_values() or br.totp(SEED, at=time.time() - 30) in \
-                secrets.known_values(), "the typed TOTP code is scrubbed from what the agent sees"
-            # A link that opens a new tab is policed like the page: the allowlist holds.
-            page = await b.open(f"http://127.0.0.1:{port}/popup")
-            await b.click(next(e["ref"] for e in page["elements"] if e.get("text") == "Open elsewhere"))
+                await b.fill_login("local")  # "once" is spent
+
+            # Tabs.
+            await b.new_tab(f"http://127.0.0.1:{port}/popup")
+            tabs = await b.tabs()
+            assert len(tabs) == 2 and [t["title"] for t in tabs if t["current"]] == ["Links"]
+            # A link that opens yet another tab is policed like the page (here: a host off the allowlist).
+            b.allow = ["127.0.0.1", "localhost"]
+            await b.click(_ref(await b.snapshot(), "Open elsewhere"))
             await asyncio.sleep(2)
-            tabs = (await b._pipe.send("Target.getTargets"))["targetInfos"]
-            popup = next(t for t in tabs if t["type"] == "page" and "example.org" in t["url"])
+            infos = (await b._pipe.send("Target.getTargets"))["targetInfos"]
+            popup = next(t for t in infos if t["type"] == "page" and "example.org" in t["url"])
             sid = (await b._pipe.send("Target.attachToTarget", {"targetId": popup["targetId"], "flatten": True}))["sessionId"]
             frame = (await b._pipe.send("Page.getFrameTree", {}, sid))["frameTree"]["frame"]
             assert frame.get("unreachableUrl") == "https://example.org/", frame
-            shot = await b.screenshot()
-            assert Path(shot["path"]).stat().st_size > 1000
-            blocked = await b.open("https://example.com/")
-            outputs.append(blocked)
-            assert "BLOCKED" in (blocked.get("error") or "") or blocked.get("url", "").startswith("chrome-error"), blocked
+            assert len(await b.tabs()) == 3, "the popup is a tab too"
+            first = next(t["id"] for t in await b.tabs() if t["title"] == "Sign in")
+            page = await b.switch_tab(first)
+            assert page["title"] == "Sign in"
+            await b.close_tab(next(t["id"] for t in await b.tabs() if t["title"] == "Links"))
+            assert [t["title"] for t in await b.tabs() if t["current"]] == ["Sign in"] and len(await b.tabs()) == 2
             profile = b._profile
             await b.close()
-            assert profile is not None and not profile.exists(), "the session (cookies) is wiped"
-            flat = repr(outputs)
-            assert "s3cret-pass-1234" not in flat and SEED not in flat, "the agent never sees the credentials"
+            assert profile is not None and not profile.exists(), "a throwaway profile is deleted"
         finally:
             await b.close()
             await runner.cleanup()
+    asyncio.run(main())
 
+
+@LIVE
+def test_live_fill_picks_fields_by_structure(tmp_path):
+    _fnox(tmp_path)
+
+    async def main():
+        state = {}
+        runner, port = await _site(state)
+        b = br.Browser(workspace=tmp_path, allowed=True, fnox_cwd=tmp_path, logins_allowed=True,
+                       logins={"local": _login(port), "short": _login(port, "/login-short")})
+        try:
+            await b.open(f"http://localhost:{port}/signup")
+            with pytest.raises(br.BrowserAccessError, match="several password boxes"):
+                await b.fill_login("local")  # a sign-up form: refused
+            await b.open(f"http://localhost:{port}/2fa")
+            with pytest.raises(br.BrowserAccessError, match="no password was filled"):
+                await b.fill_login("local")  # a lone code box with no login step before it
+            await b.open(f"http://127.0.0.1:{port}/login")
+            with pytest.raises(br.BrowserAccessError, match="login hosts"):
+                await b.fill_login("local")  # same form, another site: credentials aren't typed there
+            # Two steps: the username alone (explicitly marked), then the password alone.
+            await b.open(f"http://localhost:{port}/step1")
+            r = await b.fill_login("local")
+            assert r["filled"] == ["username"]
+            page = await b.click(_ref(r, "Next"))
+            assert state["step_user"] == "alice@example.com" and page["title"] == "Password"
+            r = await b.fill_login("local")
+            assert r["filled"] == ["password"]
+            await b.click(_ref(r, "Sign in"))
+            assert state["step_pw"] == "s3cret-pass-1234"
+            # A box that can't take the whole password: the fill fails before anything is submitted.
+            await b.open(f"http://localhost:{port}/login-short")
+            with pytest.raises(br.BrowserAccessError, match="took focus"):
+                await b.fill_login("short")
+        finally:
+            await b.close()
+            await runner.cleanup()
+    asyncio.run(main())
+
+
+@LIVE
+def test_live_banners_focus_theft_and_late_forms(tmp_path):
+    _fnox(tmp_path)
+
+    async def main():
+        state = {}
+        runner, port = await _site(state)
+        b = br.Browser(workspace=tmp_path, allowed=True, fnox_cwd=tmp_path, logins_allowed=True,
+                       logins={"local": _login(port)})
+        try:
+            await b.open(f"http://localhost:{port}/login-hostile")
+            r = await b.fill_login("local")
+            await b.click(_ref(r, "Sign in"))
+            assert state.get("consent") == 1, "the consent banner was accepted"
+            assert state["login"] == ("alice@example.com", "s3cret-pass-1234"), \
+                "the prefilled username was replaced and no keystroke went to the chat widget"
+            await b.open(f"http://localhost:{port}/old-login")  # redirects; the form appears 1.5 s later
+            r = await b.fill_login("local")
+            assert r["filled"] == ["username", "password"]
+        finally:
+            await b.close()
+            await runner.cleanup()
+    asyncio.run(main())
+
+
+@LIVE
+def test_live_gate_blocks_websockets(tmp_path):
+    async def main():
+        state = {}
+        runner, port = await _site(state)
+        approvals = Approvals(allow_file=tmp_path / "allow.toml", hold=0.2)
+        b = br.Browser(workspace=tmp_path, allowed=True, approvals=approvals, gated=["localhost"])
+        try:
+            await b.open(f"http://127.0.0.1:{port}/ws-page?to=localhost:{port}")
+            await asyncio.sleep(1.5)
+            assert state.get("ws", 0) == 0, "a page elsewhere can't reach the gated site, WebSockets included"
+            await b.open(f"http://127.0.0.1:{port}/ws-page?to=127.0.0.1:{port}")
+            await asyncio.sleep(1.5)
+            assert state.get("ws") == 1, "other WebSockets work"
+            r = b.request_site("localhost", "read my dashboard")
+            approvals.decide(r["id"], "session")
+            await b.open(f"http://127.0.0.1:{port}/ws-page?to=localhost:{port}")
+            await asyncio.sleep(1.5)
+            assert state["ws"] == 2, "granted for the session"
+        finally:
+            await b.close()
+            await runner.cleanup()
+    asyncio.run(main())
+
+
+@LIVE
+def test_live_attempt_cap(tmp_path, monkeypatch):
+    _fnox(tmp_path)
+    (tmp_path / "fnox.toml").write_text((tmp_path / "fnox.toml").read_text().replace("s3cret-pass-1234", "wrong"))
+    secrets.forget()
+    monkeypatch.setattr(br, "LOGIN_FORM_WAIT", 2.0)
+
+    async def main():
+        state = {}
+        runner, port = await _site(state)
+        approvals = Approvals(allow_file=tmp_path / "allow.toml", hold=0.2)
+        b = br.Browser(workspace=tmp_path, allowed=True, fnox_cwd=tmp_path, logins_allowed=True, approvals=approvals,
+                       logins={"local": _login(port, totp=None)})
+        try:
+            for _ in range(2):  # wrong password: back on a page with a password box
+                await b.open(f"http://localhost:{port}/login")
+                r = await b.fill_login("local")
+                await b.click(_ref(r, "Sign in"))
+                await b.open(f"http://localhost:{port}/login")
+            with pytest.raises(br.BrowserAccessError, match="approves a retry") as e:
+                await b.fill_login("local")
+            retry = next(a for a in approvals.items.values() if a.kind == "browser_login_retry")
+            assert len(retry.details["attempts"]) == 2 and str(retry.id) in str(e.value)
+            other = br.Browser(workspace=tmp_path, allowed=True, fnox_cwd=tmp_path, logins_allowed=True,
+                               approvals=approvals, logins={"local": _login(port, totp=None)})
+            with pytest.raises(br.BrowserAccessError, match="approves a retry"):
+                other._check_attempts("local")  # counted across agents
+            approvals.decide(retry.id, "once")
+            r = await b.fill_login("local")
+            assert r["filled"] == ["username", "password"]
+        finally:
+            await b.close()
+            await runner.cleanup()
+    asyncio.run(main())
+
+
+@LIVE
+def test_live_base_profile_keeps_sessions(tmp_path):
+    from agentd.devices.browser_profile import BaseProfile
+
+    _fnox(tmp_path)
+
+    async def main():
+        state = {}
+        runner, port = await _site(state)
+        profile = BaseProfile(root=tmp_path / "browser")
+        logins = {"local": _login(port)}
+        try:
+            for _ in range(2):  # sign in once; the next session is still signed in
+                b = br.Browser(workspace=tmp_path, allowed=True, fnox_cwd=tmp_path, logins_allowed=True,
+                               profile=profile, logins=logins)
+                page = await b.open(f"http://localhost:{port}/whoami")
+                if "session=abc" not in page["text"]:
+                    await b.open(f"http://localhost:{port}/login")
+                    await b.click(_ref(await b.fill_login("local"), "Sign in"))
+                    await b.click(_ref(await b.fill_login("local"), "Verify"))
+                    assert "session=abc" in (await b.open(f"http://localhost:{port}/whoami"))["text"]
+                    first_clone = b._profile
+                else:
+                    state["kept"] = True
+                await b.close()
+            assert state.get("kept") and not first_clone.exists(), "kept in the base; the clone is gone"
+            # A sensitive login is signed out (its data cleared) when the session ends.
+            logins["local"]["tier"] = "sensitive"
+            b = br.Browser(workspace=tmp_path, allowed=True, fnox_cwd=tmp_path, logins_allowed=True,
+                           profile=profile, logins=logins)
+            assert "session=abc" in (await b.open(f"http://localhost:{port}/whoami"))["text"]
+            await b.close()
+            b = br.Browser(workspace=tmp_path, allowed=True, fnox_cwd=tmp_path, logins_allowed=True,
+                           profile=profile, logins=logins)
+            assert "session=none" in (await b.open(f"http://localhost:{port}/whoami"))["text"]
+            await b.close()
+        finally:
+            await runner.cleanup()
     asyncio.run(main())
 
 
@@ -350,3 +549,48 @@ def test_lease_needs_approval(tmp_path):
         await b._check()
         assert 290 < b.lease_until - time.time() <= 300
     asyncio.run(main())
+
+
+def test_gate_logic(tmp_path, unlocked):
+    approvals = Approvals(allow_file=tmp_path / "allow.toml")
+    b = br.Browser(chrome="/bin/true", approvals=approvals, gated=["examplemail.com"],
+                   logins={"bank": {"url": "https://www.examplebank.com/login", "password": "P"},
+                           "sso": {"url": "https://app.example.com/", "hosts": ["app.example.com", "login.example-idp.com"],
+                                   "password": "Q"}})
+    assert b._gated_sites() == {"examplebank.com", "examplemail.com", "example.com", "example-idp.com"}
+    assert not b._proxy_allows("api.examplebank.com"), "the whole registrable domain, not just the login's hosts"
+    assert b._proxy_allows("news.example.org")
+    assert "wss://*.examplebank.com/*" in b._blocked_urls()
+    approvals.decide(b.request_site("www.examplebank.com", "pay a bill")["id"], "session")
+    assert b._proxy_allows("api.examplebank.com") and "wss://*.examplebank.com/*" not in b._blocked_urls()
+    approvals.decide(b.request_login("sso", "x")["id"], "once")
+    assert b._proxy_allows("login.example-idp.com"), "a login approval opens its sites, identity provider included"
+    approvals.decide(b.request_site("examplemail.com", "y")["id"], "always")
+    fresh = br.Browser(chrome="/bin/true", approvals=Approvals(allow_file=tmp_path / "allow.toml"),
+                       gated=["examplemail.com"])
+    assert fresh._proxy_allows("examplemail.com") and not br.Browser(chrome="/bin/true", gated=["examplemail.com"],
+                                                                  )._proxy_allows("x.examplemail.com")
+
+
+def test_attempt_cap_bookkeeping(tmp_path):
+    approvals = Approvals(allow_file=tmp_path / "allow.toml")
+    b = br.Browser(chrome="/bin/true", approvals=approvals, logins={"bank": {"url": "https://bank.example/",
+                                                                             "password": "P"}})
+    b._check_attempts("bank")
+    with b._attempts() as data:
+        data["bank"] = [{"id": "a", "at": time.time(), "failed": True},
+                        {"id": "b", "at": time.time(), "failed": None},      # unjudged counts against it
+                        {"id": "c", "at": time.time(), "failed": False},     # a success doesn't
+                        {"id": "d", "at": time.time() - 90000, "failed": True}]  # older than 24 h
+    with pytest.raises(br.BrowserAccessError, match="approves a retry"):
+        b._check_attempts("bank")
+    with pytest.raises(br.BrowserAccessError):
+        b._check_attempts("bank")
+    assert len([a for a in approvals.items.values() if a.kind == "browser_login_retry"]) == 1, "asked once"
+    approvals.decide(next(iter(approvals.items)), "once")
+    b._check_attempts("bank")
+    b._check_attempts("bank")
+    with b._fill_lock("bank"):
+        with pytest.raises(br.BrowserAccessError, match="another agent"):
+            with b._fill_lock("bank"):
+                pass

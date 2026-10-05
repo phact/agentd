@@ -19,7 +19,7 @@ def _test_state_root():
 @pytest.fixture(autouse=True)
 def _keep_test_state_out_of_real_dirs(monkeypatch, _test_state_root):
     """Tests never write to the real ~/.claude/projects, ~/.codex/sessions, ~/.omp,
-    ~/.agentd/transcripts or ~/.agentd/responses."""
+    ~/.agentd/transcripts, ~/.agentd/responses or ~/.agentd/browser."""
     from agentd.harness import responses, transcripts
 
     root = _test_state_root
@@ -33,3 +33,8 @@ def _keep_test_state_out_of_real_dirs(monkeypatch, _test_state_root):
 
     monkeypatch.setattr(chat, "SESSIONS_DIR", root / "harness-sessions")
     monkeypatch.setattr(responses, "RESPONSES_DIR", root / "responses")
+    from agentd.devices import browser, browser_profile
+
+    per_test = Path(tempfile.mkdtemp(prefix="browser-", dir=root))  # attempts and locks don't leak between tests
+    monkeypatch.setattr(browser_profile, "ROOT", per_test)
+    monkeypatch.setattr(browser, "ROOT", per_test)

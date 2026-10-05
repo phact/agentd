@@ -53,7 +53,7 @@ DECISIONS = ("once", "session", "always", "deny")
 @dataclass
 class Approval:
     id: str
-    kind: str                         # connect | secret | unlock | browser | browser_login | device
+    kind: str  # connect | secret | unlock | device | browser | browser_login | browser_site | browser_host | browser_login_retry
     session: str
     details: dict[str, Any]
     reason: str = ""
@@ -103,6 +103,10 @@ class Approvals:
     def saved_logins(self) -> list[str]:
         """Browser logins approved "always", as ``site@host``."""
         return self._saved().get("browser_logins", [])
+
+    def saved_sites(self) -> list[str]:
+        """Sites whose signed-in session the browser may use without asking ("always")."""
+        return self._saved().get("browser_sites", [])
 
     def saved_rules(self) -> list[SecretRule]:
         """Secret rules approved "always" (``[[secret_rules]]``: secret, domain, header, methods, paths)."""
@@ -259,6 +263,10 @@ class Approvals:
         if approval.kind == "browser_login":
             if persist:
                 self._save("browser_logins", f"{d['site']}@{d['host']}")
+            return
+        if approval.kind == "browser_site":
+            if persist:
+                self._save("browser_sites", d["site"])
             return
         if approval.kind == "connect":
             spec = f"{d.get('host') or d.get('ip')}:{d['port']}"
