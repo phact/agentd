@@ -1,6 +1,8 @@
 # Connectors: MCP tools for the user's services, OAuth through approvals
 
-Status: agreed design (2026-10-06), not implemented. agentd is owned by its
+Status: the native Google Calendar connector over p2claw Connect is
+implemented (2026-10-07; see "Implementation" at the end); MCP-server
+transports, `OwnClient` and `McpAuth` are not yet. agentd is owned by its
 maintainer; this doc records the agreed shape and why.
 
 ## Why
@@ -133,8 +135,7 @@ passthrough).
   schema are recorded when the connector is approved; a tool that appears or
   changes later (`tools/list_changed`) needs a new approval before the agent
   can use it.
-- **Reads:** covered by the connector's grant for the session (one
-  `connector_use` approval per session, or always).
+- **Reads:** free once connected (the consent covers them).
 - **Writes:** an approval per call that **shows the arguments** as labelled
   fields, verbatim (title, start, end, calendar), not prose built from them:
   the agent writes the arguments, and a title can be written to mislead the
@@ -171,11 +172,10 @@ chosen), so p2claw Connect needs no Google verification:
 
 | Tool | Kind |
 |---|---|
-| `calendar_ensure` (create the agent's calendar if missing) | write (once) |
 | `events_list(time_min, time_max)`, `event_get(id)` | read (own calendar) |
 | `freebusy(calendars, time_min, time_max)` | read (availability only) |
 | `suggest_time(duration, window, calendars)` | read |
-| `event_create(...)`, `event_update(id, ...)` | write |
+| `event_create(...)` (creates the agent's calendar on first use), `event_update(id, ...)` | write |
 | `event_delete(id)` | destructive |
 
 Later, behind verification of the Connect app (or with the user's own client):
@@ -209,8 +209,62 @@ p2claw: the Connect broker and callback relay (`p2claw/docs/connect.md`).
 Rosey: the phone's Connect button and argument-showing approval cards, a
 Connectors list in settings, the prompt.
 
-## Open questions
+## Decided (2026-10-07)
 
-- Which calendars `freebusy` covers by default: `primary` only, or a configured
-  list (the human's partner's email, a family calendar).
-- Read grants: a per-session approval, or free once connected.
+- `freebusy` and `suggest_time` check `primary` by default, plus whatever the
+  owner configures (`freebusy_calendars`); the agent can name others per call.
+- Reads are free once connected; there's no `connector_use` approval.
+- No separate `calendar_ensure` tool: as a write it would need an approval per
+  call even once the calendar exists; `event_create` creates it under its own
+  approval.
+
+## Implementation
+
+`agentd/connectors/__init__.py` (`Connector`, `Connectors`, `Native`,
+`P2clawConnect`, `enable_connector_skills`) and
+`agentd/connectors/google_calendar.py`.
+
+```python
+from agentd.connectors import Connector, Connectors, Native, P2clawConnect, enable_connector_skills
+
+calendar = Connector(name="calendar", description="manage its own calendar, see when you're busy",
+                     transport=Native("agentd.connectors.google_calendar"), auth=P2clawConnect("google"),
+                     scopes=["calendar.app.created", "calendar.events.freebusy"],
+                     options={"calendar_name": "Rosey", "freebusy_calendars": ["primary"]})
+enable_connector_skills(Connectors([calendar], approvals=approvals))
+```
+
+- Skills: `request_connector(name, reason)`, `connectors_status()`, and each
+  tool as `<connector>_<tool>` (`calendar_event_create`, …), for every harness
+  through the bridge.
+- `P2clawConnect` uses `p2claw-agent-client` (imported only when used, as
+  `agentd.remote` does): `oauth_grants_connect(store=True)` makes the PKCE
+  verifier and nonce and checks the callback's nonce; agentd keeps the grant
+  id in `~/.agentd/connectors/grants.json` and asks the p2claw agent for an
+  access token (cached in memory until a minute before it expires).
+- Consent: an approval of kind `connector` with `authorize_url`; agentd waits
+  for the callback in the background (up to 10 minutes) and decides the
+  approval itself (`always`, by `consent`) once the grant is stored. Tapping
+  approve without consenting changes nothing; asking again returns the same
+  link while the flow runs.
+- Writes: approvals of kind `connector_write` (`connector_destructive` for
+  deletes) with `arguments: [{name, value}]` verbatim. When the hold runs out,
+  the tool answers `pending` with the approval id, and calling again with the
+  same arguments uses that approval. `once` is spent by one call; `session`
+  covers the tool until agentd restarts; `always` is saved in
+  `~/.agentd/connectors/allowed.json` (never for destructive tools).
+- Read results carry `untrusted` (a note to treat them as data). Every call is
+  appended to `~/.agentd/connectors/audit.jsonl` (connector, tool, kind,
+  arguments truncated, decision); never tokens.
+- `410 invalid_grant` from the p2claw agent forgets the grant and tells the
+  agent to `request_connector` again. `Connectors.disconnect(name)` revokes
+  and forgets (an owner action, not a skill).
+- Tests: `test/test_connectors.py` (a fake Calendar API and a stand-in for
+  Connect; the real `p2claw-agent-client` against a fake agent socket, from a
+  p2claw checkout; and, with `AGENTD_CONNECT_LIVE=1` and `-s`, real Google
+  through the running p2claw agent: open the printed link to consent).
+
+Not yet: `Http` and `Stdio` (sandboxed) MCP-server transports, tool pinning
+(nothing to pin for native tools), `OwnClient` and `McpAuth` with the encrypted
+token store, step-up to more scopes, and wiring connectors into `agentd serve`'s
+config.

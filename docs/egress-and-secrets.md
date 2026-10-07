@@ -37,6 +37,8 @@ Setup: `agentd/sandbox/build.sh` builds `agentd-net` (needs cargo); `agentd-sand
 - `agentd.devices.android`: `Android(serial=..., apps={...})` + `enable_android_skills(...)`: screenshot (into the workspace), UI elements, tap, tap-by-text, type, keys, swipe, open app (allowlist), list apps; over adb.
 - `agentd.devices.browser`: `Browser(logins={...}, profile=BaseProfile(...))` + `enable_browser_skills(...)`: a real headed Chrome driven over the DevTools Protocol through a pipe with no automation tells, each lease on a clone of a long-lived base profile (encrypted at rest, merged back on close) or a throwaway one. Sites with a signed-in session are gated per session (`request_site`), tabs, popups, workers and WebSockets included, with a local policy proxy under everything; the agent navigates to a login form and `browser_fill_login(site)` fills it from fnox (fields picked by structure, only on the login's hosts, never submitted by agentd), at most two failed fills per site per 24 h; sensitive logins are signed out when the session ends. Design: [browser-logins.md](browser-logins.md). `request_browser`, `request_login`, `request_site` and `request_access` wait up to the hold (default 25 s) for the human's answer before returning.
 
+**Connectors** (the user's own services, e.g. Google Calendar) run on the host too: OAuth through approvals (p2claw Connect by default; the grant stays with the p2claw agent), reads free once connected, every write approved per call with its arguments shown verbatim. [connectors.md](connectors.md).
+
 ## Summary
 
 Agents need to call real services (GitHub, package registries, SaaS APIs),
