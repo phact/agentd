@@ -67,6 +67,11 @@ def protected_host_paths() -> list[Path]:
              Path(os.environ.get("CODEX_HOME", home / ".codex")) / "auth.json",
              home / ".claude" / ".credentials.json",
              data / "p2claw", Path(f"/tmp/p2claw-{os.getuid()}")]
+    # p2claw's local API socket where Linux puts it (and wherever P2CLAW_AGENT_RUNTIME_DIR says).
+    for runtime in (os.environ.get("P2CLAW_AGENT_RUNTIME_DIR"),
+                    os.environ.get("XDG_RUNTIME_DIR") and os.path.join(os.environ["XDG_RUNTIME_DIR"], "p2claw")):
+        if runtime:
+            paths.append(Path(runtime))
     paths += [Path(p) for p in os.environ.get("AGENTD_PROTECTED_PATHS", "").split(os.pathsep) if p.strip()]
     return [p.expanduser().resolve() for p in paths]
 

@@ -573,6 +573,12 @@ def test_shares_never_expose_host_secrets(tmp_path, monkeypatch):
     secret_dir = tmp_path / "vault"
     secret_dir.mkdir()
     shares(tmp_path / "data")  # fine
+    monkeypatch.setenv("XDG_RUNTIME_DIR", str(tmp_path / "run"))
+    monkeypatch.setenv("P2CLAW_AGENT_RUNTIME_DIR", str(tmp_path / "p2"))
+    assert {(tmp_path / "run" / "p2claw").resolve(), (tmp_path / "p2").resolve()} <= set(protected_host_paths()), \
+        "p2claw's socket where Linux (or its override) puts it"
+    monkeypatch.delenv("XDG_RUNTIME_DIR")
+    monkeypatch.delenv("P2CLAW_AGENT_RUNTIME_DIR")
     monkeypatch.setenv("AGENTD_PROTECTED_PATHS", f"{secret_dir}{os.pathsep}/nonexistent/x")
     with pytest.raises(ValueError, match="vault"):
         shares(tmp_path)  # contains a path the owner protected
