@@ -18,33 +18,56 @@ Agents need the user's own services (calendar first). Options weighed:
 
 Either way **agentd does the OAuth dance** and the human consents through the
 approvals flow (on the phone, for Rosey). Where the provider needs a client
-secret, the default is **p2claw Connect** (`p2claw/docs/connect.md`): p2claw's
-OAuth app, so the user sets nothing up; the user's own client is the
-alternative.
+secret, the default is **p2claw Connect** (`p2claw/docs/connect.md`; live in
+the box agent since 0.10.22): p2claw's OAuth app, so the user sets nothing up;
+the user's own client is the alternative. agentd stays mostly p2claw-agnostic:
+Connect is one `auth` option among three.
 
 ## Design
 
 ### 1. Connectors
 
-A connector is an MCP server agentd talks to **from the host** (like the
-browser and phone devices), with its auth state and a tool policy. The owner
-configures connectors; the agent can only ask to use a configured one.
+A connector is a set of tools for one of the user's services, with its auth
+state and a tool policy. The owner configures connectors; the agent can only
+ask to use a configured one. Its tools are either **native** (Python in
+agentd's process, for connectors maintained with agentd, like the browser and
+phone tools) or an **MCP server** agentd talks to.
 
 ```python
 Connector(name="calendar",
-          transport=Stdio(command=["agentd-mcp-google-calendar"]),   # or Http(url="https://…/mcp")
+          transport=Native("agentd.connectors.google_calendar"),   # or Http(url=…), Stdio(command=[…])
           auth=P2clawConnect(provider="google"),                     # or OwnClient(...), McpAuth()
           scopes=["calendar.app.created", "calendar.events.freebusy"],
           write_scopes=[],                                           # requested on first write, if any
           policy={...})                                              # overrides of the tool classification
 ```
 
-- **Transports:** `Http` (a first-party hosted MCP server, streamable HTTP) or
-  `Stdio` (a local server agentd launches and supervises).
+- **Transports:** `Native` (agentd's own tools: the access token never leaves
+  agentd's process, so nothing to hand off), `Http` (a first-party hosted MCP
+  server, streamable HTTP) or `Stdio` (someone else's local server).
+- **Someone else's local server runs in an agentd sandbox, not on the host**
+  (it's third-party code; on the host it would have the user's full access).
+  Its egress allows only its API's hosts, and its token goes in the way
+  secrets already do: the server holds a placeholder and the egress proxy
+  swaps in the current access token on the host, for that API's domain only
+  (refreshed transparently, scrubbed from responses).
+- **MCP client:** the `mcp` SDK agentd already depends on (1.25: stdio and
+  streamable-HTTP clients, and `OAuthClientProvider`, which implements the MCP
+  authorization spec below: RFC 9728 discovery, client ID metadata documents,
+  PKCE), with agentd's token storage and an approval as its redirect.
 - **Auth:**
-  - `P2clawConnect(provider)`: p2claw's Connect app; flows through the box
-    agent's `/v1/connect` API (p2claw does exchange and refresh with its
-    secret, tokens sealed to the box).
+  - `P2clawConnect(provider)`: p2claw's Connect app, through the box agent's
+    local API (`/tmp/p2claw-<uid>/agent.sock`; CLI `p2claw oauth-grants`):
+    `GET /v1/oauth-grants/providers`; `POST /v1/oauth-grants/flows`
+    `{provider, scopes, code_challenge, nonce_hash}` → `{flow_id,
+    authorize_url}`; `GET /v1/oauth-grants/flows/{id}?wait=1` (long-poll, up
+    to 55 s) → `{status, code, state}`; `POST
+    /v1/oauth-grants/flows/{id}/exchange` `{code_verifier, store: true}` →
+    access token and a stored grant id; `GET /v1/oauth-grants/{id}/token`
+    (refreshed as needed); `DELETE /v1/oauth-grants/{id}` (revoke and
+    forget). agentd makes the PKCE verifier and nonce. Providers today:
+    `google`, with `calendar.app.created` and `calendar.events.freebusy`
+    (non-sensitive, so no Google verification).
   - `OwnClient(client_id, client_secret, authorize_url, token_url)` from fnox,
     redirect to a callback the host serves.
   - `McpAuth()`: the MCP authorization spec for hosted servers that support
@@ -63,6 +86,10 @@ Connector(name="calendar",
   busy)" with an **Open** button; the human consents in the browser; the
   approval resolves when the callback completes (the tool waits up to the
   hold, like the other request tools).
+- The callback must be reachable from wherever the human consents: Connect
+  relays it to the box; an `OwnClient` with a loopback redirect only works
+  when the human consents on the host itself (from the phone it needs a relay
+  too).
 - **Step-up:** scopes come in tiers; the first use of a tool needing a scope
   not yet granted raises a new `connector` approval for just that scope
   (`include_granted_scopes`), with the reason.
@@ -70,10 +97,16 @@ Connector(name="calendar",
 
 ### 3. Token store
 
-- Refresh tokens (and MCP-server tokens) are kept in an encrypted store,
-  `~/.agentd/connectors/tokens`, whose key is a fnox secret: locked in fnox
-  means the first use after a vault change carries an `unlock` in its approval
-  (the human's master password, as for the browser profile).
+- **Connect grants are kept by the p2claw agent** (`exchange` with `store`):
+  sealed to the box by the broker, in the agent's `oauth-grants.json` (0600)
+  in its data directory. agentd records only grant ids and asks for a current
+  access token when it needs one. agentd refuses sandbox shares that would
+  expose that directory or the agent's socket (`protected_host_paths`).
+- Other refresh tokens (`OwnClient`, `McpAuth`) are kept in an encrypted
+  store, `~/.agentd/connectors/tokens`, under the same fnox key as the browser
+  base profile, so one unlock covers both: locked in fnox means the first use
+  after a vault change carries an `unlock` in its approval (the human's master
+  password).
 - Access tokens live in memory and are refreshed until a refresh fails.
 - **Disconnect:** revoke at the provider (Google revokes the whole grant for
   the app, so every connector sharing it; the approver says so), then delete.
@@ -82,22 +115,31 @@ Connector(name="calendar",
 
 ### 4. Tokens for local servers
 
-A local server gets **a short-lived access token, never the refresh token**:
-an environment variable at launch, with agentd restarting the server when the
-token nears expiry (about an hour), or, for servers that support it, a token
-endpoint on a Unix socket agentd serves. Hosted servers get
-`Authorization: Bearer …` on every request, and only that server's token
-(no passthrough).
+Native tools use the access token in agentd's process. Someone else's local
+server (in a sandbox) never holds a token: it holds a placeholder that the
+egress proxy swaps for the current access token on the host, only on
+requests to the API's domain (section 1). Hosted servers get
+`Authorization: Bearer …` on every request, and only that server's token (no
+passthrough).
 
 ### 5. Tool policy
 
 - Classify each tool from MCP tool annotations (`readOnlyHint`,
-  `destructiveHint`), with owner overrides in the connector config.
+  `destructiveHint`), with owner overrides in the connector config. The MCP
+  spec says annotations are **untrusted** unless the server is: a tool
+  without them counts as a write, and for third-party servers the owner's
+  policy is what counts.
+- **Pin the tool set at consent:** each tool's name, description and input
+  schema are recorded when the connector is approved; a tool that appears or
+  changes later (`tools/list_changed`) needs a new approval before the agent
+  can use it.
 - **Reads:** covered by the connector's grant for the session (one
   `connector_use` approval per session, or always).
-- **Writes:** an approval per call that **shows the arguments** ("Create event
-  'Committee meeting', Tue Oct 27 18:00–19:30 on Rosey's calendar"): once,
-  session (that tool), always.
+- **Writes:** an approval per call that **shows the arguments** as labelled
+  fields, verbatim (title, start, end, calendar), not prose built from them:
+  the agent writes the arguments, and a title can be written to mislead the
+  approver ("… (you approved this yesterday)"). Once, session (that tool),
+  always.
 - **Destructive** (delete, cancel): an approval per call, never always.
 - **Results are untrusted data** (an event someone else wrote can carry a
   prompt injection); tool output says so.
@@ -114,15 +156,18 @@ endpoint on a Unix socket agentd serves. Hosted servers get
 
 ## First connector: Google Calendar (local)
 
-`agentd-mcp-google-calendar`, a small stdio server maintained with agentd,
-calling the Calendar REST API with the access token agentd gives it. Scopes
-are all **non-sensitive**, so p2claw Connect needs no Google verification:
+A **native** connector (`agentd.connectors.google_calendar`): tools in
+agentd's process calling the Calendar REST API with the access token from the
+Connect grant. Scopes are both **non-sensitive** (the reason they were
+chosen), so p2claw Connect needs no Google verification:
 
 - `calendar.app.created`: the agent's **own** calendar ("Rosey"), which it
   creates on first use and fully manages; the human overlays it in Google
   Calendar.
 - `calendar.events.freebusy`: busy blocks (no titles or details) on the
-  human's calendars and ones shared with them, by calendar ID or email.
+  human's calendars and ones shared with them, by calendar ID or email (for
+  someone else's calendar, only if they share at least free/busy with the
+  human, or in the same Workspace domain).
 
 | Tool | Kind |
 |---|---|
@@ -144,14 +189,19 @@ enforces it per calendar.
 
 agentd:
 
-- `Connector` (Http, Stdio; P2clawConnect, OwnClient, McpAuth), MCP client on
-  the host, tools bridged to every harness
+- `Connector` (Native, Http, Stdio in a sandbox; P2clawConnect, OwnClient,
+  McpAuth), the `mcp` SDK as MCP client, tools bridged to every harness
 - approvals: `connector` (consent, step-up) and `connector_use`; per-call write
   approvals with arguments
-- the encrypted token store (fnox key, unlock through approvals), refresh,
+- Connect grants kept by the p2claw agent; the encrypted token store for the
+  others (the browser profile's fnox key, unlock through approvals); refresh,
   revoke
-- local-server token handoff (env + restart, or a token socket)
-- `agentd-mcp-google-calendar`
+- third-party local servers in a sandbox, tokens injected by egress
+- tool pinning; per-call write approvals with labelled arguments
+- `agentd.connectors.google_calendar` (native)
+- tests: a fake OAuth server and a fake MCP server (consent, step-up,
+  refresh failure, `insufficient_scope`, a changed tool); a fake p2claw local
+  API; a live Calendar test with a test Google account
 - docs: this file; `egress-and-secrets.md` (connectors section)
 
 p2claw: the Connect broker and callback relay (`p2claw/docs/connect.md`).
@@ -161,8 +211,6 @@ Connectors list in settings, the prompt.
 
 ## Open questions
 
-- MCP client: an existing Python MCP client library vs agentd's own (stdio and
-  streamable HTTP).
 - Which calendars `freebusy` covers by default: `primary` only, or a configured
   list (the human's partner's email, a family calendar).
 - Read grants: a per-session approval, or free once connected.
