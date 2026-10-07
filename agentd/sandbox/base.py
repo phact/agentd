@@ -25,6 +25,7 @@ import asyncio
 import logging
 import os
 import shutil
+import sys
 import time
 import uuid
 from dataclasses import dataclass, field
@@ -47,14 +48,26 @@ DEFAULT_HOME = Path(os.environ.get("AGENTD_HOME", Path.home() / ".agentd"))
 
 
 def protected_host_paths() -> list[Path]:
-    """Host paths no sandbox may see: agentd's host-side sockets (MCP bridge,
-    model proxies that add credentials, the serve API) and its CA key, plus the
-    host logins those proxies read. A share that is, contains or sits inside
-    one of these is refused (e.g. mounting ``~`` read-only)."""
+    """Host paths no sandbox may see. A share that is, contains or sits inside
+    one of these is refused (e.g. mounting ``~`` or ``~/Library`` read-only):
+
+      * agentd's host-side sockets (MCP bridge, model proxies that add
+        credentials, the serve API), its CA key, the browser profiles (their
+        cookies) and the egress audit log and grants;
+      * host credentials of tools agentd works with: the Claude Code and Codex
+        logins the model proxies read, and p2claw's identity key, state and
+        local API socket;
+      * anything listed in ``AGENTD_PROTECTED_PATHS`` (separated by ``os.pathsep``).
+    """
     home = Path.home()
-    paths = [DEFAULT_HOME / "run", DEFAULT_HOME / "ca", DEFAULT_HOME / "serve",
+    data = home / "Library" / "Application Support" if sys.platform == "darwin" else \
+        Path(os.environ.get("XDG_DATA_HOME") or home / ".local" / "share")
+    paths = [DEFAULT_HOME / "run", DEFAULT_HOME / "ca", DEFAULT_HOME / "serve", DEFAULT_HOME / "browser",
+             DEFAULT_HOME / "egress",
              Path(os.environ.get("CODEX_HOME", home / ".codex")) / "auth.json",
-             home / ".claude" / ".credentials.json"]
+             home / ".claude" / ".credentials.json",
+             data / "p2claw", Path(f"/tmp/p2claw-{os.getuid()}")]
+    paths += [Path(p) for p in os.environ.get("AGENTD_PROTECTED_PATHS", "").split(os.pathsep) if p.strip()]
     return [p.expanduser().resolve() for p in paths]
 
 
@@ -343,7 +356,7 @@ class Sandbox:
             for p in protected:
                 if host == p or p.is_relative_to(host) or host.is_relative_to(p):
                     raise ValueError(f"cannot share {host} with a sandbox: it would expose {p} "
-                                     "(agentd's sockets, CA key or host credentials)")
+                                     "(agentd's sockets, keys or browser profiles, or host credentials)")
             shares.append((f"share{i}", target, host, read_only))
         return shares
 

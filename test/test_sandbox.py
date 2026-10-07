@@ -550,3 +550,29 @@ def test_shares_never_expose_agentd_sockets_or_credentials(tmp_path, monkeypatch
             shares(read_only_mounts={"/x": bad})
     with pytest.raises(ValueError, match="would expose"):
         base.Sandbox(workspace=home)._shares()
+
+
+def test_shares_never_expose_host_secrets(tmp_path, monkeypatch):
+    """Mounts that would expose agentd's keys, browser profiles or other tools' credentials
+    (p2claw's identity key, AGENTD_PROTECTED_PATHS) are refused; others are fine."""
+    from agentd.sandbox.base import protected_host_paths
+
+    home = Path.home()
+    p2claw = (home / "Library" / "Application Support" / "p2claw") if sys.platform == "darwin" \
+        else Path(os.environ.get("XDG_DATA_HOME") or home / ".local" / "share") / "p2claw"
+    assert p2claw.resolve() in protected_host_paths()
+
+    def shares(host):
+        return DockerSandbox(image="x", workspace=tmp_path / "ws", read_only_mounts={str(host): str(host)})._shares()
+
+    (tmp_path / "ws").mkdir()
+    for exposing in (p2claw.parent, p2claw / "identity.key", DEFAULT_HOME / "browser", DEFAULT_HOME / "egress",
+                     Path(f"/tmp/p2claw-{os.getuid()}")):
+        with pytest.raises(ValueError, match="cannot share"):
+            shares(exposing)
+    secret_dir = tmp_path / "vault"
+    secret_dir.mkdir()
+    shares(tmp_path / "data")  # fine
+    monkeypatch.setenv("AGENTD_PROTECTED_PATHS", f"{secret_dir}{os.pathsep}/nonexistent/x")
+    with pytest.raises(ValueError, match="vault"):
+        shares(tmp_path)  # contains a path the owner protected
