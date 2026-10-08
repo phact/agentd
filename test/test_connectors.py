@@ -205,7 +205,7 @@ def test_connect_read_write_and_policy(tmp_path):
             r = await m.call("calendar", "event_delete", {"event_id": eid})
             assert approvals.items[r["id"]].kind == "connector_destructive"
             approvals.decide(r["id"], "always")
-            assert (await m.call("calendar", "event_delete", {"event_id": eid}))["result"] == {"deleted": eid}
+            assert (await m.call("calendar", "event_delete", {"event_id": eid}))["result"]["deleted"] == eid
             assert not (tmp_path / "connectors" / "allowed.json").exists()
 
             # The audit log: tool, kind, arguments, decision; never a token.
@@ -290,6 +290,99 @@ def test_unticked_scope(tmp_path):
             await m.call("calendar", "freebusy", {"time_min": "a", "time_max": "b", "calendars": "primary"})
         finally:
             await runner.cleanup()
+    asyncio.run(main())
+
+
+def test_recurrence_text_checks_and_split_rule():
+    d = gc.describe_recurrence
+    assert d("RRULE:FREQ=WEEKLY;BYDAY=SU;COUNT=10") == "weekly on Sundays, 10 times"
+    assert d("RRULE:FREQ=WEEKLY;BYDAY=MO,TU,WE,TH,FR") == "weekly on weekdays"
+    assert d("RRULE:FREQ=MONTHLY;BYDAY=2TU;UNTIL=20261231") == "monthly on the second Tuesday, until Dec 31, 2026"
+    assert d("RRULE:FREQ=MONTHLY;BYDAY=-1FR") == "monthly on the last Friday"
+    assert d("RRULE:FREQ=WEEKLY;INTERVAL=2;BYDAY=SA,SU") == "every other week on Saturdays and Sundays"
+    assert d("RRULE:FREQ=YEARLY;BYMONTH=3;BYMONTHDAY=1") == "yearly on March 1"
+    assert d("RRULE:FREQ=DAILY;COUNT=3\nEXDATE;TZID=America/New_York:20261102T180000") == \
+        "daily, 3 times, with some dates skipped"
+    assert d("none") == "doesn't repeat"
+    with pytest.raises(gc.CalendarError, match="RFC 5545"):
+        gc._rules("every sunday")
+    # Checked before anyone is asked to approve.
+    with pytest.raises(gc.CalendarError, match="time_zone"):
+        gc.check("event_create", {"start": "2026-10-11T18:00:00", "recurrence": "RRULE:FREQ=DAILY"})
+    gc.check("event_create", {"start": "2026-10-11", "recurrence": "RRULE:FREQ=DAILY"})  # all day: no zone needed
+    with pytest.raises(gc.CalendarError, match="series"):
+        gc.check("event_update", {"scope": "this", "recurrence": "RRULE:FREQ=DAILY"})
+    with pytest.raises(gc.CalendarError, match="scope"):
+        gc.check("event_delete", {"scope": "everything"})
+    assert gc.each_time("event_update", {"scope": "series"}) and gc.each_time("event_update", {"scope": "following"})
+    assert not gc.each_time("event_update", {"scope": "this"})
+    # Ending a series just before an occurrence: COUNT dropped, UNTIL in UTC (timed) or the day before (all day).
+    parts = {"FREQ": "WEEKLY", "BYDAY": "SU", "COUNT": "10"}
+    assert gc._ended_before(parts, {"dateTime": "2026-11-01T18:00:00-05:00"}) == \
+        "RRULE:FREQ=WEEKLY;BYDAY=SU;UNTIL=20261101T225959Z"
+    assert gc._ended_before(parts, {"date": "2026-11-01"}) == "RRULE:FREQ=WEEKLY;BYDAY=SU;UNTIL=20261031"
+
+
+def test_one_occurrence_needs_an_occurrence(tmp_path, monkeypatch):
+    """scope this/following with a series id is refused (before any approval) unless original_start names
+    the date; the card and the action resolve the same target."""
+    events = {
+        "S": {"id": "S", "summary": "Committee", "recurrence": ["RRULE:FREQ=WEEKLY;BYDAY=SU;COUNT=6"],
+              "start": {"dateTime": "2026-10-11T18:00:00-04:00", "timeZone": "America/New_York"}},
+        "S_2": {"id": "S_2", "summary": "Committee", "recurringEventId": "S",
+                "originalStartTime": {"dateTime": "2026-10-18T18:00:00-04:00"},
+                "start": {"dateTime": "2026-10-18T18:00:00-04:00"}},
+        "ONE": {"id": "ONE", "summary": "Dentist", "start": {"dateTime": "2026-10-20T09:00:00-04:00"}},
+    }
+    calls = []
+
+    async def own(ctx, create):
+        return "cal"
+
+    async def api(ctx, method, path, *, params=None, body=None):
+        calls.append((method, path, params))
+        if method == "GET" and path.endswith("/instances"):
+            return {"items": [events["S_2"]] if gc._same_time(params["originalStart"], "2026-10-18T22:00:00Z") else []}
+        if method == "GET":
+            return events[path.rsplit("/", 1)[1]]
+        return {}
+    monkeypatch.setattr(gc, "_own", own)
+    monkeypatch.setattr(gc, "_api", api)
+
+    async def main():
+        with pytest.raises(gc.CalendarError, match="series id"):
+            await gc._resolve(None, "S", "this")
+        with pytest.raises(gc.CalendarError, match="series id"):
+            await gc._resolve(None, "S", "following")
+        series, occ = await gc._resolve(None, "S", "this", "2026-10-18T18:00:00-04:00")
+        assert occ["id"] == "S_2" and series["id"] == "S"
+        assert (await gc._resolve(None, "S_2", "this"))[1]["id"] == "S_2"
+        with pytest.raises(gc.CalendarError, match="not 2026-10-25"):
+            await gc._resolve(None, "S_2", "this", "2026-10-25T18:00:00-04:00")
+        with pytest.raises(gc.CalendarError, match="no occurrence"):
+            await gc._resolve(None, "S", "this", "2026-10-19T18:00:00-04:00")
+        assert (await gc._resolve(None, "S", "series"))[1] is None
+        assert (await gc._resolve(None, "ONE", "this")) == (events["ONE"], None), "a single event is just itself"
+
+        # Through the manager: refused before an approval exists; with original_start, the card names that
+        # date and the delete hits that occurrence, not the series.
+        m, approvals, _ = _setup(tmp_path, "http://unused")
+        m._write("grants.json", {"calendar": {"grant_id": "g", "provider": "google",
+                                              "scopes": ["https://www.googleapis.com/auth/" + s for s in SCOPES]}})
+        m._tokens["calendar"] = ("tok", time.time() + 3600)
+        with pytest.raises(gc.CalendarError, match="series id"):
+            await m.call("calendar", "event_delete", {"event_id": "S", "scope": "this"})
+        with pytest.raises(gc.CalendarError, match="series id"):
+            await m.call("calendar", "event_update", {"event_id": "S", "scope": "this", "summary": "x"})
+        assert not approvals.items, "nothing was put in front of the human"
+        args = {"event_id": "S", "scope": "this", "original_start": "2026-10-18T18:00:00-04:00"}
+        r = await m.call("calendar", "event_delete", args)
+        assert approvals.items[r["id"]].details["summary"] == \
+            "Cancel 'Committee' on Sun Oct 18, 6:00 PM only (the rest of the series stays)"
+        approvals.decide(r["id"], "once")
+        await m.call("calendar", "event_delete", args)
+        assert ("DELETE", "/calendars/cal/events/S_2", {"sendUpdates": "none"}) in calls, "that occurrence, nobody emailed"
+        assert not any(c[0] == "DELETE" and c[1].endswith("/S") for c in calls), "never the series"
     asyncio.run(main())
 
 
@@ -440,7 +533,7 @@ def test_live_google_calendar(tmp_path):
         for e in listed:  # this run's event, and any an interrupted run left
             r = await m.call("calendar", "event_delete", {"event_id": e["id"]})
             approvals.decide(r["id"], "once")
-            assert (await m.call("calendar", "event_delete", {"event_id": e["id"]}))["result"] == {"deleted": e["id"]}
+            assert (await m.call("calendar", "event_delete", {"event_id": e["id"]}))["result"]["deleted"] == e["id"]
         assert (await m.call("calendar", "events_list", window))["result"] == []
         from agentd.connectors.google_calendar import _api
         from agentd.connectors import Context
@@ -449,4 +542,230 @@ def test_live_google_calendar(tmp_path):
         await _api(ctx, "DELETE", f"/calendars/{ctx.state['calendar_id']}")  # leave nothing behind
         print(f"deleted the test calendar; the grant stays with the p2claw agent: {m._grant('calendar')['grant_id']} "
               "(p2claw oauth-grants revoke <id> when done)", flush=True)
+    asyncio.run(main())
+
+
+@pytest.mark.skipif(not __import__("os").environ.get("AGENTD_CONNECT_LIVE") or not SDK.is_dir()
+                    or not __import__("os").environ.get("AGENTD_CONNECT_GRANT"),
+                    reason="set AGENTD_CONNECT_LIVE=1 and AGENTD_CONNECT_GRANT=<a grant id> (real Google)")
+def test_live_google_calendar_recurrence(tmp_path):
+    """Repeating events on a throwaway calendar: create, change one date, this and following, the whole
+    series' pattern, cancel one date, delete; approvals carry plain-language summaries and series changes
+    are asked every time. The calendar is deleted at the end."""
+    import datetime as dt
+    import os
+
+    sys.path.insert(0, str(SDK))
+    from p2claw_agent_client import AgentClient
+
+    from agentd.connectors import Context
+
+    c = Connector(name="calendar", description="agentd's live test", transport=Native("agentd.connectors.google_calendar"),
+                  auth=P2clawConnect("google", client=AgentClient()), scopes=SCOPES,
+                  options={"calendar_name": "agentd recurrence test", "time_zone": "America/New_York"})
+    approvals = Approvals(allow_file=tmp_path / "allow.toml", hold=0.5)
+    m = Connectors([c], approvals=approvals, root=tmp_path / "connectors")
+    m._write("grants.json", {"calendar": {"grant_id": os.environ["AGENTD_CONNECT_GRANT"], "provider": "google",
+                                          "scopes": ["https://www.googleapis.com/auth/" + s for s in SCOPES]}})
+    summaries = []
+
+    async def approved(tool, args, decision="once"):
+        r = await m.call("calendar", tool, args)
+        if "result" in r:
+            return r["result"]
+        summaries.append(approvals.items[r["id"]].details.get("summary"))
+        approvals.decide(r["id"], decision)
+        return (await m.call("calendar", tool, args))["result"]
+
+    async def main():
+        today = dt.date.today()
+        sunday = today + dt.timedelta(days=(6 - today.weekday()) % 7 or 7)
+        first = f"{sunday.isoformat()}T18:00:00"
+        try:
+            series = await approved("event_create", {
+                "summary": "Committee", "start": first, "end": f"{sunday.isoformat()}T19:30:00",
+                "time_zone": "America/New_York", "recurrence": "RRULE:FREQ=WEEKLY;BYDAY=SU;COUNT=6"})
+            assert series["repeats"] == "weekly on Sundays, 6 times"
+            assert summaries[-1].startswith("New repeating event 'Committee': weekly on Sundays, 6 times, starting")
+            with pytest.raises(Exception, match="time_zone"):
+                await m.call("calendar", "event_create", {"summary": "x", "start": first, "end": first,
+                                                           "recurrence": "RRULE:FREQ=DAILY;COUNT=2"})
+            window = {"time_min": f"{today.isoformat()}T00:00:00Z",
+                      "time_max": f"{(sunday + dt.timedelta(weeks=10)).isoformat()}T00:00:00Z"}
+            occ = (await m.call("calendar", "events_list", window))["result"]
+            assert len(occ) == 6 and all(o["series_id"] == series["id"] for o in occ)
+
+            # One date: rename the second Sunday only.
+            await approved("event_update", {"event_id": occ[1]["id"], "scope": "this", "summary": "Committee (short)"},
+                           decision="session")
+            assert summaries[-1].startswith("Just ") and "renamed to 'Committee (short)'" in summaries[-1]
+            occ = (await m.call("calendar", "events_list", window))["result"]
+            assert [o["summary"] for o in occ].count("Committee (short)") == 1
+
+            # A series id where one date is meant: refused before anyone is asked; with original_start,
+            # exactly that date (Google finds the occurrence by its original start).
+            asked = len(approvals.items)
+            with pytest.raises(Exception, match="series id"):
+                await m.call("calendar", "event_delete", {"event_id": series["id"], "scope": "this"})
+            assert len(approvals.items) == asked
+            await approved("event_update", {"event_id": series["id"], "scope": "this", "summary": "Committee (third)",
+                                            "original_start": occ[2]["original_start"]})
+            # (no new card: one-date updates were approved for the session above)
+            occ = (await m.call("calendar", "events_list", window))["result"]
+            assert [o["summary"] for o in occ] == ["Committee", "Committee (short)", "Committee (third)", "Committee",
+                                                   "Committee", "Committee"]
+
+            # This and following: from the 4th on, an hour later.
+            fourth = occ[3]
+            later = _iso_hour(fourth["start"], 19)
+            split = await approved("event_update", {"event_id": fourth["id"], "scope": "following",
+                                                    "start": later, "end": _iso_hour(fourth["end"], 20, 30),
+                                                    "time_zone": "America/New_York"}, decision="session")
+            assert summaries[-1].startswith("From ") and "Committee" in summaries[-1]
+            occ = (await m.call("calendar", "events_list", window))["result"]
+            assert len(occ) == 6, "3 before the split, 3 after (the count carried over)"
+            assert [o["start"][11:13] for o in occ] == ["18", "18", "18", "19", "19", "19"]
+            new_series = split["new_series"]["id"]
+
+            # A session approval of event_update doesn't cover whole-series changes: asked again.
+            r = await m.call("calendar", "event_update", {"event_id": new_series, "scope": "series",
+                                                           "recurrence": "RRULE:FREQ=WEEKLY;BYDAY=SA;UNTIL=20271231"})
+            assert r["status"] == "pending"
+            assert approvals.items[r["id"]].details["summary"].endswith(
+                "weekly on Sundays, 3 times → weekly on Saturdays, until Dec 31, 2027"), approvals.items[r["id"]].details
+            approvals.decide(r["id"], "once")
+            await m.call("calendar", "event_update", {"event_id": new_series, "scope": "series",
+                                                       "recurrence": "RRULE:FREQ=WEEKLY;BYDAY=SA;UNTIL=20271231"})
+
+            # Cancel one date of the first series, then delete the second series entirely.
+            occ = (await m.call("calendar", "events_list", window))["result"]
+            first_series = [o for o in occ if o["series_id"] == series["id"]]
+            await approved("event_delete", {"event_id": first_series[0]["id"], "scope": "this"})
+            assert summaries[-1].startswith("Cancel 'Committee' on ") and summaries[-1].endswith("(the rest of the series stays)")
+            await approved("event_delete", {"event_id": new_series, "scope": "series"})
+            assert summaries[-1].startswith("Delete the whole series 'Committee' (weekly on Saturdays")
+            left = (await m.call("calendar", "events_list", window))["result"]
+            assert len(left) == 2 and all(o["series_id"] == series["id"] for o in left)
+            # End what's left after its first remaining date.
+            await approved("event_delete", {"event_id": left[1]["id"], "scope": "following"})
+            assert len((await m.call("calendar", "events_list", window))["result"]) == 1
+        finally:
+            from agentd.connectors.google_calendar import _api
+
+            ctx = Context(m, c)
+            if ctx.state.get("calendar_id"):
+                await _api(ctx, "DELETE", f"/calendars/{ctx.state['calendar_id']}")
+        print("\nsummaries:\n  " + "\n  ".join(s for s in summaries if s), flush=True)
+    asyncio.run(main())
+
+
+def _iso_hour(value: str, hour: int, minute: int = 0) -> str:
+    """The same date (in its own offset) at another local time, without an offset (the time_zone applies)."""
+    import datetime as dt
+
+    d = dt.datetime.fromisoformat(value)
+    return d.replace(hour=hour, minute=minute, tzinfo=None).isoformat()
+
+
+@pytest.mark.skipif(not __import__("os").environ.get("AGENTD_CONNECT_LIVE") or not SDK.is_dir()
+                    or not __import__("os").environ.get("AGENTD_CONNECT_GRANT"),
+                    reason="set AGENTD_CONNECT_LIVE=1 and AGENTD_CONNECT_GRANT=<a grant id> (real Google)")
+def test_live_google_calendar_fields(tmp_path):
+    """Alerts, guests (nobody emailed), Meet, color, busy/free, visibility, status, properties, source, quick add,
+    search, a series' occurrences, the calendar's own settings; approval cards say all of it. The throwaway
+    calendar is deleted at the end."""
+    import datetime as dt
+    import os
+
+    sys.path.insert(0, str(SDK))
+    from p2claw_agent_client import AgentClient
+
+    from agentd.connectors import Context
+
+    c = Connector(name="calendar", description="agentd's live test", transport=Native("agentd.connectors.google_calendar"),
+                  auth=P2clawConnect("google", client=AgentClient()), scopes=SCOPES,
+                  options={"calendar_name": "agentd fields test", "time_zone": "America/New_York"})
+    approvals = Approvals(allow_file=tmp_path / "allow.toml", hold=0.5)
+    m = Connectors([c], approvals=approvals, root=tmp_path / "connectors")
+    m._write("grants.json", {"calendar": {"grant_id": os.environ["AGENTD_CONNECT_GRANT"], "provider": "google",
+                                          "scopes": ["https://www.googleapis.com/auth/" + s for s in SCOPES]}})
+    cards = []
+
+    async def approved(tool, args):
+        r = await m.call("calendar", tool, args)
+        if "result" in r:
+            return r["result"]
+        cards.append(approvals.items[r["id"]].details.get("summary"))
+        approvals.decide(r["id"], "once")
+        return (await m.call("calendar", tool, args))["result"]
+
+    async def main():
+        day = (dt.date.today() + dt.timedelta(days=3)).isoformat()
+        try:
+            e = await approved("event_create", {
+                "summary": "Board prep", "start": f"{day}T10:00:00", "end": f"{day}T11:00:00",
+                "time_zone": "America/New_York", "reminders": "popup:10m,email:1d",
+                "attendees": "agentd-guest@example.com, ?agentd-optional@example.com", "meet": "add",
+                "color": "tomato", "show_as": "free", "visibility": "private",
+                "properties": '{"task": "t-42"}', "source_url": "https://example.com/doc", "source_title": "Agenda"})
+            assert cards[-1] == ("New event 'Board prep' on " + cards[-1].split(" on ", 1)[1].split(";")[0] +
+                                 "; alerts: 10 min before (notification), 1 day before (email); guests: "
+                                 "agentd-guest@example.com, agentd-optional@example.com (optional); no emails sent; "
+                                 "adds a Google Meet link; color tomato; shows as free; private; tags: task=t-42; "
+                                 "link: Agenda"), cards[-1]
+            got = (await m.call("calendar", "event_get", {"event_id": e["id"]}))["result"]
+            assert got["reminders"] == {"use_default": False, "overrides": [{"method": "popup", "minutes": 10},
+                                                                            {"method": "email", "minutes": 1440}]}
+            assert got["alerts"] == "10 min before (notification), 1 day before (email)"
+            guests = {g["email"]: g for g in got["attendees"]}
+            assert set(guests) == {"agentd-guest@example.com", "agentd-optional@example.com"}
+            assert guests["agentd-optional@example.com"]["optional"] and guests["agentd-guest@example.com"]["response"]
+            assert got["meet"].startswith("https://meet.google.com/") and got["conference"]["entry_points"], got
+            assert got["color"] == "tomato" and got["show_as"] == "free" and got["visibility"] == "private"
+            assert got["properties"] == {"task": "t-42"} and got["source"]["title"] == "Agenda"
+            assert got["guests_can_invite_others"] is True and got["guests_can_modify"] is False, "defaults filled in"
+            assert got["time_zone"] == "America/New_York" and not got["all_day"] and got["organizer"] and got["created"]
+
+            # Change guests with + and -, drop Meet and the alerts, mark tentative.
+            up = await approved("event_update", {"event_id": e["id"], "attendees": "+agentd-third@example.com,-agentd-optional@example.com",
+                                                 "meet": "remove", "reminders": "none", "status": "tentative"})
+            assert "adds agentd-third@example.com" in cards[-1] and "removes agentd-optional@example.com" in cards[-1]
+            assert {g["email"] for g in up["attendees"]} == {"agentd-guest@example.com", "agentd-third@example.com"}
+            assert "meet" not in up and up["reminders"] == {"use_default": False, "overrides": []}
+            assert up["alerts"] == "no alerts" and up["status"] == "tentative"
+
+            window = {"time_min": f"{day}T00:00:00-04:00", "time_max": f"{day}T23:59:00-04:00"}
+            assert [x["id"] for x in (await m.call("calendar", "events_list", {**window, "query": "Board"}))["result"]] == [e["id"]]
+            assert [x["id"] for x in (await m.call("calendar", "events_list", {**window, "property": "task=t-42"}))["result"]] == [e["id"]]
+            assert (await m.call("calendar", "events_list", {**window, "property": "task=nope"}))["result"] == []
+
+            quick = await approved("event_quick_add", {"text": f"Lunch with Sam {day} 1pm"})
+            assert quick["summary"].startswith("Lunch with Sam") and cards[-1].startswith("New event from the text")
+
+            weekly = await approved("event_create", {"summary": "Standup", "start": f"{day}T09:00:00",
+                                                     "end": f"{day}T09:15:00", "time_zone": "America/New_York",
+                                                     "recurrence": "RRULE:FREQ=DAILY;COUNT=3"})
+            assert len((await m.call("calendar", "event_instances", {"series_id": weekly["id"]}))["result"]) == 3
+
+            info = (await m.call("calendar", "calendar_info", {}))["result"]
+            assert info["exists"] and info["name"] == "agentd fields test"
+            renamed = await approved("calendar_update", {"name": "agentd fields test (renamed)"})
+            assert renamed["name"] == "agentd fields test (renamed)" and "renamed to" in cards[-1]
+
+            with pytest.raises(Exception, match="at most 5"):
+                await m.call("calendar", "event_create", {"summary": "x", "start": day, "end": day,
+                                                           "reminders": "popup:1m,popup:2m,popup:3m,popup:4m,popup:5m,popup:6m"})
+            with pytest.raises(Exception, match="color is one of"):
+                await m.call("calendar", "event_create", {"summary": "x", "start": day, "end": day, "color": "red"})
+            # Anything Google would email people about is approved every time.
+            from agentd.connectors import google_calendar as g
+
+            assert g.each_time("event_update", {"scope": "this", "notify_guests": True})
+        finally:
+            from agentd.connectors.google_calendar import _api
+
+            ctx = Context(m, c)
+            if ctx.state.get("calendar_id"):
+                await _api(ctx, "DELETE", f"/calendars/{ctx.state['calendar_id']}")
+        print("\ncards:\n  " + "\n  ".join(x for x in cards if x), flush=True)
     asyncio.run(main())

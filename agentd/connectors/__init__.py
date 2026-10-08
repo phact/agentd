@@ -330,7 +330,10 @@ class Connectors:
             if full not in (self._grant(name) or {}).get("scopes", []):
                 raise ConnectorError(f"{name}.{tool} needs {needs}, which wasn't granted (unticked at consent): call "
                                      f"request_connector({name!r}, reason) to ask for it")
-        decision = await self._authorize(name, tool, kind, args)
+        check = getattr(self._module(c), "check", None)
+        if check is not None:
+            check(tool, args)  # a call that can't work fails before anyone is asked to approve it
+        decision = await self._authorize(name, tool, kind, args, c)
         if decision.get("status") not in ("allowed", *_GRANTED):
             return decision
         try:
@@ -342,16 +345,27 @@ class Connectors:
         self._audit(connector=name, tool=tool, kind=kind, args=_summary(args), decision=decision["status"])
         return {"result": result, "untrusted": UNTRUSTED} if kind == "read" else {"result": result}
 
-    async def _authorize(self, name: str, tool: str, kind: str, args: dict) -> dict:
-        """Reads: free once connected. Writes and destructive calls: an approval per call."""
+    async def _authorize(self, name: str, tool: str, kind: str, args: dict, c: Connector) -> dict:
+        """Reads: free once connected. Writes and destructive calls: an approval per call. A module's
+        ``each_time(tool, args)`` marks writes that a session or always approval doesn't cover (e.g.
+        rewriting a whole series); its ``describe(ctx, tool, args)`` adds a plain-language ``summary`` and
+        raises (refusing the call before anyone is asked) when it can't tell what the call would act on."""
+        module = self._module(c)
+        each_time = kind == "destructive" or bool(getattr(module, "each_time", lambda t, a: False)(tool, args))
         if kind == "read":
             return {"status": "allowed"}
-        if kind == "write" and ((name, tool) in self._session_tools or self._saved_tool(name, tool)):
+        if not each_time and ((name, tool) in self._session_tools or self._saved_tool(name, tool)):
             return {"status": "allowed"}
         if self.approvals is None:
             raise ConnectorError(f"{name}.{tool} changes things and needs an approver (none is configured)")
         details = {"connector": name, "tool": tool, "kind": kind,
                    "arguments": [{"name": k, "value": v} for k, v in args.items()]}  # verbatim, labelled
+        if hasattr(module, "describe"):
+            # describe works out what the call will act on, the same way the call does: if it can't
+            # (e.g. a series id where one occurrence is meant), the call is refused before anyone is asked.
+            summary = await module.describe(Context(self, c), tool, args)
+            if summary:
+                details["summary"] = summary
         approval_kind = "connector_write" if kind == "write" else "connector_destructive"
         # The same call again (e.g. after the hold ran out) uses the approval already asked for,
         # unless it was spent, refused or expired.
@@ -368,9 +382,9 @@ class Connectors:
             return {"status": status, "id": approval.id,
                     "message": "waiting for the human to approve; call again with the same arguments once they have"}
         self._used.add(approval.id)
-        if kind == "write" and status == "session":
+        if not each_time and status == "session":
             self._session_tools.add((name, tool))
-        if kind == "write" and status == "always":
+        if not each_time and status == "always":
             self._save_tool(name, tool)
         return {"status": status, "id": approval.id}
 

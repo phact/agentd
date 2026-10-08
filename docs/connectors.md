@@ -172,11 +172,49 @@ chosen), so p2claw Connect needs no Google verification:
 
 | Tool | Kind |
 |---|---|
-| `events_list(time_min, time_max)`, `event_get(id)` | read (own calendar) |
-| `freebusy(calendars, time_min, time_max)` | read (availability only) |
-| `suggest_time(duration, window, calendars)` | read |
-| `event_create(...)` (creates the agent's calendar on first use), `event_update(id, ...)` | write |
-| `event_delete(id)` | destructive |
+| `events_list(time_min, time_max, query, property, show_cancelled, max_results)`, `event_get(id)`, `event_instances(series_id)` | read (own calendar) |
+| `freebusy(calendars, time_min, time_max)`, `suggest_time(duration, window, calendars)` | read (availability only) |
+| `calendar_info()` | read |
+| `event_create(...)` (creates the agent's calendar on first use), `event_quick_add(text)` | write |
+| `event_update(id, scope, ...)` | write; `scope` `series` or `following`: approved every call |
+| `calendar_update(name, description, time_zone)` | write |
+| `event_delete(id, scope)` | destructive (every call) |
+
+Event fields (create and update): times and `time_zone`, `recurrence`,
+`reminders` (`popup:10m,email:1d`, up to 5, at most 4 weeks before; `default`;
+`none`), `attendees` (emails, `?` for optional; on update `+`/`-` to add or
+remove), `notify_guests` (Google emails them; off by default, and approved
+every call when on), `meet` (`add` / `remove` a Google Meet link), `color`
+(Google's 11 event colors by name), `show_as` (`busy` / `free`), `visibility`,
+`status` (`confirmed` / `tentative`), guest permissions (`guests_can_modify`,
+`guests_can_invite_others`, `guests_can_see_other_guests`), `properties` and
+`shared_properties` (key/value tags; `events_list(property="task=42")` finds
+them), `source_url` / `source_title`. Values are checked before anyone is asked
+(e.g. a sixth reminder, an unknown color, a malformed email).
+
+Not reachable with these scopes: focus time and out-of-office events (primary
+calendar only), attachments (Drive), sharing the agent's calendar (ACL),
+calendar-list defaults and user settings, push notifications (a public webhook).
+
+Repeating events: `recurrence` is RFC 5545 lines (`RRULE:FREQ=WEEKLY;BYDAY=SU;COUNT=10`,
+`…;UNTIL=20261231`), passed to Google as its `recurrence` list; a timed
+repeating event needs a `time_zone`; `recurrence="none"` turns a series into a
+single event. `events_list` returns occurrences, each with its own id plus
+`series_id` and `original_start`; `scope` (default `"this"`, so an occurrence id
+never cancels a whole series by accident) picks one occurrence (Google records
+an exception; a series id is refused for `"this"` and `"following"` unless
+`original_start` names the date, so an id can never act on more than the card
+says: the approval's summary and the call resolve the target the same way, and
+a target that can't be resolved is refused before anyone is asked), `"following"` (two steps, presented as one change: an `UNTIL`
+just before the occurrence ends the original series, and a new series starts
+there with the changes, with the remaining `COUNT` if it had one; the original
+is restored if the second step fails) or `"series"` (an occurrence id resolves
+to its series). Approvals carry a plain-language `summary` next to the raw
+arguments: "New repeating event 'Committee': weekly on Sundays, 6 times,
+starting Sun Oct 11, 6:00 PM", "'Committee' (whole series): weekly on Sundays →
+weekly on Saturdays, until Dec 31, 2027", "From Sun Nov 1, 6:00 PM on,
+'Committee': now 7:00 PM–8:30 PM", "Cancel 'Committee' on Sun Oct 11, 6:00 PM
+only (the rest of the series stays)".
 
 Later, behind verification of the Connect app (or with the user's own client):
 `calendar.events` / `calendar.readonly` for event details on the human's own
@@ -253,6 +291,10 @@ enable_connector_skills(Connectors([calendar], approvals=approvals))
   same arguments uses that approval. `once` is spent by one call; `session`
   covers the tool until agentd restarts; `always` is saved in
   `~/.agentd/connectors/allowed.json` (never for destructive tools).
+- A native module may also define `check(tool, args)` (raises before anyone
+  is asked, for calls that can't work), `each_time(tool, args)` (writes a
+  session or always approval doesn't cover) and `describe(ctx, tool, args)`
+  (the approval's plain-language `summary`; it may read, never write).
 - Read results carry `untrusted` (a note to treat them as data). Every call is
   appended to `~/.agentd/connectors/audit.jsonl` (connector, tool, kind,
   arguments truncated, decision); never tokens.
