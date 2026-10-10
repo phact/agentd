@@ -31,7 +31,13 @@ def sandbox_env() -> dict[str, str]:
         "ANTHROPIC_AUTH_TOKEN": "agentd-sandbox",
         "CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC": "1",
         "DISABLE_AUTOUPDATER": "1",
+        # Nothing from the sandbox goes to claude.ai: no artifacts.
+        "CLAUDE_CODE_DISABLE_ARTIFACT": "1",
     }
+
+
+# Flag settings outrank the workspace's own .claude/settings.json.
+SANDBOX_SETTINGS = {"enableArtifact": False, "autoUploadSessions": False, "disableRemoteControl": True}
 
 
 def claude_argv(

@@ -210,3 +210,8 @@ def test_anthropic_proxy_only_forwards_model_calls():
 
     asyncio.run(main())
 
+
+def test_claude_sandbox_turns_off_claude_ai():
+    from agentd.harness.claude_cli import SANDBOX_SETTINGS, sandbox_env
+    assert sandbox_env()["CLAUDE_CODE_DISABLE_ARTIFACT"] == "1"
+    assert SANDBOX_SETTINGS == {"enableArtifact": False, "autoUploadSessions": False, "disableRemoteControl": True}

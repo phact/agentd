@@ -8,6 +8,7 @@ placeholder. Permissions are ``bypassPermissions``: the VM is the boundary.
 """
 from __future__ import annotations
 
+import json
 import shlex
 from contextlib import aclosing
 from dataclasses import dataclass, field
@@ -49,7 +50,7 @@ class ClaudeCodeHarness:
         argv = claude_cli.claude_argv(
             model=model, resume=resume, append_system_prompt=append_system_prompt,
             setting_sources=["user", "project"], permission_mode="bypassPermissions",
-            extra_args=self.extra_args,
+            extra_args=["--settings", json.dumps(claude_cli.SANDBOX_SETTINGS), *self.extra_args],
         )
         events = claude_cli.run_in_sandbox(self.executor, argv, prompt, cwd=str(session.workspace))
         async with aclosing(events):
