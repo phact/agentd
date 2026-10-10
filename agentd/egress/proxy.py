@@ -17,7 +17,9 @@ destination (``host`` when the guest resolved a name, ``dst`` / ``port``).
   * **deny**: closed. With approvals, first held while an approver decides
     (agentd.egress.approvals).
 
-Every decision goes to the audit log (never header values or bodies).
+Every decision goes to the audit log (never header values or bodies). What
+an approval let through is also reported to the approvals (``grant.used``),
+once per connection and grant.
 """
 from __future__ import annotations
 
@@ -32,7 +34,7 @@ from typing import Any, Callable
 import h11
 
 from agentd.egress.ca import SessionCA
-from agentd.egress.policy import Policy, SecretRule
+from agentd.egress.policy import Grant, Policy, SecretRule
 
 logger = logging.getLogger(__name__)
 
@@ -99,6 +101,15 @@ class Scrubber:
         return value
 
 
+class Conn:
+    """One sandbox connection: where it goes, and the grants already reported for it."""
+
+    def __init__(self, host: str | None, ip: str, port: int):
+        self.host, self.ip, self.port = host, ip, port
+        self.via: tuple[Grant, dict] | None = None  # the grant that let it through, reported with its first request
+        self.reported: set[tuple] = set()
+
+
 class Refused(Exception):
     def __init__(self, message: str, detail: dict[str, Any]):
         super().__init__(message)
@@ -118,6 +129,7 @@ class EgressProxy:
         session: str = "",
         ask: Callable[..., Any] | None = None,
         load: Callable[[str], Any] | None = None,
+        report: Callable[[dict], None] | None = None,
     ):
         self.socket_path = Path(socket_path)
         self.policy = policy
@@ -128,6 +140,7 @@ class EgressProxy:
         self.session = session
         self.ask = ask                    # approvals hook: await ask(kind, **details) -> (approved, id, status)
         self.load = load                  # await load(name): read a secret not read yet (add_secret)
+        self.report = report              # report(event): a grant was used (Approvals.grant_used)
         self.masks: dict[bytes, bytes] = {}
         for name, value in secrets.items():
             self._mask(name, value)
@@ -188,25 +201,60 @@ class EgressProxy:
         except OSError:
             logger.warning("egress audit log unwritable: %s", self.audit_path)
 
+    def grant_used(self, conn: Conn, kind: str, grant: Grant, rule: dict, *, method: str | None = None,
+                   path: str | None = None, secret: str | None = None) -> None:
+        """Report a grant used on ``conn`` (once per connection and grant)."""
+        key = (grant.approval, json.dumps(rule, sort_keys=True))
+        if key in conn.reported:
+            return
+        conn.reported.add(key)
+        event: dict[str, Any] = {
+            "kind": kind, "grant": {"approval": grant.approval, "decision": grant.decision, "rule": rule},
+            "host": conn.host, "ip": conn.ip, "port": conn.port}
+        if method is not None:
+            event.update(method=method, path=(path or "").split("?", 1)[0])
+        if secret is not None:
+            event["secret"] = secret
+        self.audit(event="grant_used", **event)
+        if self.report is not None:
+            try:
+                self.report({"session": self.session, "ts": round(time.time(), 3), **event})
+            except Exception:
+                logger.exception("grant report failed")
+
+    def requested(self, conn: Conn, method: str, path: str, grants: list[tuple[Grant, dict, str]]) -> None:
+        """A request on ``conn`` went upstream, filling secrets under ``grants``."""
+        for grant, rule, secret in grants:
+            self.grant_used(conn, "secret", grant, rule, method=method, path=path, secret=secret)
+        if conn.via is not None and not conn.reported:
+            self.grant_used(conn, "connect", *conn.via, method=method, path=path)
+
     # ------------------------------------------------------------------ #
 
     async def _on_stream(self, reader: asyncio.StreamReader, writer: asyncio.StreamWriter) -> None:
         try:
             header = json.loads(await asyncio.wait_for(reader.readline(), 10))
             host, ip, port = header.get("host"), header.get("dst", ""), int(header.get("port", 0))
-            decision = self.policy.connect(host, ip, port)
+            conn = Conn(host, ip, port)
+            decision, entry = self.policy.match(host, ip, port)
             approval_id, approval_status = None, None
             if decision == "deny" and self.ask is not None:
                 approved, approval_id, approval_status = await self.ask("connect", host=host, ip=ip, port=port)
                 if approved:
-                    decision = self.policy.connect(host, ip, port)  # a session/always grant is in the policy now
-                    if decision == "deny":
-                        decision = "pass"  # approved once
+                    # A session/always grant is in the policy now
+                    decision, entry = self.policy.match(host, ip, port)
+                    if decision == "deny":  # approved once
+                        decision = "pass"
+                        conn.via = (Grant("once", approval_id), {"host": host or ip, "ports": [port]})
+            if entry is not None and entry.grant is not None:
+                conn.via = (entry.grant, entry.summary())
             self.audit(event="connect", host=host, ip=ip, port=port, decision=decision, approval=approval_id)
             if decision == "pass":
+                if conn.via is not None:  # nothing more to see: report it now
+                    self.grant_used(conn, "connect", *conn.via)
                 await self._pass(reader, writer, host or ip, port)
             elif decision == "intercept":
-                await self._intercept(reader, writer, host, port)
+                await self._intercept(reader, writer, conn)
             else:
                 await self._explain(reader, writer, host, ip, port, approval_id, approval_status)
         except (asyncio.TimeoutError, ValueError, ConnectionError, OSError) as e:
@@ -259,7 +307,8 @@ class EgressProxy:
         writer.write(ACCEPT)
         await _splice(reader, writer, up_reader, up_writer)
 
-    async def _intercept(self, reader, writer, host: str, port: int) -> None:
+    async def _intercept(self, reader, writer, conn: Conn) -> None:
+        host, port = conn.host, conn.port
         # Learn what the real server speaks first, then let the sandbox choose
         # among those; the upstream connection used matches the sandbox's choice.
         try:
@@ -286,7 +335,7 @@ class EgressProxy:
             if proto == "h2":
                 from agentd.egress.http2 import bridge_h2
 
-                await bridge_h2(self, host, reader, writer, up_reader, up_writer)
+                await bridge_h2(self, host, reader, writer, up_reader, up_writer, conn)
                 return
             if upstream_h2:  # the sandbox wants HTTP/1.1: reconnect upstream to match
                 up_writer.close()
@@ -296,7 +345,7 @@ class EgressProxy:
                 except (OSError, asyncio.TimeoutError, ssl.SSLError) as e:
                     self.audit(event="upstream_failed", host=host, port=port, error=str(e)[:200] or type(e).__name__)
                     return
-            await self._http1(host, reader, writer, up_reader, up_writer)
+            await self._http1(conn, reader, writer, up_reader, up_writer)
         finally:
             up_writer.close()
 
@@ -305,9 +354,12 @@ class EgressProxy:
     # ------------------------------------------------------------------ #
 
     def inject(self, host: str, method: str, path: str, headers: list[tuple[bytes, bytes]],
-               once: frozenset[str] = frozenset()) -> tuple[list[tuple[bytes, bytes]], list[str]]:
+               once: frozenset[str] = frozenset(), *, grants: list | None = None,
+               once_grant: tuple[Grant, dict] | None = None) -> tuple[list[tuple[bytes, bytes]], list[str]]:
         """Swap placeholders for secrets where a rule allows it (or ``once``
-        allows it for this request); Refused otherwise."""
+        allows it for this request); Refused otherwise. ``grants`` collects
+        (grant, rule, secret) for each secret filled because of an approval
+        (``once_grant``: the one behind ``once``)."""
         rules = self.policy.rules_for(host)
         used: list[str] = []
         out = []
@@ -330,6 +382,11 @@ class EgressProxy:
                                    "rules": allowed})
                 value = value.replace(bph, self.secrets[secret].encode())
                 used.append(secret)
+                if grants is not None:
+                    if rule is not None and rule.grant is not None:
+                        grants.append((rule.grant, rule.summary(), secret))
+                    elif rule is None and once_grant is not None:
+                        grants.append((*once_grant, secret))
                 if rule is not None:
                     self.policy.use(rule)
             out.append((name, value))
@@ -378,12 +435,13 @@ class EgressProxy:
                 e.approval_id, e.approval_status = approval_id, status
                 raise e
 
-    async def inject_or_ask(self, host: str, method: str, path: str, headers: list[tuple[bytes, bytes]]):
+    async def inject_or_ask(self, host: str, method: str, path: str, headers: list[tuple[bytes, bytes]],
+                            grants: list | None = None):
         """inject(), and when refused, hold for an approval: (headers, used) or Refused (with .approval_id
-        and .approval_status)."""
+        and .approval_status). ``grants``: as for inject()."""
         await self._load_needed(host, method, path, headers)
         try:
-            return self.inject(host, method, path, headers)
+            return self.inject(host, method, path, headers, grants=grants)
         except Refused as e:
             if self.ask is None or e.detail.get("unavailable"):
                 raise
@@ -392,11 +450,15 @@ class EgressProxy:
             if approved:
                 once = frozenset({e.detail["secret"]})
                 await self._load_needed(host, method, path, headers, once)
-                return self.inject(host, method, path, headers, once=once)
+                rule = {"secret": e.detail["secret"], "host": host, "header": e.detail.get("header"),
+                        "methods": [method], "paths": [path.split("?", 1)[0]]}
+                return self.inject(host, method, path, headers, once=once, grants=grants,
+                                   once_grant=(Grant(status, approval_id), rule))
             e.approval_id, e.approval_status = approval_id, status
             raise
 
-    async def _http1(self, host: str, reader, writer, up_reader, up_writer) -> None:
+    async def _http1(self, conn: Conn, reader, writer, up_reader, up_writer) -> None:
+        host = conn.host
         down = h11.Connection(h11.SERVER)
         up = h11.Connection(h11.CLIENT)
 
@@ -414,8 +476,9 @@ class EgressProxy:
                 return  # ConnectionClosed or a protocol error
             method = event.method.decode()
             path = event.target.decode("latin-1")
+            grants: list = []
             try:
-                headers, used = await self.inject_or_ask(host, method, path, list(event.headers))
+                headers, used = await self.inject_or_ask(host, method, path, list(event.headers), grants)
             except Refused as e:
                 approval_id = getattr(e, "approval_id", None)
                 self.audit(event="refused", host=host, method=method, path=path.split("?", 1)[0],
@@ -427,6 +490,7 @@ class EgressProxy:
                 await writer.drain()
                 return
             self.audit(event="request", host=host, method=method, path=path.split("?", 1)[0], secrets=used)
+            self.requested(conn, method, path, grants)
             # Responses must stay scrubbable: no compression from the server.
             headers = [(n, v) for n, v in headers if n.lower() not in (b"accept-encoding", b"expect")]
             headers.append((b"accept-encoding", b"identity"))

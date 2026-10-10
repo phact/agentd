@@ -72,7 +72,7 @@ def _drain(side: _Side, sid: int) -> None:
     side.pending.pop(sid, None)
 
 
-async def bridge_h2(proxy: "EgressProxy", host: str, down_r, down_w, up_r, up_w) -> None:
+async def bridge_h2(proxy: "EgressProxy", host: str, down_r, down_w, up_r, up_w, conn=None) -> None:
     from agentd.egress.proxy import Refused, Scrubber
 
     down = _Side(h2.connection.H2Connection(h2.config.H2Configuration(
@@ -120,8 +120,9 @@ async def bridge_h2(proxy: "EgressProxy", host: str, down_r, down_w, up_r, up_w)
                         method = pseudo.get(b":method", b"GET").decode()
                         path = pseudo.get(b":path", b"/").decode("latin-1")
                         regular = [(k, v) for k, v in hdrs if not k.startswith(b":")]
+                        grants: list = []
                         try:
-                            regular, used = await proxy.inject_or_ask(host, method, path, regular)
+                            regular, used = await proxy.inject_or_ask(host, method, path, regular, grants)
                         except Refused as e:
                             approval_id = getattr(e, "approval_id", None)
                             proxy.audit(event="refused", host=host, method=method, path=path.split("?", 1)[0],
@@ -135,6 +136,8 @@ async def bridge_h2(proxy: "EgressProxy", host: str, down_r, down_w, up_r, up_w)
                             continue
                         proxy.audit(event="request", host=host, method=method, path=path.split("?", 1)[0],
                                     secrets=used, http="2")
+                        if conn is not None:
+                            proxy.requested(conn, method, path, grants)
                         regular = [(k, v) for k, v in regular if k.lower() != b"accept-encoding"]
                         regular.append((b"accept-encoding", b"identity"))
                         usid = up.conn.get_next_available_stream_id()

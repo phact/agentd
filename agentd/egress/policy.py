@@ -41,6 +41,14 @@ DEFAULT_PORTS = (443, 80)
 
 
 @dataclass(frozen=True)
+class Grant:
+    """The approval behind a policy entry: its id (None for an "always" rule
+    saved in allow.toml by an earlier run) and decision."""
+    decision: str                     # once | session | always
+    approval: str | None = None
+
+
+@dataclass(frozen=True)
 class SecretRule:
     secret: str
     domain: str
@@ -49,12 +57,17 @@ class SecretRule:
     paths: tuple[str, ...] = ()       # globs; empty: any
     placeholder: str | None = None
     port: int = 443                   # fnox rules are HTTPS on 443
+    grant: Grant | None = field(default=None, compare=False)  # None: from the fnox config
 
     def matches(self, method: str, path: str) -> bool:
         if self.methods and method.upper() not in self.methods:
             return False
         path = path.split("?", 1)[0]
         return not self.paths or any(_glob(p, path) for p in self.paths)
+
+    def summary(self) -> dict[str, Any]:
+        return {"secret": self.secret, "host": self.domain, "header": self.header,
+                "methods": list(self.methods), "paths": list(self.paths)}
 
     def describe(self) -> str:
         return (f"{self.secret} -> {self.domain} methods={','.join(self.methods) or '*'} "
@@ -71,13 +84,17 @@ def _glob(pattern: str, path: str) -> bool:
 class Allow:
     host: str                 # exact name, "*.suffix", or an IP literal
     ports: tuple[int, ...]    # ports allowed
+    grant: Grant | None = field(default=None, compare=False)  # None: from Egress(allow=...)
 
     @classmethod
-    def parse(cls, spec: str) -> "Allow":
+    def parse(cls, spec: str, grant: Grant | None = None) -> "Allow":
         host, _, port = spec.rpartition(":") if spec.count(":") == 1 else (spec, "", "")
         if not port:
-            return cls(spec.lower(), DEFAULT_PORTS)
-        return cls(host.lower(), (int(port),))
+            return cls(spec.lower(), DEFAULT_PORTS, grant)
+        return cls(host.lower(), (int(port),), grant)
+
+    def summary(self) -> dict[str, Any]:
+        return {"host": self.host, "ports": list(self.ports)}
 
     def matches(self, host: str | None, ip: str, port: int) -> bool:
         if port not in self.ports:
@@ -107,15 +124,25 @@ class Policy:
 
     def connect(self, host: str | None, ip: str, port: int) -> str:
         """"intercept" | "pass" | "deny" for a new connection."""
-        if self.rules_for(host, port):
-            return "intercept"
-        if any(a.matches(host, ip, port) for a in self.allows):
-            return "pass"
+        return self.match(host, ip, port)[0]
+
+    def match(self, host: str | None, ip: str, port: int) -> tuple[str, Allow | SecretRule | None]:
+        """connect()'s decision and the entry behind it when that's a grant (an
+        approval's): the Allow, or for "intercept", a rule when only granted rules
+        and allowances reach the host."""
+        rules = self.rules_for(host, port)
+        if rules:
+            granted = all(r.grant for r in rules) and not any(
+                a.grant is None and a.matches(host, ip, port) for a in self.allows)
+            return "intercept", rules[0] if granted else None
+        for a in self.allows:
+            if a.matches(host, ip, port):
+                return "pass", a
         for i, a in enumerate(self.once_allows):
             if a.matches(host, ip, port):
                 del self.once_allows[i]
-                return "pass"
-        return "deny"
+                return "pass", a
+        return "deny", None
 
 
 # --------------------------------------------------------------------------- #

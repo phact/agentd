@@ -4,6 +4,7 @@ the signed webhook, the proxy holding requests while an approver decides,
 and agentd serve's approval endpoints.
 """
 import asyncio
+import dataclasses
 import hashlib
 import hmac
 import json
@@ -18,7 +19,7 @@ from agentd.egress import policy as pol
 from agentd.egress import proxy as px
 from agentd.egress.approvals import Approvals
 from agentd.egress.ca import SessionCA
-from agentd.egress.policy import Policy, SecretRule
+from agentd.egress.policy import Grant, Policy, SecretRule
 from agentd.egress.proxy import EgressProxy
 from test.test_egress import REAL, Guest, _request, _upstream
 
@@ -336,4 +337,222 @@ def test_list_secrets_and_use_one_without_a_rule(tmp_path):
             for name in ("list_secrets", "request_access", "access_status"):
                 FUNCTION_REGISTRY.pop(name, None)
                 SCHEMA_REGISTRY.pop(name, None)
+    asyncio.run(main())
+
+
+def test_grants_used_are_reported(monkeypatch, tmp_path):
+    """What an approval let through is reported once per connection and grant;
+    what the config allows isn't."""
+    async def main():
+        seen = []
+        runner, port, test_ca = await _upstream(seen)
+        monkeypatch.setattr(px, "_UPSTREAM_CA", test_ca.pem.decode())
+        sock = Path(tempfile.mkdtemp(dir="/tmp", prefix="gu-")) / "s.sock"
+        ph, other_ph = pol.make_placeholder(REAL), pol.make_placeholder("other-real-value")
+        ca = SessionCA()
+        policy = Policy(rules=[SecretRule("CFG", "localhost", methods=("GET",), port=port)])
+        reports = []
+        a = Approvals(hold=1.0, allow_file=tmp_path / "allow.toml", webhook="http://hook.invalid/",
+                      on_grant_used=reports.append)
+        posted = []
+
+        async def post(body):
+            posted.append(json.loads(body))
+        monkeypatch.setattr(a, "_post", post)
+        egress = FakeEgress("s1", {"TOKEN": ph, "CFG": other_ph})
+        proxy = EgressProxy(sock, policy, secrets={"TOKEN": REAL, "CFG": "other-real-value"},
+                            placeholders={"TOKEN": ph, "CFG": other_ph}, ca=ca, ask=a.asker(egress, policy),
+                            session="s1", report=a.grant_used)
+        await proxy.start()
+
+        async def decide_soon(kind, decision):
+            for _ in range(100):
+                pending = [x for x in a.list(pending_only=True) if x.kind == kind]
+                if pending:
+                    a.decide(pending[0].id, decision)
+                    return pending[0]
+                await asyncio.sleep(0.02)
+
+        def auth(p):
+            return f"Authorization: Bearer {p}\r\n".encode()
+        try:
+            guest = Guest(sock, ca.pem)
+            # The config's rule: nothing to report.
+            reader, writer = await guest.connect("localhost", port)
+            head, _ = await _request(reader, writer, "GET", "/cfg", auth(other_ph))
+            assert b"200" in head.split(b"\r\n")[0] and reports == []
+
+            # Approved for the session while held: reported once on this connection...
+            decider = asyncio.ensure_future(decide_soon("secret", "session"))
+            head, _ = await _request(reader, writer, "POST", "/ok/new?q=secret", auth(ph))
+            approval = await decider
+            assert b"200" in head.split(b"\r\n")[0]
+            r = reports[-1]
+            assert r["kind"] == "secret" and r["session"] == "s1" and r["secret"] == "TOKEN"
+            assert r["grant"] == {"approval": approval.id, "decision": "session", "rule": {
+                "secret": "TOKEN", "host": "localhost", "header": "authorization", "methods": ["POST"],
+                "paths": ["/ok/new"]}}
+            assert (r["host"], r["port"], r["method"], r["path"]) == ("localhost", port, "POST", "/ok/new")
+            assert "ts" in r and posted[-1] == {"type": "grant.used", **r}
+            await _request(reader, writer, "POST", "/ok/new", auth(ph))
+            assert len(reports) == 1, "one report per connection"
+            writer.close()
+            # ...and again on the next connection.
+            reader, writer = await guest.connect("localhost", port)
+            await _request(reader, writer, "POST", "/ok/new", auth(ph))
+            assert len(reports) == 2 and reports[-1]["grant"]["approval"] == approval.id
+            writer.close()
+
+            # Approved once while held: the "once" grant is the approval.
+            reader, writer = await guest.connect("localhost", port)
+            decider = asyncio.ensure_future(decide_soon("secret", "once"))
+            head, _ = await _request(reader, writer, "DELETE", "/ok/x", auth(ph))
+            once = await decider
+            assert b"200" in head.split(b"\r\n")[0]
+            assert reports[-1]["grant"]["approval"] == once.id and reports[-1]["grant"]["decision"] == "once"
+            assert reports[-1]["method"] == "DELETE"
+            writer.close()
+
+            # A connection let through by a connect approval: reported when it's made (nothing to see inside).
+            policy.rules.clear()
+            plain = Guest(sock, test_ca.pem)
+            decider = asyncio.ensure_future(decide_soon("connect", "once"))
+            res = await plain.connect("localhost", port)
+            conn_once = await decider
+            assert res is not None and reports[-1]["kind"] == "connect"
+            assert reports[-1]["grant"] == {"approval": conn_once.id, "decision": "once",
+                                            "rule": {"host": "localhost", "ports": [port]}}
+            assert "method" not in reports[-1]
+            res[1].close()
+            decider = asyncio.ensure_future(decide_soon("connect", "always"))
+            res = await plain.connect("localhost", port)
+            always = await decider
+            assert reports[-1]["grant"]["approval"] == always.id and reports[-1]["grant"]["decision"] == "always"
+            res[1].close()
+        finally:
+            await proxy.stop()
+
+        # A later run: the saved "always" rules are reported by rule (no approval id).
+        policy2 = Policy()
+        reports.clear()
+        a2 = Approvals(hold=1.0, allow_file=tmp_path / "allow.toml", on_grant_used=reports.append)
+        a2.decide(a2.request("secret", "s2", {"secret": "TOKEN", "host": "localhost", "method": "GET",
+                                              "path": "/saved", "header": "authorization"}).id, "always")
+        a3 = Approvals(hold=1.0, allow_file=tmp_path / "allow.toml", on_grant_used=reports.append)
+        proxy = EgressProxy(sock, policy2, secrets={"TOKEN": REAL}, placeholders={"TOKEN": ph}, ca=ca,
+                            ask=a3.asker(FakeEgress("s3", {"TOKEN": ph}), policy2), session="s3",
+                            report=a3.grant_used)
+        await proxy.start()
+        try:
+            plain = Guest(sock, test_ca.pem)
+            res = await plain.connect("localhost", port)
+            assert reports[-1]["grant"] == {"approval": None, "decision": "always",
+                                            "rule": {"host": "localhost", "ports": [port]}}
+            res[1].close()
+            policy2.allows.clear()
+            # Saved rules are for port 443: move it to the test server's.
+            assert policy2.rules[0].grant == Grant("always")
+            policy2.rules[0] = dataclasses.replace(policy2.rules[0], port=port)
+            # Reached only through a granted secret rule: a request without the secret reports the rule.
+            reader, writer = await Guest(sock, ca.pem).connect("localhost", port)
+            head, _ = await _request(reader, writer, "GET", "/plain", b"")
+            assert b"200" in head.split(b"\r\n")[0]
+            assert reports[-1]["kind"] == "connect" and reports[-1]["path"] == "/plain"
+            assert reports[-1]["grant"]["rule"]["secret"] == "TOKEN" and reports[-1]["grant"]["approval"] is None
+            head, _ = await _request(reader, writer, "GET", "/saved", auth(ph))
+            assert reports[-1]["kind"] == "connect", "the same grant: already reported on this connection"
+            writer.close()
+            reader, writer = await Guest(sock, ca.pem).connect("localhost", port)
+            await _request(reader, writer, "GET", "/saved", auth(ph))
+            assert reports[-1]["kind"] == "secret" and reports[-1]["secret"] == "TOKEN"
+            writer.close()
+        finally:
+            await proxy.stop()
+            await runner.cleanup()
+    asyncio.run(main())
+
+
+async def _h2_upstream(test_ca):
+    """A local HTTP/2-only HTTPS server: 200 with the request's path for every request."""
+    import h2.config
+    import h2.connection
+    import h2.events
+
+    async def serve(reader, writer):
+        conn = h2.connection.H2Connection(h2.config.H2Configuration(client_side=False))
+        conn.initiate_connection()
+        writer.write(conn.data_to_send())
+        while data := await reader.read(65536):
+            for ev in conn.receive_data(data):
+                if isinstance(ev, h2.events.RequestReceived):
+                    path = dict(ev.headers)[b":path"]
+                    conn.send_headers(ev.stream_id, [(b":status", b"200"),
+                                                     (b"content-length", str(len(path)).encode())])
+                    conn.send_data(ev.stream_id, path, end_stream=True)
+            writer.write(conn.data_to_send())
+            await writer.drain()
+
+    server = await asyncio.start_server(serve, "127.0.0.1", 0, ssl=test_ca.server_context("localhost", ("h2",)))
+    return server, server.sockets[0].getsockname()[1]
+
+
+async def _h2_get(reader, writer, paths, headers=()):
+    """GET each path on one HTTP/2 connection; the statuses."""
+    import h2.config
+    import h2.connection
+    import h2.events
+
+    conn = h2.connection.H2Connection(h2.config.H2Configuration(client_side=True))
+    conn.initiate_connection()
+    statuses = {}
+    for path in paths:
+        sid = conn.get_next_available_stream_id()
+        conn.send_headers(sid, [(b":method", b"GET"), (b":path", path.encode()), (b":scheme", b"https"),
+                                (b":authority", b"localhost"), *headers], end_stream=True)
+        writer.write(conn.data_to_send())
+        await writer.drain()
+        while sid not in statuses or statuses[sid][1] is False:
+            data = await asyncio.wait_for(reader.read(65536), 5)
+            assert data, "connection closed"
+            for ev in conn.receive_data(data):
+                if isinstance(ev, h2.events.ResponseReceived):
+                    statuses[ev.stream_id] = (dict(ev.headers)[b":status"], False)
+                elif isinstance(ev, h2.events.StreamEnded):
+                    statuses[ev.stream_id] = (statuses[ev.stream_id][0], True)
+            writer.write(conn.data_to_send())
+    return [s for s, _ in statuses.values()]
+
+
+def test_grants_used_over_http2(monkeypatch, tmp_path):
+    async def main():
+        test_ca = SessionCA("test upstream CA")
+        server, port = await _h2_upstream(test_ca)
+        monkeypatch.setattr(px, "_UPSTREAM_CA", test_ca.pem.decode())
+        sock = Path(tempfile.mkdtemp(dir="/tmp", prefix="g2-")) / "s.sock"
+        ph = pol.make_placeholder(REAL)
+        ca = SessionCA()
+        reports = []
+        a = Approvals(hold=1.0, allow_file=tmp_path / "allow.toml", on_grant_used=reports.append)
+        policy = Policy()
+        a.asker(FakeEgress("s1", {"TOKEN": ph}), policy)
+        approval = a.request("secret", "s1", {"secret": "TOKEN", "host": "localhost", "method": "GET",
+                                              "path": "/a", "header": "authorization"})
+        a.decide(approval.id, "session")
+        policy.rules[0] = dataclasses.replace(policy.rules[0], port=port)
+        proxy = EgressProxy(sock, policy, secrets={"TOKEN": REAL}, placeholders={"TOKEN": ph}, ca=ca,
+                            ask=None, session="s1", report=a.grant_used)
+        await proxy.start()
+        try:
+            reader, writer = await Guest(sock, ca.pem).connect("localhost", port, alpn=("h2",))
+            assert writer.get_extra_info("ssl_object").selected_alpn_protocol() == "h2"
+            statuses = await _h2_get(reader, writer, ["/a?x=1", "/a"],
+                                     [(b"authorization", f"Bearer {ph}".encode())])
+            assert statuses == [b"200", b"200"]
+            assert len(reports) == 1, reports
+            assert reports[0]["kind"] == "secret" and reports[0]["path"] == "/a" and reports[0]["method"] == "GET"
+            assert reports[0]["grant"]["approval"] == approval.id
+            writer.close()
+        finally:
+            await proxy.stop()
+            server.close()
     asyncio.run(main())

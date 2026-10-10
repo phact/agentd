@@ -23,6 +23,19 @@ Decisions (``agentd serve``: ``POST /v1/approvals/{id}``, or :meth:`decide`):
 (persisted in ``~/.agentd/egress/allow.toml``: host allowances, secret rules
 and browser logins; not in the fnox config, whose contents are part of fnox's
 cache key, so editing it would re-lock every unlocked secret), or ``deny``.
+
+Each connection let through, or secret filled in, because of an approval is
+reported once per connection: a ``grant.used`` webhook event and the
+``on_grant_used`` callback (called on the proxy's loop) get::
+
+    {"type": "grant.used", "session": ..., "ts": ..., "kind": "connect" | "secret",
+     "grant": {"approval": "apr_..." | null, "decision": "once" | "session" | "always",
+               "rule": {"host", "ports"} | {"secret", "host", "header", "methods", "paths"}},
+     "host": ..., "ip": ..., "port": ..., "method": ..., "path": ..., "secret": ...}
+
+``approval`` is null for an "always" rule saved by an earlier run (the rule
+says which). ``method`` and ``path`` (no query) are there when the proxy sees
+them: intercepted HTTPS, not connections passed through untouched.
 """
 from __future__ import annotations
 
@@ -38,7 +51,7 @@ from pathlib import Path
 from typing import TYPE_CHECKING, Any, Callable
 
 from agentd import fnox
-from agentd.egress.policy import Allow, Policy, SecretRule
+from agentd.egress.policy import Allow, Grant, Policy, SecretRule
 from agentd.sandbox.base import DEFAULT_HOME
 
 if TYPE_CHECKING:
@@ -68,8 +81,10 @@ class Approval:
 
 class Approvals:
     def __init__(self, webhook: str | None = None, *, secret: str | None = None, hold: float = 25.0,
-                 expire: float = 3600.0, answer_url: str | None = None, allow_file: Path = ALLOW_FILE):
+                 expire: float = 3600.0, answer_url: str | None = None, allow_file: Path = ALLOW_FILE,
+                 on_grant_used: Callable[[dict[str, Any]], None] | None = None):
         self.webhook = webhook
+        self.on_grant_used = on_grant_used
         self.secret = (secret or os.environ.get("AGENTD_WEBHOOK_SECRET") or "").encode()
         self.hold = hold
         self.expire = expire
@@ -115,7 +130,8 @@ class Approvals:
             if isinstance(r, dict) and r.get("secret") and r.get("domain"):
                 rules.append(SecretRule(secret=r["secret"], domain=str(r["domain"]).lower(),
                                         header=str(r.get("header", "authorization")).lower(),
-                                        methods=tuple(r.get("methods") or ()), paths=tuple(r.get("paths") or ())))
+                                        methods=tuple(r.get("methods") or ()), paths=tuple(r.get("paths") or ()),
+                                        grant=Grant("always")))
         return rules
 
     def _save(self, key: str, value: str | dict) -> None:
@@ -140,7 +156,7 @@ class Approvals:
     def asker(self, egress: "EgressSession", policy: Policy):
         """The proxy's hook for one session: ``await ask(kind, **details) -> (approved, approval id, status)``."""
         self._sessions[egress.session] = (egress, policy)
-        policy.allows.extend(Allow.parse(s) for s in self.saved_allows())
+        policy.allows.extend(Allow.parse(s, Grant("always")) for s in self.saved_allows())
         policy.rules.extend(r for r in self.saved_rules() if r.secret in egress.placeholders)
 
         async def ask(kind: str, **details: Any) -> tuple[bool, str]:
@@ -268,16 +284,17 @@ class Approvals:
             if persist:
                 self._save("browser_sites", d["site"])
             return
+        grant = Grant("once" if once else approval.status, approval.id)
         if approval.kind == "connect":
             spec = f"{d.get('host') or d.get('ip')}:{d['port']}"
             for _, policy in targets:
-                (policy.once_allows if once else policy.allows).append(Allow.parse(spec))
+                (policy.once_allows if once else policy.allows).append(Allow.parse(spec, grant))
             if persist:
                 self._save_allow(spec)
         elif approval.kind == "secret":
             rule = SecretRule(secret=d["secret"], domain=d["host"], header=d.get("header", "authorization"),
                               methods=(d["method"],) if d.get("method") else (),
-                              paths=(d["path"].split("?", 1)[0],) if d.get("path") else ())
+                              paths=(d["path"].split("?", 1)[0],) if d.get("path") else (), grant=grant)
             for egress, policy in targets:
                 if rule.secret in egress.placeholders:
                     (policy.once_rules if once else policy.rules).append(rule)
@@ -330,6 +347,16 @@ class Approvals:
     # ------------------------------------------------------------------ #
     # Webhook
     # ------------------------------------------------------------------ #
+
+    def grant_used(self, event: dict[str, Any]) -> None:
+        """The egress proxy's report of a connection or secret an approval let through."""
+        if self.on_grant_used is not None:
+            try:
+                self.on_grant_used(event)
+            except Exception:  # noqa: BLE001
+                logger.exception("on_grant_used failed")
+        if self.webhook:
+            asyncio.get_running_loop().create_task(self._post(json.dumps({"type": "grant.used", **event}).encode()))
 
     def sign(self, body: bytes) -> str:
         return "sha256=" + hmac.new(self.secret, body, hashlib.sha256).hexdigest()

@@ -19,7 +19,7 @@ from typing import Any
 
 from agentd import fnox
 from agentd.egress.ca import SessionCA
-from agentd.egress.policy import (Allow, Policy, SecretRule, fnox_config_files, fnox_get, load_rules,
+from agentd.egress.policy import (Allow, Grant, Policy, SecretRule, fnox_config_files, fnox_get, load_rules,
                                   load_secret_names, make_placeholder, opaque_placeholder)
 from agentd.egress.proxy import EgressProxy
 from agentd.fnox import SecretMissing
@@ -117,7 +117,8 @@ class EgressSession:
             ask = e.approvals.asker(self, policy)
         self.proxy = EgressProxy(self.socket_path, policy, secrets=secrets, placeholders=self.placeholders,
                                  ca=self.ca, audit_path=e.audit, session=self.session, ask=ask,
-                                 load=self._load if e.fnox else None)
+                                 load=self._load if e.fnox else None,
+                                 report=e.approvals.grant_used if e.approvals is not None else None)
         await self.proxy.start()
 
     async def _load(self, name: str) -> None:
@@ -177,4 +178,4 @@ class EgressSession:
         return script, self.ca.pem
 
 
-__all__ = ["Egress", "EgressSession", "EgressProxy", "Policy", "SecretRule", "Allow"]
+__all__ = ["Egress", "EgressSession", "EgressProxy", "Policy", "SecretRule", "Allow", "Grant"]

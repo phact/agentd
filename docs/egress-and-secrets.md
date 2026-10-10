@@ -24,6 +24,7 @@ executor = KrunExecutor(egress=Egress(
 - **Allowed hosts pass through untouched** (the server sees the client's own TLS); raw TCP by host and port (`github.com:22`). Everything else is refused: HTTPS and HTTP get a 403 explaining why.
 - **Approvals:** with `approvals=`, a blocked connection or a secret used outside its rule is announced to your webhook (signed, `X-Agentd-Signature`) and held ~25 s while an approver decides (`agentd serve`: `POST /v1/approvals/{id}` with `once`, `session`, `always` or `deny`). Not decided in time: the agent gets a 403 (`error.type` `agentd_egress`, `error.approval` with the id, `status: "pending"` and `retry_after`; `status: "deny"` if the human refused) and retries. Clients need a timeout of at least the hold + 15 s. `once` decided with nothing held (asked ahead with `request_access`, or after the hold ran out) lets the next matching request through, once. `always` saves the grant in `~/.agentd/egress/allow.toml` (host allowances, `[[secret_rules]]`, browser logins), which later sessions load; agentd never edits the fnox config, because fnox's daemon keys its cache on the config's contents and an edit would re-lock every unlocked secret. Rules you write yourself in fnox's `[proxy.rules]` still apply. Agents can ask ahead with the `request_access` skill (`agentd.egress.approvals.enable_access_skill`), and see what they can ask for with `list_secrets`: every secret in the fnox config (or just `Egress(secrets=[...])`) by name and description, the env var holding its placeholder, and the rules that let it be sent now; never values. A secret with no rule is read from fnox only once a rule or approval lets it be sent. Requests nobody decides expire after `expire` seconds (default 1 h); the `request_access`, `request_phone` and `request_browser` descriptions tell the agent so, and `request_access`'s also gives the hold, that client timeout and what the 403 means.
 - **Audit log** of every decision: `~/.agentd/egress/audit.jsonl` (never header values or bodies).
+- **Grants used:** each connection let through, or secret filled in, because of an approval is reported once per connection: a `grant.used` webhook event, and `Approvals(on_grant_used=...)` (called on the proxy's loop), with the session, time, `kind` (`connect` or `secret`), the grant (`approval` id, `decision`, and the `rule`: host and ports, or secret, host, header, methods and paths; `approval` is null for an "always" rule saved by an earlier run), the host, ip and port, and the method and path (no query) when the proxy sees them (not for connections passed through untouched). Also in the audit log as `grant_used`. What the config allows (`Egress(allow=...)`, fnox's `[proxy.rules]`) isn't reported.
 - **Docker sandboxes have no network** (`--network none`); egress is libkrun-only for now.
 
 Setup: `agentd/sandbox/build.sh` builds `agentd-net` (needs cargo); `agentd-sandbox colima setup` / `linux setup` build libkrun with networking.
@@ -184,6 +185,9 @@ decision. Never header values or bodies.
   the workspace; optionally time-limited (a lease).
   "Once" applies to the held request, or when none is held (asked ahead,
   or the hold ran out) to the next matching request: a single-use rule.
+- Each use of a grant is reported (`grant.used`, once per connection and
+  grant: the approval id, or for a saved "always" rule the rule, plus host,
+  method and path when visible), so an app can tie it to the turn in progress.
 - Named rule presets ("github: read-only", "github: this repo, write") so
   rules are picked, not written.
 
