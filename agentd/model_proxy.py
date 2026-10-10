@@ -264,7 +264,8 @@ class ModelProxy:
         socket_path: str | Path,
         credentials: Credentials,
         upstream: str = ANTHROPIC_API,
-        allowed_prefixes: tuple[str, ...] = ("/v1/", "/api/hello"),
+        allowed_prefixes: tuple[str, ...] = ("/v1/messages", "/v1/models", "/api/hello"),
+        blocked_prefixes: tuple[str, ...] = ("/v1/messages/batches",),
         ssl_context=None,
         responses_via_chat: str | None = None,
     ):
@@ -279,6 +280,7 @@ class ModelProxy:
         self.credentials = credentials
         self.upstream = upstream.rstrip("/")
         self.allowed_prefixes = allowed_prefixes
+        self.blocked_prefixes = blocked_prefixes
         self.ssl_context = ssl_context
         self._runner: web.AppRunner | None = None
         self._session: aiohttp.ClientSession | None = None
@@ -405,7 +407,7 @@ class ModelProxy:
         if request.headers.get("upgrade", "").lower() == "websocket":
             # Not proxied (yet); clients such as Codex fall back to HTTP streaming.
             return web.json_response({"error": "websocket transport not supported by agentd proxy"}, status=426)
-        if not path.startswith(self.allowed_prefixes):
+        if not path.startswith(self.allowed_prefixes) or path.startswith(self.blocked_prefixes):
             logger.warning("model proxy: blocked %s %s", request.method, path)
             return web.json_response({"error": f"path {path} not allowed"}, status=403)
         if self.responses_via_chat and request.method == "POST" and path.rstrip("/").endswith("/responses"):

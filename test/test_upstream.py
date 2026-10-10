@@ -178,3 +178,35 @@ def test_live_codex_on_a_chat_upstream():
         assert seen[0]["body"]["model"] == "test-model"
     finally:
         loop.call_soon_threadsafe(loop.stop)
+
+
+def test_anthropic_proxy_only_forwards_model_calls():
+    async def main():
+        seen = []
+
+        async def any_path(request):
+            seen.append(request.path)
+            return web.json_response({})
+        app = web.Application()
+        app.router.add_route("*", "/{path:.*}", any_path)
+        runner = web.AppRunner(app)
+        await runner.setup()
+        port = _free_port()
+        await web.TCPSite(runner, "127.0.0.1", port).start()
+        sock = Path(tempfile.mkdtemp(dir="/tmp")) / "p.sock"
+        proxy = ModelProxy(sock, BearerCredentials("host-key"), f"http://127.0.0.1:{port}")
+        await proxy.start()
+        try:
+            async with aiohttp.ClientSession(connector=aiohttp.UnixConnector(path=str(sock))) as http:
+                for path, status in [("/v1/messages?beta=true", 200), ("/v1/messages/count_tokens", 200),
+                                     ("/v1/models", 200), ("/v1/messages/batches", 403), ("/v1/files", 403),
+                                     ("/v1/sessions", 403), ("/v1/environments", 403), ("/v1/skills", 403)]:
+                    async with http.post("http://x" + path, json={}) as r:
+                        assert r.status == status, path
+            assert seen == ["/v1/messages", "/v1/messages/count_tokens", "/v1/models"]
+        finally:
+            await proxy.stop()
+            await runner.cleanup()
+
+    asyncio.run(main())
+
