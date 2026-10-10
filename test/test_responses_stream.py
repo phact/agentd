@@ -1,5 +1,14 @@
 # test_mixed_tools.py
 
+import os
+
+import pytest
+
+# Native tool calls through LiteLLM need provider API keys (a Claude Code login
+# can't serve them: the claude CLI route returns text only).
+if not os.environ.get("OPENAI_API_KEY"):
+    pytest.skip("needs OPENAI_API_KEY (native tool calls)", allow_module_level=True)
+
 import json
 import os
 import shutil

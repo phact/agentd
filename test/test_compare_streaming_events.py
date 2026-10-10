@@ -3,6 +3,12 @@
 import json
 import os
 import asyncio
+
+import pytest
+
+# Compares OpenAI's own streams with patched ones: needs an OpenAI key.
+if not os.environ.get("OPENAI_API_KEY"):
+    pytest.skip("needs OPENAI_API_KEY", allow_module_level=True)
 from openai import OpenAI, AsyncOpenAI
 from agentd.patch import patch_openai_with_mcp
 from agentd.tool_decorator import tool

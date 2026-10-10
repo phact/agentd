@@ -1,3 +1,12 @@
+import os
+
+import pytest
+
+# Native tool calls through LiteLLM need provider API keys (a Claude Code login
+# can't serve them: the claude CLI route returns text only).
+if not (os.environ.get("OPENAI_API_KEY") and os.environ.get("GEMINI_API_KEY")):
+    pytest.skip("needs OPENAI_API_KEY and GEMINI_API_KEY (native tool calls, embeddings)", allow_module_level=True)
+
 from agents.mcp.server import MCPServerStdio
 from agents.mcp.server import MCPServerSse
 from agentd.patch import patch_openai_with_mcp

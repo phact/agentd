@@ -1,5 +1,15 @@
 # test_mixed_tools.py
 
+import os
+
+import pytest
+
+# Native tool calls through LiteLLM need provider API keys (a Claude Code login
+# can't serve them: the claude CLI route returns text only).
+if not os.environ.get("OPENAI_API_KEY"):
+    pytest.skip("needs OPENAI_API_KEY (native tool calls)", allow_module_level=True)
+gemini = pytest.mark.skipif(not os.environ.get("GEMINI_API_KEY"), reason="needs GEMINI_API_KEY")
+
 import json
 import os
 import shutil
@@ -145,6 +155,7 @@ def test_explicit_local_only():
     )
     print_response("Explicit-Local-Only", response)
 
+@gemini
 def test_all_three_combined():
     """
     Use all three together:

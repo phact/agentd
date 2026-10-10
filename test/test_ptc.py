@@ -4,6 +4,8 @@ Test Programmatic Tool Calling (PTC).
 Run with: python test/test_ptc.py
 """
 import os
+
+import pytest
 import tempfile
 from pathlib import Path
 
@@ -11,6 +13,13 @@ from agents.mcp.server import MCPServerStdio
 from agentd.ptc import patch_openai_with_ptc, parse_code_fences, CodeFence
 from agentd.tool_decorator import tool, FUNCTION_REGISTRY, SCHEMA_REGISTRY
 from openai import OpenAI
+
+# Real model calls: Claude through your Claude Code login (the claude CLI) unless
+# ANTHROPIC_API_KEY is set; no OpenAI key needed.
+live = pytest.mark.skipif(os.environ.get("AGENTD_LIVE") != "1", reason="set AGENTD_LIVE=1 (makes real model calls)")
+# Native tool calls (bash_tool mode) need an API: the claude CLI route returns text only.
+openai_live = pytest.mark.skipif(os.environ.get("AGENTD_LIVE") != "1" or not os.environ.get("OPENAI_API_KEY"),
+                                 reason="set AGENTD_LIVE=1 and OPENAI_API_KEY (native tool calls)")
 
 
 # =============================================================================
@@ -285,6 +294,7 @@ def test_local_tools_registered():
 # Integration Test with MCP Server
 # =============================================================================
 
+@live
 def test_ptc_with_filesystem():
     """Test PTC with filesystem MCP server."""
     # Create a temporary directory for testing
@@ -303,11 +313,11 @@ def test_ptc_with_filesystem():
         )
 
         # Patch client
-        client = patch_openai_with_ptc(OpenAI(), cwd=tmpdir)
+        client = patch_openai_with_ptc(OpenAI(api_key="unused"), cwd=tmpdir)
 
         # Make a request that should trigger code fence generation
         response = client.chat.completions.create(
-            model="gpt-4o-mini",
+            model="claude-haiku-4-5",
             messages=[
                 {
                     "role": "system",
@@ -368,10 +378,11 @@ To execute code, use fenced blocks:
         print("✓ test_ptc_with_filesystem passed")
 
 
+@live
 def test_ptc_simple():
     """Simple test without MCP servers - just local tools."""
     with tempfile.TemporaryDirectory() as tmpdir:
-        client = patch_openai_with_ptc(OpenAI(), cwd=tmpdir)
+        client = patch_openai_with_ptc(OpenAI(api_key="unused"), cwd=tmpdir)
 
         response = client.chat.completions.create(
             model="anthropic/claude-haiku-4-5",
@@ -460,10 +471,11 @@ def test_skills_cli_created():
         print("✓ test_skills_cli_created passed")
 
 
+@live
 def test_skills_cli_e2e():
     """Test that an agent can use `skills list`, `skills frontmatter`, and `skills exec`."""
     with tempfile.TemporaryDirectory() as tmpdir:
-        client = patch_openai_with_ptc(OpenAI(), cwd=tmpdir)
+        client = patch_openai_with_ptc(OpenAI(api_key="unused"), cwd=tmpdir)
 
         response = client.chat.completions.create(
             model="anthropic/claude-haiku-4-5",
@@ -509,6 +521,7 @@ PYEOF
 # Test Bash Tool Mode
 # =============================================================================
 
+@openai_live
 def test_bash_tool_mode():
     """Test bash tool mode (native tool_calls interface instead of code fences)."""
     with tempfile.TemporaryDirectory() as tmpdir:
@@ -516,7 +529,7 @@ def test_bash_tool_mode():
         test_file.write_text("Hello from bash tool mode!")
 
         # Patch with bash_tool=True at patch time
-        client = patch_openai_with_ptc(OpenAI(), cwd=tmpdir, bash_tool=True)
+        client = patch_openai_with_ptc(OpenAI(api_key="unused"), cwd=tmpdir, bash_tool=True)
 
         response = client.chat.completions.create(
             model="gpt-4o-mini",
@@ -543,14 +556,15 @@ def test_bash_tool_mode():
         print("✓ test_bash_tool_mode passed")
 
 
+@live
 def test_bash_tool_mode_call_time():
     """Test bash_tool=True passed at call time (not patch time)."""
     with tempfile.TemporaryDirectory() as tmpdir:
         # Patch WITHOUT bash_tool
-        client = patch_openai_with_ptc(OpenAI(), cwd=tmpdir)
+        client = patch_openai_with_ptc(OpenAI(api_key="unused"), cwd=tmpdir)
 
         response = client.chat.completions.create(
-            model="gpt-4o-mini",
+            model="claude-haiku-4-5",
             messages=[
                 {"role": "user", "content": f"What is 2 + 2? Just answer with the number."}
             ],
