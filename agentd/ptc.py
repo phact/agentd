@@ -2582,6 +2582,7 @@ def patch_openai_with_ptc(
     bash_tool: bool = False,
     harness: str = "ptc",
     harness_options: dict[str, dict] | None = None,
+    on_unprompted=None,
 ):
     """
     Patch OpenAI client to use programmatic tool calling.
@@ -2613,6 +2614,12 @@ def patch_openai_with_ptc(
                                       "features": {"multi_agent": False}}}}
 
             (keys are the harness's fields; see agentd.harness.codex).
+        on_unprompted: Called with each turn a harness starts on its own (Claude
+            Code, when a background task finishes), as a Responses event
+            stream like ``responses.create(stream=True)``'s; its completed
+            response continues the conversation (``agentd.unprompted`` is
+            true). It may return a coroutine (scheduled). Without it, they
+            queue on the harness (``.unprompted``).
 
     Returns:
         Patched client
@@ -2631,6 +2638,7 @@ def patch_openai_with_ptc(
     client._bash_tool = bash_tool
     client._harness = harness
     client._harness_options = dict(harness_options or {})
+    client._on_unprompted = on_unprompted
     client._agentd_executor = executor  # for agentd.available(client)
     for name in client._harness_options:
         if name not in ("claude-code", "codex", "opencode", "omp"):

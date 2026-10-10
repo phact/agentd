@@ -17,6 +17,7 @@ os.environ.setdefault("AGENTD_LOG_DIR", tempfile.mkdtemp(prefix="agentd-test-log
 from agentd.harness import claude_project_dirname  # noqa: E402
 from agentd.harness.chat import HarnessConversations, render_history, run_turn, split_messages  # noqa: E402
 from agentd.harness.events import HarnessEvent  # noqa: E402
+from test.live import live, live_tmp  # noqa: E402
 
 
 class FakeHarness:
@@ -128,41 +129,6 @@ def test_claude_project_dirname():
     assert claude_project_dirname("/Users/me/my.work_space") == "-Users-me-my-work-space"
 
 
-def _live_backends():
-    from agentd.sandbox.executor import docker_available, krun_available
-
-    from agentd.sandbox.executor import colima_available
-
-    return [b for b, ok in (("krun", krun_available()), ("krun-colima", colima_available()),
-                            ("docker", docker_available())) if ok]
-
-
-@pytest.fixture(params=["krun", "krun-colima", "docker"])
-def live_executor(request):
-    """Executor factory per backend for live tests (workspaces under ~/.agentd/tmp)."""
-    from agentd.sandbox.executor import DockerExecutor, KrunExecutor
-
-    if request.param not in _live_backends():
-        pytest.skip(f"{request.param} sandbox not set up")
-    if request.param == "krun-colima":
-        return lambda **kw: KrunExecutor(colima=True, **kw)
-    return KrunExecutor if request.param == "krun" else DockerExecutor
-
-
-def live_tmp():
-    from agentd.sandbox.base import DEFAULT_HOME
-
-    (DEFAULT_HOME / "tmp").mkdir(parents=True, exist_ok=True)
-    return tempfile.TemporaryDirectory(dir=DEFAULT_HOME / "tmp")
-
-
-CLAUDE_ROOTFS = Path.home() / ".agentd" / "rootfs" / "agents"
-live = pytest.mark.skipif(
-    os.environ.get("AGENTD_LIVE") != "1",
-    reason="set AGENTD_LIVE=1 (makes real model calls)",
-)
-
-
 @live
 def test_live_claude_code_harness_resume_and_switch(live_executor):
     from openai import OpenAI
@@ -255,3 +221,63 @@ def test_live_codex_harness_resume_and_switch_with_claude_code(live_executor):
             text = r3.choices[0].message.content
             assert "HERON-7" in text and "Linux" in text
 
+
+
+@live
+def test_live_claude_code_persistent_session(live_executor):
+    """One process across turns; a background job's completion comes back as an
+    unprompted turn (Responses stream); a cancelled turn doesn't end the process."""
+    import asyncio
+
+    from openai import AsyncOpenAI
+
+    from agentd.ptc import patch_openai_with_ptc
+
+    async def main(ex, ws):
+        unprompted = []
+
+        async def on_unprompted(stream):
+            unprompted.append([e async for e in stream])
+        client = patch_openai_with_ptc(AsyncOpenAI(api_key="unused"), cwd=ws, executor=ex, harness="claude-code",
+                                       on_unprompted=on_unprompted)
+        model = "claude-sonnet-5"
+        r1 = await client.responses.create(model=model, input=(
+            "Use the Bash tool with run_in_background set to true to run `sleep 15; echo FALCON-9`. "
+            "Then reply just STARTED. When it finishes, reply with its output."))
+        harness = client._harness_objs["claude-code"]
+        proc = harness._live[r1.agentd["session_id"]]
+        r2 = await client.responses.create(model=model, previous_response_id=r1.id,
+                                           input="Reply with just the word PONG.")
+        assert "PONG" in r2.output_text and r2.agentd["session_id"] == r1.agentd["session_id"]
+
+        # Cancel a turn mid-way: interrupted, the process (and the background job) stays.
+        async def long_turn():
+            stream = await client.responses.create(model=model, previous_response_id=r2.id, stream=True,
+                                                   input="Use Bash to run `sleep 60`, then reply DONE.")
+            async for _ in stream:
+                pass
+        task = asyncio.ensure_future(long_turn())
+        await asyncio.sleep(8)
+        task.cancel()
+        r3 = await client.responses.create(model=model, previous_response_id=r2.id,
+                                           input="Reply with just the word AGAIN.")
+        assert "AGAIN" in r3.output_text and proc.alive
+
+        for _ in range(120):
+            if unprompted:
+                break
+            await asyncio.sleep(0.5)
+        done = unprompted[0][-1]
+        assert done.type == "response.completed" and done.response.agentd["unprompted"]
+        assert "FALCON-9" in done.response.output_text
+        # The conversation goes on from the unprompted turn.
+        r4 = await client.responses.create(model=model, previous_response_id=done.response.id,
+                                           input="What did the background job print? Just that.")
+        assert "FALCON-9" in r4.output_text and r4.agentd["session_id"] == r1.agentd["session_id"]
+        await harness.close()
+
+    with live_tmp() as tmp:
+        ws = Path(tmp, "ws")
+        ws.mkdir()
+        with live_executor(transcripts_dir=Path(tmp, "transcripts")) as ex:
+            asyncio.run(main(ex, ws))

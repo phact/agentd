@@ -273,8 +273,21 @@ def _state(client_obj: Any, executor: Any, harness_name: str):
         client_obj._harness_conversations = HarnessConversations()
     if harness_name not in client_obj._harness_objs:
         options = (getattr(client_obj, "_harness_options", None) or {}).get(harness_name, {})
-        client_obj._harness_objs[harness_name] = get_harness(harness_name)(executor, **options)
+        harness = get_harness(harness_name)(executor, **options)
+        callback = getattr(client_obj, "_on_unprompted", None)
+        if callback is not None and getattr(harness, "on_unprompted", False) is None:
+            harness.on_unprompted = _unprompted_to(client_obj, harness_name, callback)
+        client_obj._harness_objs[harness_name] = harness
     return client_obj._harness_objs[harness_name], client_obj._harness_conversations
+
+
+def _unprompted_to(client_obj: Any, harness_name: str, callback):
+    """Hand each unprompted turn to the client's ``on_unprompted`` as a Responses event stream."""
+    from agentd.harness.responses import stream_unprompted
+
+    def deliver(turn):
+        return callback(stream_unprompted(client_obj, harness_name, turn))
+    return deliver
 
 
 async def _prepare_skills(executor, cwd, mcp_servers, server_cache, bridge_cache, skills_override) -> str:

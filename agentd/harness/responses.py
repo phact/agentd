@@ -60,6 +60,13 @@ def _stored(client_obj) -> "OrderedDict[str, dict]":
     return client_obj._harness_responses
 
 
+def _latest(client_obj) -> dict[str, str]:
+    """The latest response of each native session ("harness:session id" -> response id)."""
+    if getattr(client_obj, "_harness_latest", None) is None:
+        client_obj._harness_latest = {}
+    return client_obj._harness_latest
+
+
 def _load(client_obj, response_id: str) -> dict | None:
     """A response record: {"harness", "session_id", "messages"} (memory, then disk)."""
     record = _stored(client_obj).get(response_id)
@@ -98,6 +105,8 @@ def _remember(client_obj, response_id: str, harness_name: str, session_id: str |
               "messages": messages + [{"role": "assistant", "content": reply}]}
     store = _stored(client_obj)
     store[response_id] = record
+    if session_id:
+        _latest(client_obj)[f"{harness_name}:{session_id}"] = response_id
     while len(store) > _MAX_STORED:
         store.popitem(last=False)
     RESPONSES_DIR.mkdir(parents=True, exist_ok=True)
@@ -190,19 +199,65 @@ async def stream_response(
     code executions. A tool call closes the current message item; later text
     opens a new one. The final ``response.output`` lists every item in order.
     """
-    from openai.types import responses as R
-
-    from agentd.harness.tool_events import ToolCalls, _code
-    from agentd.ptc import _make_execution_event
-
     _check_kwargs(kwargs)
     instructions, previous = kwargs.get("instructions"), kwargs.get("previous_response_id")
     messages, resume = _conversation(client_obj, harness_name, input_data, instructions, previous)
     harness, conversations = _state(client_obj, executor, harness_name)
     manifest = await _prepare_skills(executor, cwd, mcp_servers, server_cache, bridge_cache, skills_override)
 
+    _turn = run_turn(
+        harness_name=harness_name, harness=harness, conversations=conversations,
+        model=model, messages=messages, cwd=cwd, tool_manifest=manifest, streaming=True,
+        session_id=kwargs.get("session_id") or resume,
+    )
+
+    def done(response_id, final, text):
+        _remember(client_obj, response_id, harness_name, final.session_id, messages, text)
+
+    async with aclosing(_turn):
+        stream = _stream_events(_turn, harness_name=harness_name, model_name=model or harness_name,
+                                instructions=instructions, previous=previous, on_completed=done)
+        async with aclosing(stream):
+            async for event in stream:
+                yield event
+
+
+async def stream_unprompted(client_obj, harness_name: str, turn):
+    """The Responses event stream for a turn the harness started on its own (a
+    background task finished): recorded like any response, continuing the
+    conversation's latest one (``previous_response_id``)."""
+    previous = _latest(client_obj).get(f"{harness_name}:{turn.session_id}")
+    prior = _load(client_obj, previous) if previous else None
+    note = []
+
+    async def events():
+        async for event in turn.events():
+            if event.kind == "task":
+                note.append(event.text or "a background task finished")
+            yield event
+
+    def done(response_id, final, text):
+        messages = (prior or {}).get("messages", []) + [
+            {"role": "user", "content": "[background: " + "; ".join(note or ["a background task finished"]) + "]"}]
+        _remember(client_obj, response_id, harness_name, final.session_id or turn.session_id, messages, text)
+
+    stream = _stream_events(events(), harness_name=harness_name, model_name=harness_name, instructions=None,
+                            previous=previous, on_completed=done, agentd_extra={"unprompted": True})
+    async with aclosing(stream):
+        async for event in stream:
+            yield event
+
+
+async def _stream_events(events, *, harness_name, model_name, instructions, previous, on_completed,
+                         agentd_extra: dict | None = None):
+    """Responses stream events for a turn's HarnessEvents; ``on_completed(response_id,
+    final, text)`` records a completed one."""
+    from openai.types import responses as R
+
+    from agentd.harness.tool_events import ToolCalls, _code
+    from agentd.ptc import _make_execution_event
+
     response_id = _new_id("resp")
-    model_name = model or harness_name
     container = f"agentd-{harness_name}"
     seq = 0
     indexes = iter(range(1 << 30))  # output_index, assigned when an item starts
@@ -260,43 +315,37 @@ async def stream_response(
     yield R.ResponseInProgressEvent(type="response.in_progress", response=start, sequence_number=nxt())
 
     final = None
-    _turn = run_turn(
-        harness_name=harness_name, harness=harness, conversations=conversations,
-        model=model, messages=messages, cwd=cwd, tool_manifest=manifest, streaming=True,
-        session_id=kwargs.get("session_id") or resume,
-    )
-    async with aclosing(_turn):
-        async for event in _turn:
-            if event.kind == "text":
-                if msg is None:
-                    for e in open_message():
-                        yield e
-                # Separators keep output_text equal to the reply recorded for resume.
-                delta = event.text if not texts else TEXT_SEPARATOR + event.text
-                texts.append(event.text)
-                msg["text"] += delta
-                yield R.ResponseTextDeltaEvent(type="response.output_text.delta", item_id=msg["id"],
-                                               output_index=msg["index"], content_index=0, delta=delta,
-                                               logprobs=[], sequence_number=nxt())
-            elif event.kind == "tool_use":
-                for e in close_message():
+    async for event in events:
+        if event.kind == "text":
+            if msg is None:
+                for e in open_message():
                     yield e
-                calls.started(event)
-                item_id = _new_id("ci")
-                index = next(indexes)
-                tools[event.id or item_id] = (item_id, index)
-                started = R.ResponseCodeInterpreterToolCall(
-                    id=item_id, type="code_interpreter_call", status="in_progress", container_id=container,
-                    code=f"{event.name}\n{_code(event)}", outputs=[])
-                yield R.ResponseOutputItemAddedEvent(type="response.output_item.added", output_index=index,
-                                                     item=started, sequence_number=nxt())
-            elif event.kind == "tool_result":
-                call = calls.finished(event)
-                if call is not None and event.id in tools:
-                    item_id, index = tools.pop(event.id)
-                    yield tool_done(call, item_id, index)
-            elif event.kind == "result":
-                final = event
+            # Separators keep output_text equal to the reply recorded for resume.
+            delta = event.text if not texts else TEXT_SEPARATOR + event.text
+            texts.append(event.text)
+            msg["text"] += delta
+            yield R.ResponseTextDeltaEvent(type="response.output_text.delta", item_id=msg["id"],
+                                           output_index=msg["index"], content_index=0, delta=delta,
+                                           logprobs=[], sequence_number=nxt())
+        elif event.kind == "tool_use":
+            for e in close_message():
+                yield e
+            calls.started(event)
+            item_id = _new_id("ci")
+            index = next(indexes)
+            tools[event.id or item_id] = (item_id, index)
+            started = R.ResponseCodeInterpreterToolCall(
+                id=item_id, type="code_interpreter_call", status="in_progress", container_id=container,
+                code=f"{event.name}\n{_code(event)}", outputs=[])
+            yield R.ResponseOutputItemAddedEvent(type="response.output_item.added", output_index=index,
+                                                 item=started, sequence_number=nxt())
+        elif event.kind == "tool_result":
+            call = calls.finished(event)
+            if call is not None and event.id in tools:
+                item_id, index = tools.pop(event.id)
+                yield tool_done(call, item_id, index)
+        elif event.kind == "result":
+            final = event
 
     for call, (item_id, index) in zip(calls.unfinished(), list(tools.values())):
         yield tool_done(call, item_id, index)
@@ -311,12 +360,13 @@ async def stream_response(
         msg["text"] = text
     for e in close_message():
         yield e
-    agentd = {"harness": harness_name, "session_id": final and final.session_id, "is_error": failed}
+    agentd = {"harness": harness_name, "session_id": final and final.session_id, "is_error": failed,
+              **(agentd_extra or {})}
     if failed:
         error = {"code": "server_error", "message": (final and final.text) or "harness ended without a result"}
         yield R.ResponseFailedEvent(type="response.failed", sequence_number=nxt(),
                                     response=snapshot("failed", finished_items(), error=error, agentd=agentd))
     else:
-        _remember(client_obj, response_id, harness_name, final.session_id, messages, text)
+        on_completed(response_id, final, text)
         yield R.ResponseCompletedEvent(type="response.completed", sequence_number=nxt(),
                                        response=snapshot("completed", finished_items(), agentd=agentd))

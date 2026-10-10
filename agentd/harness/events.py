@@ -7,11 +7,13 @@ from typing import Any
 
 @dataclass
 class HarnessEvent:
-    """One thing a harness did: ``text``, ``tool_use``, ``tool_result`` or ``result``.
+    """One thing a harness did: ``text``, ``tool_use``, ``tool_result``, ``task`` or ``result``.
 
     ``result`` is always last: its ``text`` is the final reply and
     ``session_id`` the harness's native session (for resume). A
-    ``tool_result`` carries the ``id`` of the ``tool_use`` it answers.
+    ``tool_result`` carries the ``id`` of the ``tool_use`` it answers. A
+    ``task`` (``data``: the CLI's notification) is a background task that
+    finished, at the start of the unprompted turn it set off.
     """
 
     kind: str
